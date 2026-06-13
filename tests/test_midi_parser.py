@@ -27,6 +27,15 @@ class TestMidiParserV2:
         with pytest.raises((EOFError, OSError, ValueError)):
             MidiScheduleParserV2().parse_bytes(b"not a midi file", "bad.mid")
 
+    def test_parser_wraps_mido_loader_errors(self, monkeypatch):
+        def raise_loader_error(*args, **kwargs):
+            raise IndexError("truncated metadata")
+
+        monkeypatch.setattr("muziq_nn.datasets.midi.mido.MidiFile", raise_loader_error)
+
+        with pytest.raises(ValueError, match="invalid MIDI file bad.mid"):
+            MidiScheduleParserV2().parse_bytes(b"bad", "bad.mid")
+
     def test_leakage_audit_rejects_shared_hash(self):
         schedule = MidiScheduleParserV2().parse_bytes(
             TinyCorpusBuilderV2._midi_bytes(), "fixture.mid"

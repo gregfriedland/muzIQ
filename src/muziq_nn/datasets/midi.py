@@ -45,6 +45,10 @@ class MidiSplitAssignerV2:
         return "test"
 
 
+class MidiInvalidFileV2(ValueError):
+    """Raised when Mido cannot load an external MIDI file."""
+
+
 class MidiScheduleParserV2:
     """Parse a MIDI byte stream into note events in seconds."""
 
@@ -53,7 +57,10 @@ class MidiScheduleParserV2:
     def parse_bytes(self, payload: bytes, source_path: str) -> MidiScheduleV2:
         schedule_id = hashlib.md5(payload).hexdigest()
         split = MidiSplitAssignerV2().split_for_id(schedule_id)
-        midi = mido.MidiFile(file=io.BytesIO(payload))
+        try:
+            midi = mido.MidiFile(file=io.BytesIO(payload))
+        except Exception as error:
+            raise MidiInvalidFileV2(f"invalid MIDI file {source_path}: {error}") from error
         events: list[MidiNoteEventV2] = []
         duration_s = 0.0
         for track_idx, track in enumerate(midi.tracks):
