@@ -1,9 +1,16 @@
 from __future__ import annotations
 
+import io
+import tarfile
+
 import pytest
 from conftest import TinyCorpusBuilderV2
 
-from muziq_nn.datasets.midi import MidiScheduleParserV2, MidiSplitAuditV2
+from muziq_nn.datasets.midi import (
+    LakhMidiDownloaderV2,
+    MidiScheduleParserV2,
+    MidiSplitAuditV2,
+)
 
 
 class TestMidiParserV2:
@@ -30,3 +37,36 @@ class TestMidiParserV2:
             MidiSplitAuditV2().audit(
                 {"train": [schedule], "validation": [duplicate], "test": []}
             )
+
+    def test_downloader_skips_mido_parse_errors(self, tmp_path):
+        class SyntheticMidoMetadataErrorV2(Exception):
+            pass
+
+        SyntheticMidoMetadataErrorV2.__module__ = "mido.midifiles.meta"
+
+        class ParserWithOneBadMidiV2:
+            def __init__(self):
+                self.calls = 0
+
+            def parse_bytes(self, payload: bytes, source_path: str):
+                self.calls += 1
+                if self.calls == 1:
+                    raise SyntheticMidoMetadataErrorV2("bad key signature")
+                schedule = MidiScheduleParserV2().parse_bytes(payload, source_path)
+                return schedule.model_copy(update={"split": "train"})
+
+        archive_path = tmp_path / "lakh_subset.tar.gz"
+        good_payload = TinyCorpusBuilderV2._midi_bytes()
+        with tarfile.open(archive_path, "w:gz") as archive:
+            for name, payload in (("bad.mid", b"bad"), ("good.mid", good_payload)):
+                info = tarfile.TarInfo(name)
+                info.size = len(payload)
+                archive.addfile(info, io.BytesIO(payload))
+
+        downloader = LakhMidiDownloaderV2(tmp_path / "data")
+        downloader.parser = ParserWithOneBadMidiV2()
+        downloader.build_cache(
+            str(archive_path), {"train": 1, "validation": 0, "test": 0}
+        )
+
+        assert len(downloader.load_manifests()["train"]) == 1

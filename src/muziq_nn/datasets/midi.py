@@ -133,6 +133,18 @@ class MidiSplitAuditV2:
             raise ValueError(f"MIDI hash leakage detected: {sample}")
 
 
+class MidiInvalidFilePolicyV2:
+    """Classify external MIDI-file parse failures that should be skipped."""
+
+    MIDO_MODULE_PREFIX = "mido."
+    GENERIC_PARSE_ERRORS = (EOFError, OSError, ValueError, KeyError)
+
+    def should_skip(self, error: Exception) -> bool:
+        if isinstance(error, self.GENERIC_PARSE_ERRORS):
+            return True
+        return error.__class__.__module__.startswith(self.MIDO_MODULE_PREFIX)
+
+
 class LakhMidiDownloaderV2:
     """Stream Lakh MIDI archives into compact split manifests."""
 
@@ -146,6 +158,7 @@ class LakhMidiDownloaderV2:
     def __init__(self, data_root: Path):
         self.paths = MidiPathsV2(data_root)
         self.parser = MidiScheduleParserV2()
+        self.invalid_file_policy = MidiInvalidFilePolicyV2()
 
     def build_cache(
         self, source: str | None = None, targets: dict[SplitName, int] | None = None
@@ -169,8 +182,10 @@ class LakhMidiDownloaderV2:
                     payload = extracted.read()
                     try:
                         schedule = self.parser.parse_bytes(payload, member.name)
-                    except (EOFError, OSError, ValueError, KeyError):
-                        continue
+                    except Exception as error:
+                        if self.invalid_file_policy.should_skip(error):
+                            continue
+                        raise
                     if not schedule.events:
                         continue
                     if len(buckets[schedule.split]) >= target_counts[schedule.split]:
