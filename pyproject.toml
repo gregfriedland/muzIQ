@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=69.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "muziq-nn"
+version = "0.1.0"
+description = "Bounded-cache neural source tracking for music visualization analysis"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "mido>=1.3.3",
+    "numpy>=1.26.0",
+    "pydantic>=2.7.0",
+    "scipy>=1.12.0",
+    "soundfile>=0.12.1",
+    "torch>=2.2.0",
+    "tqdm>=4.66.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "ruff>=0.6.0",
+]
+
+[project.scripts]
+muziq-prepare = "muziq_nn.datasets.prepare:main"
+muziq-train = "muziq_nn.training.train:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+
+[tool.ruff]
+line-length = 96
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
