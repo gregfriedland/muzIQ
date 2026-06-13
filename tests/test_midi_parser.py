@@ -38,6 +38,12 @@ class TestMidiParserV2:
         with pytest.raises(ValueError, match="invalid MIDI file bad.mid"):
             MidiScheduleParserV2().parse_bytes(b"bad", "bad.mid")
 
+    def test_parser_rejects_event_cap_during_parse(self):
+        payload = TinyCorpusBuilderV2._midi_bytes()
+
+        with pytest.raises(ValueError, match="exceeds"):
+            MidiScheduleParserV2().parse_bytes(payload, "fixture.mid", max_events=1)
+
     def test_leakage_audit_rejects_shared_hash(self):
         schedule = MidiScheduleParserV2().parse_bytes(
             TinyCorpusBuilderV2._midi_bytes(), "fixture.mid"
@@ -59,7 +65,9 @@ class TestMidiParserV2:
             def __init__(self):
                 self.calls = 0
 
-            def parse_bytes(self, payload: bytes, source_path: str):
+            def parse_bytes(
+                self, payload: bytes, source_path: str, max_events: int | None = None
+            ):
                 self.calls += 1
                 if self.calls == 1:
                     raise SyntheticMidoMetadataErrorV2("bad key signature")
@@ -84,7 +92,9 @@ class TestMidiParserV2:
 
     def test_downloader_rejects_oversized_schedules(self, tmp_path):
         class OversizedParserV2:
-            def parse_bytes(self, payload: bytes, source_path: str):
+            def parse_bytes(
+                self, payload: bytes, source_path: str, max_events: int | None = None
+            ):
                 event = MidiNoteEventV2(
                     start_s=0.0,
                     end_s=0.1,

@@ -49,12 +49,18 @@ class MidiInvalidFileV2(ValueError):
     """Raised when Mido cannot load an external MIDI file."""
 
 
+class MidiScheduleTooLargeV2(ValueError):
+    """Raised when a MIDI schedule exceeds cache bounds during parsing."""
+
+
 class MidiScheduleParserV2:
     """Parse a MIDI byte stream into note events in seconds."""
 
     DEFAULT_TEMPO = 500_000
 
-    def parse_bytes(self, payload: bytes, source_path: str) -> MidiScheduleV2:
+    def parse_bytes(
+        self, payload: bytes, source_path: str, max_events: int | None = None
+    ) -> MidiScheduleV2:
         schedule_id = hashlib.md5(payload).hexdigest()
         split = MidiSplitAssignerV2().split_for_id(schedule_id)
         try:
@@ -64,7 +70,14 @@ class MidiScheduleParserV2:
         events: list[MidiNoteEventV2] = []
         duration_s = 0.0
         for track_idx, track in enumerate(midi.tracks):
-            events.extend(self._parse_track(midi, track, track_idx))
+            events.extend(
+                self._parse_track(
+                    midi,
+                    track,
+                    track_idx,
+                    self._remaining_events(max_events, len(events), source_path),
+                )
+            )
         if events:
             duration_s = max(event.end_s for event in events)
         return MidiScheduleV2(
@@ -80,6 +93,7 @@ class MidiScheduleParserV2:
         midi: mido.MidiFile,
         track: mido.MidiTrack,
         track_idx: int,
+        max_events: int | None = None,
     ) -> list[MidiNoteEventV2]:
         tempo = self.DEFAULT_TEMPO
         seconds = 0.0
@@ -123,7 +137,24 @@ class MidiScheduleParserV2:
                     program=program,
                 )
             )
+            if max_events is not None and len(events) > max_events:
+                raise MidiScheduleTooLargeV2(
+                    f"MIDI track {track_idx} exceeds {max_events} parsed events"
+                )
         return events
+
+    @staticmethod
+    def _remaining_events(
+        max_events: int | None, parsed_events: int, source_path: str
+    ) -> int | None:
+        if max_events is None:
+            return None
+        remaining = max_events - parsed_events
+        if remaining < 0:
+            raise MidiScheduleTooLargeV2(
+                f"MIDI file {source_path} exceeds {max_events} parsed events"
+            )
+        return remaining
 
 
 class MidiSplitAuditV2:
@@ -206,7 +237,11 @@ class LakhMidiDownloaderV2:
                         continue
                     payload = extracted.read()
                     try:
-                        schedule = self.parser.parse_bytes(payload, member.name)
+                        schedule = self.parser.parse_bytes(
+                            payload,
+                            member.name,
+                            max_events=self.schedule_bounds.MAX_EVENTS,
+                        )
                     except Exception as error:
                         if self.invalid_file_policy.should_skip(error):
                             continue
