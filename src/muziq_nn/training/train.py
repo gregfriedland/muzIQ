@@ -49,6 +49,21 @@ class CurriculumPlanV2:
     def __init__(self, stages: tuple[CurriculumStageV2, ...] | None = None):
         self.stages = stages or self.DEFAULT_STAGES
 
+    def scale_examples(self, scale: float) -> CurriculumPlanV2:
+        if scale <= 0.0:
+            raise ValueError("curriculum scale must be positive")
+        return CurriculumPlanV2(
+            tuple(
+                CurriculumStageV2(
+                    stage.name,
+                    max(1, int(round(stage.train_examples_per_epoch * scale))),
+                    stage.epochs,
+                    stage.learning_rate,
+                )
+                for stage in self.stages
+            )
+        )
+
     def trim_for_hours(
         self, examples_per_second: float, max_hours: float
     ) -> tuple[CurriculumStageV2, ...]:
@@ -86,6 +101,7 @@ class TrainingConfigV2:
     data_root: str = "data"
     run_root: str = "runs"
     curriculum: str = "all"
+    curriculum_scale: float = 1.0
     max_hours: float = 8.0
     generate_on_the_fly: bool = True
     calibration_examples: int = 10_000
@@ -152,7 +168,7 @@ class SourceTrackingTrainerV2:
         self.batch_builder = TrainingBatchBuilderV2(self.device)
 
     def run(self) -> dict[str, object]:
-        plan = CurriculumPlanV2()
+        plan = CurriculumPlanV2().scale_examples(self.config.curriculum_scale)
         examples_per_second = self.calibrate()
         stages = plan.trim_for_hours(examples_per_second, self.config.max_hours)
         if self.config.smoke_examples > 0:
@@ -251,6 +267,11 @@ class TrainingCliV2:
         parser.add_argument("--data-root", default=TrainingConfigV2.data_root)
         parser.add_argument("--run-root", default=TrainingConfigV2.run_root)
         parser.add_argument("--curriculum", default=TrainingConfigV2.curriculum)
+        parser.add_argument(
+            "--curriculum-scale",
+            type=float,
+            default=TrainingConfigV2.curriculum_scale,
+        )
         parser.add_argument("--max-hours", type=float, default=TrainingConfigV2.max_hours)
         parser.add_argument("--generate-on-the-fly", action="store_true")
         parser.add_argument(
