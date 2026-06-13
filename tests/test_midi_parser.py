@@ -8,9 +8,11 @@ from conftest import TinyCorpusBuilderV2
 
 from muziq_nn.datasets.midi import (
     LakhMidiDownloaderV2,
+    MidiScheduleBoundsV2,
     MidiScheduleParserV2,
     MidiSplitAuditV2,
 )
+from muziq_nn.datasets.schema import MidiNoteEventV2, MidiScheduleV2
 
 
 class TestMidiParserV2:
@@ -79,3 +81,36 @@ class TestMidiParserV2:
         )
 
         assert len(downloader.load_manifests()["train"]) == 1
+
+    def test_downloader_rejects_oversized_schedules(self, tmp_path):
+        class OversizedParserV2:
+            def parse_bytes(self, payload: bytes, source_path: str):
+                event = MidiNoteEventV2(
+                    start_s=0.0,
+                    end_s=0.1,
+                    pitch=60,
+                    velocity=96,
+                    track=0,
+                )
+                return MidiScheduleV2(
+                    schedule_id="0" * 32,
+                    split="train",
+                    duration_s=1.0,
+                    source_path=source_path,
+                    events=(event,) * (MidiScheduleBoundsV2.MAX_EVENTS + 1),
+                )
+
+        archive_path = tmp_path / "lakh_subset.tar.gz"
+        payload = TinyCorpusBuilderV2._midi_bytes()
+        with tarfile.open(archive_path, "w:gz") as archive:
+            info = tarfile.TarInfo("oversized.mid")
+            info.size = len(payload)
+            archive.addfile(info, io.BytesIO(payload))
+
+        downloader = LakhMidiDownloaderV2(tmp_path / "data")
+        downloader.parser = OversizedParserV2()
+        downloader.build_cache(
+            str(archive_path), {"train": 1, "validation": 0, "test": 0}
+        )
+
+        assert len(downloader.load_manifests()["train"]) == 0

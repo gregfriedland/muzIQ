@@ -8,7 +8,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from muziq_nn.datasets.midi import LakhMidiDownloaderV2
+from muziq_nn.datasets.midi import LakhMidiDownloaderV2, MidiScheduleBoundsV2
 from muziq_nn.datasets.nsynth import NsynthDownloaderV2, NsynthSplitAuditV2
 
 
@@ -61,6 +61,11 @@ class PrepareRunnerV2:
             "storage_budget_gb": self.config.storage_budget_gb,
             "nsynth_urls": NsynthDownloaderV2.ARCHIVE_URLS,
             "lakh_midi_url": LakhMidiDownloaderV2.ARCHIVE_URL,
+            "midi_schedule_bounds": {
+                "max_events": MidiScheduleBoundsV2.MAX_EVENTS,
+                "max_duration_s": MidiScheduleBoundsV2.MAX_DURATION_S,
+                "max_tracks": MidiScheduleBoundsV2.MAX_TRACKS,
+            },
             "note": (
                 "Metadata records download sources; cache builders stream "
                 "archives on demand."

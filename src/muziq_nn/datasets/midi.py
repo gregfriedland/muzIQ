@@ -152,6 +152,23 @@ class MidiInvalidFilePolicyV2:
         return error.__class__.__module__.startswith(self.MIDO_MODULE_PREFIX)
 
 
+class MidiScheduleBoundsV2:
+    """Reject schedules too large for bounded 30-second mixture rendering."""
+
+    MAX_EVENTS = 2_048
+    MAX_DURATION_S = 600.0
+    MAX_TRACKS = 12
+
+    def accepts(self, schedule: MidiScheduleV2) -> bool:
+        if len(schedule.events) == 0:
+            return False
+        if len(schedule.events) > self.MAX_EVENTS:
+            return False
+        if schedule.duration_s > self.MAX_DURATION_S:
+            return False
+        return len(schedule.track_ids) <= self.MAX_TRACKS
+
+
 class LakhMidiDownloaderV2:
     """Stream Lakh MIDI archives into compact split manifests."""
 
@@ -166,6 +183,7 @@ class LakhMidiDownloaderV2:
         self.paths = MidiPathsV2(data_root)
         self.parser = MidiScheduleParserV2()
         self.invalid_file_policy = MidiInvalidFilePolicyV2()
+        self.schedule_bounds = MidiScheduleBoundsV2()
 
     def build_cache(
         self, source: str | None = None, targets: dict[SplitName, int] | None = None
@@ -193,7 +211,7 @@ class LakhMidiDownloaderV2:
                         if self.invalid_file_policy.should_skip(error):
                             continue
                         raise
-                    if not schedule.events:
+                    if not self.schedule_bounds.accepts(schedule):
                         continue
                     if len(buckets[schedule.split]) >= target_counts[schedule.split]:
                         continue
