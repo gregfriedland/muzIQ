@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 import tarfile
@@ -79,12 +80,40 @@ class NsynthSplitAuditV2:
             raise ValueError(f"NSynth instrument leakage detected: {sample}")
 
 
+class NsynthInstrumentSplitPolicyV2:
+    """Assign each NSynth instrument to exactly one training split."""
+
+    TRAIN_BUCKETS = 86
+    VALIDATION_BUCKETS = 7
+    TOTAL_BUCKETS = 100
+
+    def split_for(self, note: NsynthNoteV2) -> SplitName:
+        return self.split_for_instrument(note.instrument)
+
+    def split_for_instrument(self, instrument: int) -> SplitName:
+        digest = hashlib.blake2s(str(instrument).encode("utf-8"), digest_size=4).digest()
+        bucket = int.from_bytes(digest, byteorder="big") % self.TOTAL_BUCKETS
+        if bucket < self.TRAIN_BUCKETS:
+            return "train"
+        if bucket < self.TRAIN_BUCKETS + self.VALIDATION_BUCKETS:
+            return "validation"
+        return "test"
+
+
 class NsynthCacheSelectorV2:
     """Pick a balanced bounded subset from a stream of candidate notes."""
 
-    def __init__(self, target_notes: int, max_notes_per_instrument: int = 80):
+    def __init__(
+        self,
+        target_notes: int,
+        max_notes_per_instrument: int = 80,
+        split: SplitName | None = None,
+        split_policy: NsynthInstrumentSplitPolicyV2 | None = None,
+    ):
         self.target_notes = target_notes
         self.max_notes_per_instrument = max_notes_per_instrument
+        self.split = split
+        self.split_policy = split_policy or NsynthInstrumentSplitPolicyV2()
         self._count_by_instrument: dict[str, int] = defaultdict(int)
         self._count_by_bucket: dict[tuple[str, str, int, int], int] = defaultdict(int)
         self._selected = 0
@@ -95,6 +124,8 @@ class NsynthCacheSelectorV2:
 
     def should_keep(self, note: NsynthNoteV2) -> bool:
         if self.complete:
+            return False
+        if self.split is not None and self.split_policy.split_for(note) != self.split:
             return False
         if self._count_by_instrument[note.instrument_str] >= self.max_notes_per_instrument:
             return False
@@ -139,7 +170,7 @@ class NsynthDownloaderV2:
         self, split: SplitName, source: str, target_notes: int
     ) -> list[NsynthNoteV2]:
         self.paths.split_audio_root(split).mkdir(parents=True, exist_ok=True)
-        selector = NsynthCacheSelectorV2(target_notes)
+        selector = NsynthCacheSelectorV2(target_notes, split=split)
         notes: list[NsynthNoteV2] = []
         with self._open_stream(source) as stream:
             with tarfile.open(fileobj=stream, mode="r|gz") as archive:

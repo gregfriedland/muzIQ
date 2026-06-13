@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import pytest
 
-from muziq_nn.datasets.nsynth import NsynthCacheSelectorV2, NsynthSplitAuditV2
+from muziq_nn.datasets.nsynth import (
+    NsynthCacheSelectorV2,
+    NsynthInstrumentSplitPolicyV2,
+    NsynthSplitAuditV2,
+)
 from muziq_nn.datasets.schema import NsynthNoteV2
 
 
@@ -23,6 +27,19 @@ class TestNsynthCacheV2:
         kept = [note for note in notes if selector.should_keep(note)]
 
         assert len(kept) == 2
+
+    def test_cache_selector_rejects_instruments_assigned_to_other_splits(self):
+        policy = NsynthInstrumentSplitPolicyV2()
+        note = self._note("train", 1, "bass_acoustic_001")
+        assigned_split = policy.split_for(note)
+        rejected_split = next(
+            split for split in ("train", "validation", "test") if split != assigned_split
+        )
+        selector = NsynthCacheSelectorV2(
+            target_notes=1, split=rejected_split, split_policy=policy
+        )
+
+        assert not selector.should_keep(note)
 
     @staticmethod
     def _note(
