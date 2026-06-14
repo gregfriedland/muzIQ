@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 
+import torch
 from conftest import TinyCorpusBuilderV2
 
 from muziq_nn.training.train import CurriculumPlanV2, SourceTrackingTrainerV2, TrainingConfigV2
@@ -95,3 +96,43 @@ class TestTrainSmokeV2:
         assert metadata["phase"] in {"batch_interval", "epoch_done", "training_done"}
         assert "stage" in metadata
         assert payload["artifacts"]["checkpoint_upload_uri"].endswith("/unit-run")
+
+    def test_resume_cursor_from_warm_start_metadata(self, tmp_path):
+        TinyCorpusBuilderV2(tmp_path / "data").build()
+        checkpoint_path = tmp_path / "checkpoint.pt"
+        base = SourceTrackingTrainerV2(
+            TrainingConfigV2(data_root=str(tmp_path / "data"), device="cpu")
+        )
+        torch.save(
+            {
+                "state_dict": base.model.state_dict(),
+                "checkpoint_metadata": {
+                    "checkpoint_number": 45,
+                    "phase": "batch_interval",
+                    "stage": "single_instrument_melody",
+                    "epoch": 2,
+                    "batch": 500,
+                    "batches_per_epoch": 938,
+                },
+            },
+            checkpoint_path,
+        )
+        config = TrainingConfigV2(
+            data_root=str(tmp_path / "data"),
+            device="cpu",
+            warm_start_checkpoint=str(checkpoint_path),
+            resume_from_warm_start_metadata=True,
+        )
+        trainer = SourceTrackingTrainerV2(config)
+        stages = CurriculumPlanV2().scale_epochs(2).stages
+
+        cursor = trainer._resume_cursor(stages)
+
+        assert cursor is not None
+        assert cursor.stage == "single_instrument_melody"
+        assert cursor.epoch == 2
+        assert cursor.batch == 500
+        assert cursor.checkpoint_number == 45
+        assert trainer._stages_from_resume(stages, cursor)[0].name == (
+            "single_instrument_melody"
+        )

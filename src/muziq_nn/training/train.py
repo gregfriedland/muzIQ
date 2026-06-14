@@ -141,6 +141,15 @@ class TrainingConfigV2:
     checkpoint_upload_uri: str | None = None
     checkpoint_upload_run_id: str | None = None
     checkpoint_interval_batches: int = 100
+    resume_from_warm_start_metadata: bool = False
+
+
+@dataclass(frozen=True)
+class TrainingResumeCursorV2:
+    stage: str
+    epoch: int
+    batch: int
+    checkpoint_number: int
 
 
 class TrainingBatchBuilderV2:
@@ -435,6 +444,7 @@ class SourceTrackingTrainerV2:
         self.device = self._resolve_device(config.device)
         self.renderer = self._build_renderer(include_midi=False)
         self.midi_renderer: SourceTrackingRendererV2 | None = None
+        self.warm_start_metadata: dict[str, object] | None = None
         self.model = DualPathTransformerSourceTrackerV2(SourceTrackingModelConfigV2()).to(
             self.device
         )
@@ -459,6 +469,9 @@ class SourceTrackingTrainerV2:
                 "warm_start_checkpoint": self.config.warm_start_checkpoint,
                 "checkpoint_upload_uri": self.config.checkpoint_upload_uri,
                 "checkpoint_interval_batches": self.config.checkpoint_interval_batches,
+                "resume_from_warm_start_metadata": (
+                    self.config.resume_from_warm_start_metadata
+                ),
             },
             force=True,
         )
@@ -483,6 +496,22 @@ class SourceTrackingTrainerV2:
                 stages = (
                     CurriculumStageV2("single_note_all", self.config.smoke_examples, 1, 3e-4),
                 )
+            resume_cursor = self._resume_cursor(stages)
+            if resume_cursor is not None:
+                stages = self._stages_from_resume(stages, resume_cursor)
+                self.checkpoint_number = max(
+                    self.checkpoint_number, resume_cursor.checkpoint_number
+                )
+                self.progress.emit(
+                    "training_resume",
+                    {
+                        "stage": resume_cursor.stage,
+                        "epoch": resume_cursor.epoch,
+                        "batch": resume_cursor.batch,
+                        "checkpoint_number": resume_cursor.checkpoint_number,
+                    },
+                    force=True,
+                )
             self.progress.emit(
                 "training_plan",
                 {
@@ -503,10 +532,22 @@ class SourceTrackingTrainerV2:
             if self.checkpoint_uploader.base_uri is not None:
                 self.checkpoint_upload_worker = CheckpointUploadWorkerV2(
                     self.checkpoint_uploader, self.progress
-                )
+            )
             history = []
             for stage in stages:
-                history.extend(self._train_stage(stage, run_dir))
+                first_epoch = (
+                    resume_cursor.epoch
+                    if resume_cursor is not None and stage.name == resume_cursor.stage
+                    else 1
+                )
+                first_batch = (
+                    resume_cursor.batch
+                    if resume_cursor is not None and stage.name == resume_cursor.stage
+                    else 0
+                )
+                history.extend(
+                    self._train_stage(stage, run_dir, first_epoch, first_batch)
+                )
             metrics_path = run_dir / "metrics.json"
             checkpoint_path = run_dir / "checkpoint.pt"
             artifacts = {
@@ -564,7 +605,13 @@ class SourceTrackingTrainerV2:
         elapsed = max(time.perf_counter() - start, 1e-6)
         return count / elapsed
 
-    def _train_stage(self, stage: CurriculumStageV2, run_dir: Path) -> list[dict[str, object]]:
+    def _train_stage(
+        self,
+        stage: CurriculumStageV2,
+        run_dir: Path,
+        first_epoch: int = 1,
+        first_batch: int = 0,
+    ) -> list[dict[str, object]]:
         optimizer = torch.optim.AdamW(self.model.parameters(), lr=stage.learning_rate)
         rows = []
         batches_per_epoch = max(
@@ -577,13 +624,16 @@ class SourceTrackingTrainerV2:
                 "epochs": stage.epochs,
                 "batches_per_epoch": batches_per_epoch,
                 "examples_per_epoch": stage.train_examples_per_epoch,
+                "first_epoch": first_epoch,
+                "first_batch": first_batch,
             },
             force=True,
         )
-        for epoch in range(stage.epochs):
+        for epoch in range(first_epoch - 1, stage.epochs):
             losses = []
             epoch_start = time.monotonic()
-            for batch_idx in range(batches_per_epoch):
+            batch_start = first_batch if epoch == first_epoch - 1 else 0
+            for batch_idx in range(batch_start, batches_per_epoch):
                 seeds = [
                     self.config.seed
                     + epoch * 1_000_000
@@ -631,7 +681,10 @@ class SourceTrackingTrainerV2:
                 "stage": stage.name,
                 "epoch": epoch + 1,
                 "loss": float(np.mean(losses)),
-                "examples": stage.train_examples_per_epoch,
+                "examples": max(
+                    0,
+                    stage.train_examples_per_epoch - batch_start * self.config.batch_size,
+                ),
                 "elapsed_s": round(time.monotonic() - epoch_start, 3),
             }
             self.progress.emit("training_epoch_done", row, force=True)
@@ -808,10 +861,67 @@ class SourceTrackingTrainerV2:
         )
         return SourceTrackingRendererV2(note_store, midi_store)
 
+    def _resume_cursor(
+        self, stages: tuple[CurriculumStageV2, ...]
+    ) -> TrainingResumeCursorV2 | None:
+        if not self.config.resume_from_warm_start_metadata:
+            return None
+        if self.warm_start_metadata is None:
+            raise ValueError(
+                "resume_from_warm_start_metadata requires checkpoint_metadata in the "
+                "warm-start checkpoint"
+            )
+        metadata = self.warm_start_metadata
+        stage_name = str(metadata["stage"])
+        checkpoint_number = int(metadata.get("checkpoint_number", 0))
+        if stage_name == "complete":
+            return None
+        stage_index = self._stage_index(stages, stage_name)
+        epoch = int(metadata["epoch"])
+        batch = int(metadata["batch"])
+        phase = str(metadata.get("phase", ""))
+        batches_per_epoch = int(
+            metadata.get("batches_per_epoch")
+            or np.ceil(stages[stage_index].train_examples_per_epoch / self.config.batch_size)
+        )
+        if phase == "epoch_done" or batch >= batches_per_epoch:
+            epoch += 1
+            batch = 0
+        if epoch > stages[stage_index].epochs:
+            stage_index += 1
+            if stage_index >= len(stages):
+                return None
+            stage_name = stages[stage_index].name
+            epoch = 1
+            batch = 0
+        return TrainingResumeCursorV2(
+            stage=stage_name,
+            epoch=epoch,
+            batch=batch,
+            checkpoint_number=checkpoint_number,
+        )
+
+    @staticmethod
+    def _stages_from_resume(
+        stages: tuple[CurriculumStageV2, ...], cursor: TrainingResumeCursorV2
+    ) -> tuple[CurriculumStageV2, ...]:
+        return stages[SourceTrackingTrainerV2._stage_index(stages, cursor.stage) :]
+
+    @staticmethod
+    def _stage_index(stages: tuple[CurriculumStageV2, ...], stage_name: str) -> int:
+        for idx, stage in enumerate(stages):
+            if stage.name == stage_name:
+                return idx
+        raise ValueError(f"Resume stage {stage_name!r} is not in the training plan")
+
     def _load_warm_start(self, checkpoint: Path) -> None:
         if not checkpoint.exists():
             raise FileNotFoundError(f"Warm-start checkpoint not found: {checkpoint}")
         payload = torch.load(checkpoint, map_location=self.device)
+        if isinstance(payload, dict):
+            metadata = payload.get("checkpoint_metadata")
+            if isinstance(metadata, dict):
+                self.warm_start_metadata = metadata
         state_dict = (
             payload.get("state_dict", payload) if isinstance(payload, dict) else payload
         )
@@ -880,6 +990,7 @@ class TrainingCliV2:
             type=int,
             default=TrainingConfigV2.checkpoint_interval_batches,
         )
+        parser.add_argument("--resume-from-warm-start-metadata", action="store_true")
         args = parser.parse_args(argv)
         values = vars(args)
         if not values["generate_on_the_fly"]:
