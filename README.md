@@ -42,3 +42,21 @@ uv run python -m muziq_nn.training.train \
 
 The trainer calibrates throughput first, then trims later curriculum stages if
 the full plan projects beyond the requested time budget.
+
+For preemptible GPU pods, enable checkpoint upload so numbered model artifacts
+are copied during training:
+
+```bash
+uv run python -m muziq_nn.training.train \
+  --curriculum all \
+  --max-hours 8 \
+  --generate-on-the-fly \
+  --checkpoint-upload-uri gs://rezo-flyte/scratch/serializable/muziq-nn \
+  --checkpoint-upload-run-id "$(date -u +%Y%m%d)-example" \
+  --checkpoint-interval-batches 100
+```
+
+Uploads are written under
+`gs://rezo-flyte/scratch/serializable/muziq-nn/YYYYMMDD/RUN_ID/checkpoints/`.
+Each checkpoint has a matching JSON metadata file with checkpoint number,
+phase, stage, epoch, batch, loss, and timestamp, plus a `latest.json` pointer.

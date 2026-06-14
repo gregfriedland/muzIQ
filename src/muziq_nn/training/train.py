@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
+import shutil
+import subprocess
 import sys
 import time
 from collections.abc import Sequence
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 
 import numpy as np
@@ -131,6 +135,9 @@ class TrainingConfigV2:
     render_workers: int = 1
     warm_start_checkpoint: str | None = None
     epoch_multiplier: float = 1.0
+    checkpoint_upload_uri: str | None = None
+    checkpoint_upload_run_id: str | None = None
+    checkpoint_interval_batches: int = 100
 
 
 class TrainingBatchBuilderV2:
@@ -242,6 +249,101 @@ class TrainingRenderWorkerV2:
         return renderer
 
 
+@dataclass(frozen=True)
+class CheckpointMetadataV2:
+    checkpoint_number: int
+    phase: str
+    stage: str
+    epoch: int
+    batch: int
+    batches_per_epoch: int
+    examples_seen: int
+    loss: float | None
+    mean_loss: float | None
+    run_id: str
+    created_at_utc: str
+    local_checkpoint_path: str
+
+
+class CheckpointArtifactUploaderV2:
+    """Upload numbered checkpoint artifacts to GCS or a local test directory."""
+
+    def __init__(self, base_uri: str | None, run_id: str, date_stamp: str):
+        self.base_uri = base_uri.rstrip("/") if base_uri else None
+        self.run_id = self._safe_component(run_id)
+        self.date_stamp = self._safe_component(date_stamp)
+
+    def remote_run_uri(self) -> str | None:
+        if self.base_uri is None:
+            return None
+        return f"{self.base_uri}/{self.date_stamp}/{self.run_id}"
+
+    def upload(self, local_path: Path, relative_path: str) -> str | None:
+        if self.base_uri is None:
+            return None
+        remote_uri = f"{self.remote_run_uri()}/{relative_path}"
+        if self.base_uri.startswith("gs://"):
+            self._upload_gcs(local_path, remote_uri)
+        else:
+            self._copy_local(local_path, remote_uri)
+        return remote_uri
+
+    def _upload_gcs(self, local_path: Path, remote_uri: str) -> None:
+        if self._upload_gcs_with_python(local_path, remote_uri):
+            return
+        gsutil = shutil.which("gsutil")
+        if gsutil is not None:
+            subprocess.run([gsutil, "-q", "cp", str(local_path), remote_uri], check=True)
+            return
+        gcloud = shutil.which("gcloud")
+        if gcloud is not None:
+            subprocess.run(
+                [gcloud, "storage", "cp", str(local_path), remote_uri, "--quiet"],
+                check=True,
+            )
+            return
+        raise RuntimeError(
+            "checkpoint upload requested for GCS, but google-cloud-storage, gsutil, "
+            "and gcloud are unavailable"
+        )
+
+    def _upload_gcs_with_python(self, local_path: Path, remote_uri: str) -> bool:
+        try:
+            storage = importlib.import_module("google.cloud.storage")
+        except ModuleNotFoundError:
+            return False
+        bucket_name, blob_name = self._split_gcs_uri(remote_uri)
+        client = storage.Client()
+        bucket = client.bucket(bucket_name)
+        blob = bucket.blob(blob_name)
+        blob.upload_from_filename(str(local_path))
+        return True
+
+    @staticmethod
+    def _copy_local(local_path: Path, remote_uri: str) -> None:
+        destination = Path(remote_uri.removeprefix("file://"))
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(local_path, destination)
+
+    @staticmethod
+    def _split_gcs_uri(uri: str) -> tuple[str, str]:
+        path = uri.removeprefix("gs://")
+        bucket, _, blob = path.partition("/")
+        if not bucket or not blob:
+            raise ValueError(f"Invalid GCS URI: {uri}")
+        return bucket, blob
+
+    @staticmethod
+    def _safe_component(value: str) -> str:
+        safe = []
+        for char in value:
+            if char.isalnum() or char in ("-", "_", "."):
+                safe.append(char)
+            else:
+                safe.append("-")
+        return "".join(safe).strip("-") or "run"
+
+
 class SourceTrackingTrainerV2:
     """Train the compact attention model from generated examples."""
 
@@ -259,6 +361,8 @@ class SourceTrackingTrainerV2:
         self.batch_builder = TrainingBatchBuilderV2(self.device)
         self.progress = TrainingProgressLoggerV2(config.progress_interval_s)
         self.render_executor: ProcessPoolExecutor | None = None
+        self.checkpoint_number = 0
+        self.checkpoint_uploader: CheckpointArtifactUploaderV2 | None = None
 
     def run(self) -> dict[str, object]:
         self.progress.emit(
@@ -269,6 +373,8 @@ class SourceTrackingTrainerV2:
                 "batch_size": self.config.batch_size,
                 "render_workers": self.config.render_workers,
                 "warm_start_checkpoint": self.config.warm_start_checkpoint,
+                "checkpoint_upload_uri": self.config.checkpoint_upload_uri,
+                "checkpoint_interval_batches": self.config.checkpoint_interval_batches,
             },
             force=True,
         )
@@ -304,15 +410,24 @@ class SourceTrackingTrainerV2:
                 force=True,
             )
             run_dir = self._run_dir()
+            run_dir.mkdir(parents=True, exist_ok=True)
+            self.checkpoint_uploader = CheckpointArtifactUploaderV2(
+                self.config.checkpoint_upload_uri,
+                self.config.checkpoint_upload_run_id or run_dir.name,
+                time.strftime("%Y%m%d"),
+            )
             history = []
             for stage in stages:
-                history.extend(self._train_stage(stage))
+                history.extend(self._train_stage(stage, run_dir))
             metrics_path = run_dir / "metrics.json"
             checkpoint_path = run_dir / "checkpoint.pt"
             artifacts = {
                 "run_dir": str(run_dir),
                 "metrics_path": str(metrics_path),
                 "checkpoint_path": str(checkpoint_path),
+                "checkpoint_upload_uri": self.checkpoint_uploader.remote_run_uri()
+                if self.checkpoint_uploader is not None
+                else None,
             }
             payload = {
                 "config": asdict(self.config),
@@ -321,9 +436,20 @@ class SourceTrackingTrainerV2:
                 "history": history,
                 "artifacts": artifacts,
             }
-            run_dir.mkdir(parents=True, exist_ok=True)
             metrics_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
             torch.save(self.model.state_dict(), checkpoint_path)
+            self._save_checkpoint_artifact(
+                run_dir,
+                phase="training_done",
+                stage="complete",
+                epoch=0,
+                batch=0,
+                batches_per_epoch=0,
+                examples_seen=sum(row["examples"] for row in history),
+                loss=history[-1]["loss"] if history else None,
+                mean_loss=history[-1]["loss"] if history else None,
+                force=True,
+            )
             self.progress.emit("training_done", artifacts, force=True)
             print(
                 json.dumps(
@@ -348,7 +474,7 @@ class SourceTrackingTrainerV2:
         elapsed = max(time.perf_counter() - start, 1e-6)
         return count / elapsed
 
-    def _train_stage(self, stage: CurriculumStageV2) -> list[dict[str, object]]:
+    def _train_stage(self, stage: CurriculumStageV2, run_dir: Path) -> list[dict[str, object]]:
         optimizer = torch.optim.AdamW(self.model.parameters(), lr=stage.learning_rate)
         rows = []
         batches_per_epoch = max(
@@ -396,6 +522,21 @@ class SourceTrackingTrainerV2:
                         "mean_loss": round(float(np.mean(losses)), 6),
                     },
                 )
+                self._save_checkpoint_artifact(
+                    run_dir,
+                    phase="batch_interval",
+                    stage=stage.name,
+                    epoch=epoch + 1,
+                    batch=batch_idx + 1,
+                    batches_per_epoch=batches_per_epoch,
+                    examples_seen=(epoch * stage.train_examples_per_epoch)
+                    + min(
+                        stage.train_examples_per_epoch,
+                        (batch_idx + 1) * self.config.batch_size,
+                    ),
+                    loss=loss_value,
+                    mean_loss=float(np.mean(losses)),
+                )
             row = {
                 "stage": stage.name,
                 "epoch": epoch + 1,
@@ -405,8 +546,119 @@ class SourceTrackingTrainerV2:
             }
             self.progress.emit("training_epoch_done", row, force=True)
             print(json.dumps(row, sort_keys=True), flush=True)
+            self._save_checkpoint_artifact(
+                run_dir,
+                phase="epoch_done",
+                stage=stage.name,
+                epoch=epoch + 1,
+                batch=batches_per_epoch,
+                batches_per_epoch=batches_per_epoch,
+                examples_seen=(epoch + 1) * stage.train_examples_per_epoch,
+                loss=row["loss"],
+                mean_loss=row["loss"],
+                force=True,
+            )
             rows.append(row)
         return rows
+
+    def _save_checkpoint_artifact(
+        self,
+        run_dir: Path,
+        *,
+        phase: str,
+        stage: str,
+        epoch: int,
+        batch: int,
+        batches_per_epoch: int,
+        examples_seen: int,
+        loss: float | None,
+        mean_loss: float | None,
+        force: bool = False,
+    ) -> None:
+        if self.checkpoint_uploader is None:
+            return
+        if self.checkpoint_uploader.base_uri is None:
+            return
+        if not force:
+            interval = max(0, self.config.checkpoint_interval_batches)
+            if interval == 0 or batch % interval != 0:
+                return
+        self.checkpoint_number += 1
+        checkpoint_dir = run_dir / "checkpoints"
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        filename_stem = self._checkpoint_filename_stem(
+            self.checkpoint_number,
+            phase,
+            stage,
+            epoch,
+            batch,
+        )
+        checkpoint_path = checkpoint_dir / f"{filename_stem}.pt"
+        metadata = CheckpointMetadataV2(
+            checkpoint_number=self.checkpoint_number,
+            phase=phase,
+            stage=stage,
+            epoch=epoch,
+            batch=batch,
+            batches_per_epoch=batches_per_epoch,
+            examples_seen=examples_seen,
+            loss=loss,
+            mean_loss=mean_loss,
+            run_id=self.checkpoint_uploader.run_id,
+            created_at_utc=datetime.now(UTC).isoformat(),
+            local_checkpoint_path=str(checkpoint_path),
+        )
+        metadata_path = checkpoint_dir / f"{filename_stem}.json"
+        latest_path = checkpoint_dir / "latest.json"
+        torch.save(
+            {
+                "state_dict": self.model.state_dict(),
+                "checkpoint_metadata": asdict(metadata),
+            },
+            checkpoint_path,
+        )
+        metadata_payload = asdict(metadata)
+        metadata_path.write_text(json.dumps(metadata_payload, indent=2), encoding="utf-8")
+        uploaded_checkpoint = self.checkpoint_uploader.upload(
+            checkpoint_path, f"checkpoints/{checkpoint_path.name}"
+        )
+        uploaded_metadata = self.checkpoint_uploader.upload(
+            metadata_path, f"checkpoints/{metadata_path.name}"
+        )
+        latest_payload = {
+            **metadata_payload,
+            "remote_checkpoint_uri": uploaded_checkpoint,
+            "remote_metadata_uri": uploaded_metadata,
+        }
+        latest_path.write_text(json.dumps(latest_payload, indent=2), encoding="utf-8")
+        self.checkpoint_uploader.upload(latest_path, "checkpoints/latest.json")
+        self.progress.emit(
+            "checkpoint_uploaded",
+            {
+                "checkpoint_number": self.checkpoint_number,
+                "phase": phase,
+                "stage": stage,
+                "epoch": epoch,
+                "batch": batch,
+                "remote_checkpoint_uri": uploaded_checkpoint,
+            },
+            force=True,
+        )
+
+    @staticmethod
+    def _checkpoint_filename_stem(
+        checkpoint_number: int,
+        phase: str,
+        stage: str,
+        epoch: int,
+        batch: int,
+    ) -> str:
+        safe_phase = CheckpointArtifactUploaderV2._safe_component(phase)
+        safe_stage = CheckpointArtifactUploaderV2._safe_component(stage)
+        return (
+            f"checkpoint_{checkpoint_number:06d}_phase-{safe_phase}"
+            f"_stage-{safe_stage}_epoch-{epoch:03d}_batch-{batch:06d}"
+        )
 
     def _render_slices(
         self, stage: str, split: SplitName, seeds: list[int]
@@ -503,6 +755,13 @@ class TrainingCliV2:
             "--epoch-multiplier",
             type=float,
             default=TrainingConfigV2.epoch_multiplier,
+        )
+        parser.add_argument("--checkpoint-upload-uri")
+        parser.add_argument("--checkpoint-upload-run-id")
+        parser.add_argument(
+            "--checkpoint-interval-batches",
+            type=int,
+            default=TrainingConfigV2.checkpoint_interval_batches,
         )
         args = parser.parse_args(argv)
         values = vars(args)

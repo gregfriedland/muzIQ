@@ -20,7 +20,17 @@ Train from a bounded cache:
 - audit train/validation/test leakage by NSynth instrument ID and MIDI hash.
 
 Use Python 3.12, `uv`, PyTorch, NumPy, SciPy, SoundFile, Mido, Pydantic, Pytest,
-and Ruff.
+Google Cloud Storage, and Ruff.
+
+GPU training on spot/preemptible pods must upload model checkpoints during the
+run. The trainer writes numbered checkpoint artifacts and JSON metadata under a
+date-versioned prefix:
+
+`gs://rezo-flyte/scratch/serializable/muziq-nn/YYYYMMDD/RUN_ID/checkpoints/`
+
+Each metadata file records checkpoint number, phase, stage, epoch, batch,
+examples seen, loss, and creation time. A `latest.json` object is refreshed
+after each upload so a revoked pod still leaves the latest reachable artifact.
 
 ## Curriculum
 

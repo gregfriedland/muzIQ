@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from conftest import TinyCorpusBuilderV2
 
 from muziq_nn.training.train import CurriculumPlanV2, SourceTrackingTrainerV2, TrainingConfigV2
@@ -68,3 +70,28 @@ class TestTrainSmokeV2:
         assert payload["config"]["warm_start_checkpoint"] == str(checkpoint)
         assert payload["artifacts"]["checkpoint_path"].endswith("checkpoint.pt")
         assert list((tmp_path / "runs" / "second").glob("*/checkpoint.pt"))
+
+    def test_checkpoint_upload_writes_numbered_artifacts(self, tmp_path):
+        TinyCorpusBuilderV2(tmp_path / "data").build()
+        upload_root = tmp_path / "uploads"
+        config = TrainingConfigV2(
+            data_root=str(tmp_path / "data"),
+            run_root=str(tmp_path / "runs"),
+            calibration_examples=1,
+            batch_size=1,
+            smoke_examples=1,
+            device="cpu",
+            checkpoint_upload_uri=str(upload_root),
+            checkpoint_upload_run_id="unit-run",
+            checkpoint_interval_batches=1,
+        )
+
+        payload = SourceTrackingTrainerV2(config).run()
+
+        uploaded = list(upload_root.glob("*/unit-run/checkpoints/checkpoint_*.json"))
+        assert uploaded
+        metadata = json.loads(sorted(uploaded)[0].read_text(encoding="utf-8"))
+        assert metadata["checkpoint_number"] == 1
+        assert metadata["phase"] in {"batch_interval", "epoch_done", "training_done"}
+        assert "stage" in metadata
+        assert payload["artifacts"]["checkpoint_upload_uri"].endswith("/unit-run")
