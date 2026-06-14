@@ -215,27 +215,30 @@ class TrainingProgressLoggerV2:
 class TrainingRenderWorkerV2:
     """Render batch slices in worker processes with one renderer per process."""
 
-    _renderers: dict[str, SourceTrackingRendererV2] = {}
+    _renderers: dict[tuple[str, bool], SourceTrackingRendererV2] = {}
 
     @staticmethod
     def render_slice(task: tuple[str, str, SplitName, int]) -> dict[str, np.ndarray]:
         data_root, stage, split, seed = task
-        renderer = TrainingRenderWorkerV2._renderer(data_root)
+        renderer = TrainingRenderWorkerV2._renderer(
+            data_root, include_midi=stage == "midi_complex"
+        )
         example = renderer.render(stage, split, seed)
         return TrainingBatchBuilderV2.slice_from_example(example)
 
     @staticmethod
-    def _renderer(data_root: str) -> SourceTrackingRendererV2:
-        renderer = TrainingRenderWorkerV2._renderers.get(data_root)
+    def _renderer(data_root: str, include_midi: bool) -> SourceTrackingRendererV2:
+        cache_key = (data_root, include_midi)
+        renderer = TrainingRenderWorkerV2._renderers.get(cache_key)
         if renderer is not None:
             return renderer
         nsynth = NsynthIndexV2(Path(data_root))
-        midi = MidiIndexV2(Path(data_root))
+        midi_store = MidiScheduleStoreV2(MidiIndexV2(Path(data_root))) if include_midi else None
         renderer = SourceTrackingRendererV2(
             NsynthNoteStoreV2(nsynth),
-            MidiScheduleStoreV2(midi),
+            midi_store,
         )
-        TrainingRenderWorkerV2._renderers[data_root] = renderer
+        TrainingRenderWorkerV2._renderers[cache_key] = renderer
         return renderer
 
 
@@ -245,7 +248,8 @@ class SourceTrackingTrainerV2:
     def __init__(self, config: TrainingConfigV2):
         self.config = config
         self.device = self._resolve_device(config.device)
-        self.renderer = self._build_renderer()
+        self.renderer = self._build_renderer(include_midi=False)
+        self.midi_renderer: SourceTrackingRendererV2 | None = None
         self.model = DualPathTransformerSourceTrackerV2(SourceTrackingModelConfigV2()).to(
             self.device
         )
@@ -408,20 +412,31 @@ class SourceTrackingTrainerV2:
         self, stage: str, split: SplitName, seeds: list[int]
     ) -> list[dict[str, np.ndarray]]:
         if self.render_executor is None:
+            renderer = self._renderer_for_stage(stage)
             return [
                 TrainingBatchBuilderV2.slice_from_example(
-                    self.renderer.render(stage, split, seed)
+                    renderer.render(stage, split, seed)
                 )
                 for seed in seeds
             ]
         tasks = [(self.config.data_root, stage, split, seed) for seed in seeds]
         return list(self.render_executor.map(TrainingRenderWorkerV2.render_slice, tasks))
 
-    def _build_renderer(self) -> SourceTrackingRendererV2:
+    def _renderer_for_stage(self, stage: str) -> SourceTrackingRendererV2:
+        if stage != "midi_complex":
+            return self.renderer
+        if self.midi_renderer is None:
+            self.midi_renderer = self._build_renderer(include_midi=True)
+        return self.midi_renderer
+
+    def _build_renderer(self, include_midi: bool) -> SourceTrackingRendererV2:
         nsynth = NsynthIndexV2(Path(self.config.data_root))
-        midi = MidiIndexV2(Path(self.config.data_root))
         note_store = NsynthNoteStoreV2(nsynth)
-        midi_store = MidiScheduleStoreV2(midi)
+        midi_store = (
+            MidiScheduleStoreV2(MidiIndexV2(Path(self.config.data_root)))
+            if include_midi
+            else None
+        )
         return SourceTrackingRendererV2(note_store, midi_store)
 
     def _load_warm_start(self, checkpoint: Path) -> None:
