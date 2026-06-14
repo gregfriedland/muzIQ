@@ -70,26 +70,63 @@ class AudioFrameExtractorV2:
         self._fold = self._build_log_fold()
 
     def extract(self, audio: np.ndarray) -> np.ndarray:
-        n_frames = int(np.ceil(len(audio) / self.config.hop))
+        n_frames = self._frame_count(audio)
         if n_frames == 0:
             return np.zeros((0, self.config.bands), dtype=np.float32)
+        return self._normalize_bands(self._raw_bands(audio, 0, n_frames))
+
+    def extract_context(
+        self,
+        audio: np.ndarray,
+        end_frame: int,
+        frame_count: int,
+        peak_warmup_frames: int,
+    ) -> np.ndarray:
+        n_frames = self._frame_count(audio)
+        if n_frames == 0 or frame_count <= 0:
+            return np.zeros((0, self.config.bands), dtype=np.float32)
+        end_frame = min(max(0, int(end_frame)), n_frames - 1)
+        output_start = max(0, end_frame - frame_count + 1)
+        normalize_start = max(0, output_start - max(0, peak_warmup_frames))
+        raw_bands = self._raw_bands(
+            audio,
+            normalize_start,
+            end_frame - normalize_start + 1,
+        )
+        normalized = self._normalize_bands(raw_bands)
+        return normalized[output_start - normalize_start :]
+
+    def _raw_bands(
+        self,
+        audio: np.ndarray,
+        start_frame: int,
+        frame_count: int,
+    ) -> np.ndarray:
+        n_frames = self._frame_count(audio)
         target_samples = n_frames * self.config.hop
         tail = target_samples - len(audio)
         padded = np.pad(
             audio.astype(np.float32, copy=False),
             (self.config.win - self.config.hop, tail),
         )
+        window_start = start_frame * self.config.hop
+        window_stop = (start_frame + frame_count) * self.config.hop
         windows = np.lib.stride_tricks.sliding_window_view(padded, self.config.win)[
-            :: self.config.hop
-        ][:n_frames]
+            window_start:window_stop:self.config.hop
+        ]
         mag = np.abs(np.fft.rfft(windows * self._window, axis=1))
-        raw_bands = (mag @ self._fold.T).astype(np.float32)
+        return (mag @ self._fold.T).astype(np.float32)
+
+    def _normalize_bands(self, raw_bands: np.ndarray) -> np.ndarray:
         frames = np.zeros_like(raw_bands, dtype=np.float32)
         peak = np.full(self.config.bands, 1e-6, dtype=np.float32)
         for frame_idx, bands in enumerate(raw_bands):
             peak = np.maximum(bands, peak * 0.9996)
             frames[frame_idx] = np.clip(bands / np.maximum(peak, 1e-6), 0.0, 1.0)
         return frames
+
+    def _frame_count(self, audio: np.ndarray) -> int:
+        return int(np.ceil(len(audio) / self.config.hop))
 
     def _build_log_fold(self) -> np.ndarray:
         freqs = np.fft.rfftfreq(self.config.win, 1.0 / self.config.sample_rate)
@@ -229,6 +266,47 @@ class SourceTrackingRendererV2:
     def render(
         self, stage: str, split: SplitName, seed: int
     ) -> RenderedSourceTrackingExampleV2:
+        audio, events = self._render_audio_events(stage, split, seed)
+        frames = self.extractor.extract(audio)
+        labels = self._labels_from_events(events, len(audio))
+        return RenderedSourceTrackingExampleV2(
+            stage=stage,
+            split=split,
+            seed=seed,
+            audio=audio,
+            frames=frames,
+            labels=labels,
+            events=tuple(events),
+            sample_rate=self.config.sample_rate,
+        )
+
+    def render_training_slice(
+        self,
+        stage: str,
+        split: SplitName,
+        seed: int,
+        frame_count: int,
+        peak_warmup_frames: int,
+    ) -> dict[str, np.ndarray]:
+        audio, events = self._render_audio_events(stage, split, seed)
+        frame_idx = self._sample_active_frame_from_events(events, len(audio))
+        target = self._label_at_frame(events, len(audio), frame_idx)
+        return {
+            "frames": self.extractor.extract_context(
+                audio,
+                end_frame=frame_idx,
+                frame_count=frame_count,
+                peak_warmup_frames=peak_warmup_frames,
+            ),
+            **target,
+        }
+
+    def _render_audio_events(
+        self,
+        stage: str,
+        split: SplitName,
+        seed: int,
+    ) -> tuple[np.ndarray, list[SourceEventLabelV2]]:
         rng = np.random.default_rng(seed)
         audio = np.zeros(
             int(self.config.duration_s * self.config.sample_rate), dtype=np.float32
@@ -252,18 +330,7 @@ class SourceTrackingRendererV2:
         peak = float(np.max(np.abs(audio)))
         if peak > 1e-6:
             audio = (audio / peak * 0.8).astype(np.float32)
-        frames = self.extractor.extract(audio)
-        labels = self._labels_from_events(events, len(audio))
-        return RenderedSourceTrackingExampleV2(
-            stage=stage,
-            split=split,
-            seed=seed,
-            audio=audio,
-            frames=frames,
-            labels=labels,
-            events=tuple(events),
-            sample_rate=self.config.sample_rate,
-        )
+        return audio, events
 
     def _render_single_note(
         self,
@@ -396,12 +463,7 @@ class SourceTrackingRendererV2:
         for event in events:
             if event.source_id >= self.config.max_sources:
                 continue
-            start = max(
-                0, int(np.floor(event.start_s * self.config.sample_rate / self.config.hop))
-            )
-            end = min(
-                n_frames, int(np.ceil(event.end_s * self.config.sample_rate / self.config.hop))
-            )
+            start, end = self._event_frame_span(event, n_frames)
             if end <= start:
                 continue
             active[start:end, event.source_id] = 1.0
@@ -417,3 +479,64 @@ class SourceTrackingRendererV2:
             source_id=source_id,
             frame_times=frame_times,
         )
+
+    def _sample_active_frame_from_events(
+        self,
+        events: list[SourceEventLabelV2],
+        n_samples: int,
+    ) -> int:
+        n_frames = int(np.ceil(n_samples / self.config.hop))
+        active = np.zeros(n_frames, dtype=np.bool_)
+        for event in events:
+            if event.source_id >= self.config.max_sources:
+                continue
+            start, end = self._event_frame_span(event, n_frames)
+            if end > start:
+                active[start:end] = True
+        active_frames = np.flatnonzero(active)
+        if len(active_frames) == 0:
+            return n_frames - 1
+        return int(active_frames[len(active_frames) // 2])
+
+    def _label_at_frame(
+        self,
+        events: list[SourceEventLabelV2],
+        n_samples: int,
+        frame_idx: int,
+    ) -> dict[str, np.ndarray]:
+        n_frames = int(np.ceil(n_samples / self.config.hop))
+        activity = np.zeros(self.config.max_sources, dtype=np.float32)
+        onset = np.zeros(self.config.max_sources, dtype=np.float32)
+        offset = np.zeros(self.config.max_sources, dtype=np.float32)
+        family = np.full(self.config.max_sources, -1, dtype=np.int32)
+        for event in events:
+            if event.source_id >= self.config.max_sources:
+                continue
+            start, end = self._event_frame_span(event, n_frames)
+            if start <= frame_idx < end:
+                activity[event.source_id] = 1.0
+                family[event.source_id] = event.family_index
+            if frame_idx == start:
+                onset[event.source_id] = 1.0
+            if frame_idx == end - 1:
+                offset[event.source_id] = 1.0
+        return {
+            "activity": activity,
+            "family": family,
+            "onset": onset,
+            "offset": offset,
+        }
+
+    def _event_frame_span(
+        self,
+        event: SourceEventLabelV2,
+        n_frames: int,
+    ) -> tuple[int, int]:
+        start = max(
+            0, int(np.floor(event.start_s * self.config.sample_rate / self.config.hop))
+        )
+        end = min(
+            n_frames,
+            int(np.ceil(event.end_s * self.config.sample_rate / self.config.hop)),
+        )
+        return start, end

@@ -143,6 +143,8 @@ class TrainingConfigV2:
     checkpoint_interval_batches: int = 100
     resume_from_warm_start_metadata: bool = False
     resume_optimizer_state: bool = True
+    training_slice_frames: int = 256
+    training_slice_peak_warmup_frames: int = 512
 
 
 @dataclass(frozen=True)
@@ -238,13 +240,20 @@ class TrainingRenderWorkerV2:
     _renderers: dict[tuple[str, bool], SourceTrackingRendererV2] = {}
 
     @staticmethod
-    def render_slice(task: tuple[str, str, SplitName, int]) -> dict[str, np.ndarray]:
-        data_root, stage, split, seed = task
+    def render_slice(
+        task: tuple[str, str, SplitName, int, int, int],
+    ) -> dict[str, np.ndarray]:
+        data_root, stage, split, seed, frame_count, peak_warmup_frames = task
         renderer = TrainingRenderWorkerV2._renderer(
             data_root, include_midi=stage == "midi_complex"
         )
-        example = renderer.render(stage, split, seed)
-        return TrainingBatchBuilderV2.slice_from_example(example)
+        return renderer.render_training_slice(
+            stage,
+            split,
+            seed,
+            frame_count=frame_count,
+            peak_warmup_frames=peak_warmup_frames,
+        )
 
     @staticmethod
     def _renderer(data_root: str, include_midi: bool) -> SourceTrackingRendererV2:
@@ -479,6 +488,10 @@ class SourceTrackingTrainerV2:
                     self.config.resume_from_warm_start_metadata
                 ),
                 "resume_optimizer_state": self.config.resume_optimizer_state,
+                "training_slice_frames": self.config.training_slice_frames,
+                "training_slice_peak_warmup_frames": (
+                    self.config.training_slice_peak_warmup_frames
+                ),
             },
             force=True,
         )
@@ -903,12 +916,28 @@ class SourceTrackingTrainerV2:
         if self.render_executor is None:
             renderer = self._renderer_for_stage(stage)
             return [
-                TrainingBatchBuilderV2.slice_from_example(
-                    renderer.render(stage, split, seed)
+                renderer.render_training_slice(
+                    stage,
+                    split,
+                    seed,
+                    frame_count=self.config.training_slice_frames,
+                    peak_warmup_frames=(
+                        self.config.training_slice_peak_warmup_frames
+                    ),
                 )
                 for seed in seeds
             ]
-        tasks = [(self.config.data_root, stage, split, seed) for seed in seeds]
+        tasks = [
+            (
+                self.config.data_root,
+                stage,
+                split,
+                seed,
+                self.config.training_slice_frames,
+                self.config.training_slice_peak_warmup_frames,
+            )
+            for seed in seeds
+        ]
         return list(self.render_executor.map(TrainingRenderWorkerV2.render_slice, tasks))
 
     def _renderer_for_stage(self, stage: str) -> SourceTrackingRendererV2:
@@ -1066,6 +1095,16 @@ class TrainingCliV2:
             dest="resume_optimizer_state",
             action="store_false",
             help="Do not restore optimizer state from warm-start checkpoints.",
+        )
+        parser.add_argument(
+            "--training-slice-frames",
+            type=int,
+            default=TrainingConfigV2.training_slice_frames,
+        )
+        parser.add_argument(
+            "--training-slice-peak-warmup-frames",
+            type=int,
+            default=TrainingConfigV2.training_slice_peak_warmup_frames,
         )
         parser.set_defaults(
             resume_optimizer_state=TrainingConfigV2.resume_optimizer_state

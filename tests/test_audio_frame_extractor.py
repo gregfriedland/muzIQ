@@ -20,6 +20,25 @@ class TestAudioFrameExtractorV2:
 
         np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-6)
 
+    def test_context_extract_matches_full_slice_with_complete_warmup(self):
+        rng = np.random.default_rng(11)
+        audio = rng.normal(
+            0.0,
+            0.2,
+            SourceTrackingAudioConfigV2.sample_rate * 2 + 17,
+        ).astype(np.float32)
+        extractor = AudioFrameExtractorV2()
+
+        full = extractor.extract(audio)
+        actual = extractor.extract_context(
+            audio,
+            end_frame=120,
+            frame_count=16,
+            peak_warmup_frames=1_000,
+        )
+
+        np.testing.assert_allclose(actual, full[105:121], rtol=1e-6, atol=1e-6)
+
     @staticmethod
     def _legacy_extract(
         extractor: AudioFrameExtractorV2, audio: np.ndarray

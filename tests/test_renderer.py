@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import numpy as np
 from conftest import TinyCorpusBuilderV2
 
 from muziq_nn.datasets.midi import MidiIndexV2
@@ -10,6 +11,7 @@ from muziq_nn.datasets.render import (
     SourceTrackingAudioConfigV2,
     SourceTrackingRendererV2,
 )
+from muziq_nn.training.train import TrainingBatchBuilderV2
 
 
 class TestRendererV2:
@@ -46,3 +48,28 @@ class TestRendererV2:
         )
         assert active_sources
         assert min(active_sources) == 0
+
+    def test_training_slice_matches_full_render_labels(self, tmp_path):
+        TinyCorpusBuilderV2(tmp_path).build()
+        renderer = SourceTrackingRendererV2(
+            NsynthNoteStoreV2(NsynthIndexV2(tmp_path)),
+            MidiScheduleStoreV2(MidiIndexV2(tmp_path)),
+        )
+
+        full = TrainingBatchBuilderV2.slice_from_example(
+            renderer.render("single_instrument_melody", "train", seed=5)
+        )
+        sliced = renderer.render_training_slice(
+            "single_instrument_melody",
+            "train",
+            seed=5,
+            frame_count=256,
+            peak_warmup_frames=10_000,
+        )
+
+        assert sliced["frames"].shape == full["frames"].shape
+        np.testing.assert_allclose(sliced["frames"], full["frames"], rtol=1e-6, atol=1e-6)
+        assert (sliced["activity"] == full["activity"]).all()
+        assert (sliced["family"] == full["family"]).all()
+        assert (sliced["onset"] == full["onset"]).all()
+        assert (sliced["offset"] == full["offset"]).all()
