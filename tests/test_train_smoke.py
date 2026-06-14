@@ -42,7 +42,10 @@ class TestTrainSmokeV2:
         assert payload["artifacts"]["checkpoint_path"].endswith("checkpoint.pt")
         assert payload["artifacts"]["metrics_path"].endswith("metrics.json")
         assert list((tmp_path / "runs").glob("*/metrics.json"))
-        assert list((tmp_path / "runs").glob("*/checkpoint.pt"))
+        checkpoint = next((tmp_path / "runs").glob("*/checkpoint.pt"))
+        checkpoint_payload = torch.load(checkpoint, map_location="cpu")
+        assert checkpoint_payload["optimizer_state_dict"] is not None
+        assert checkpoint_payload["checkpoint_metadata"]["optimizer_state_included"]
 
     def test_warm_start_checkpoint_runs_one_train_step(self, tmp_path):
         TinyCorpusBuilderV2(tmp_path / "data").build()
@@ -95,6 +98,11 @@ class TestTrainSmokeV2:
         assert metadata["checkpoint_number"] == 1
         assert metadata["phase"] in {"batch_interval", "epoch_done", "training_done"}
         assert "stage" in metadata
+        assert metadata["optimizer_state_included"]
+        assert metadata["optimizer_class"] == "AdamW"
+        uploaded_checkpoint = sorted(upload_root.glob("*/unit-run/checkpoints/*.pt"))[0]
+        checkpoint_payload = torch.load(uploaded_checkpoint, map_location="cpu")
+        assert checkpoint_payload["optimizer_state_dict"] is not None
         assert payload["artifacts"]["checkpoint_upload_uri"].endswith("/unit-run")
 
     def test_resume_cursor_from_warm_start_metadata(self, tmp_path):

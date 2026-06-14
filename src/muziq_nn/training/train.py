@@ -142,6 +142,7 @@ class TrainingConfigV2:
     checkpoint_upload_run_id: str | None = None
     checkpoint_interval_batches: int = 100
     resume_from_warm_start_metadata: bool = False
+    resume_optimizer_state: bool = True
 
 
 @dataclass(frozen=True)
@@ -275,6 +276,8 @@ class CheckpointMetadataV2:
     run_id: str
     created_at_utc: str
     local_checkpoint_path: str
+    optimizer_state_included: bool
+    optimizer_class: str | None
 
 
 @dataclass(frozen=True)
@@ -445,6 +448,8 @@ class SourceTrackingTrainerV2:
         self.renderer = self._build_renderer(include_midi=False)
         self.midi_renderer: SourceTrackingRendererV2 | None = None
         self.warm_start_metadata: dict[str, object] | None = None
+        self.warm_start_optimizer_state: dict[str, object] | None = None
+        self.optimizer_resume_stage: str | None = None
         self.model = DualPathTransformerSourceTrackerV2(SourceTrackingModelConfigV2()).to(
             self.device
         )
@@ -457,6 +462,7 @@ class SourceTrackingTrainerV2:
         self.checkpoint_number = 0
         self.checkpoint_uploader: CheckpointArtifactUploaderV2 | None = None
         self.checkpoint_upload_worker: CheckpointUploadWorkerV2 | None = None
+        self.current_optimizer: torch.optim.Optimizer | None = None
 
     def run(self) -> dict[str, object]:
         self.progress.emit(
@@ -472,6 +478,7 @@ class SourceTrackingTrainerV2:
                 "resume_from_warm_start_metadata": (
                     self.config.resume_from_warm_start_metadata
                 ),
+                "resume_optimizer_state": self.config.resume_optimizer_state,
             },
             force=True,
         )
@@ -499,6 +506,7 @@ class SourceTrackingTrainerV2:
             resume_cursor = self._resume_cursor(stages)
             if resume_cursor is not None:
                 stages = self._stages_from_resume(stages, resume_cursor)
+                self.optimizer_resume_stage = resume_cursor.stage
                 self.checkpoint_number = max(
                     self.checkpoint_number, resume_cursor.checkpoint_number
                 )
@@ -566,7 +574,7 @@ class SourceTrackingTrainerV2:
                 "artifacts": artifacts,
             }
             metrics_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-            torch.save(self.model.state_dict(), checkpoint_path)
+            self._save_final_checkpoint(checkpoint_path, history)
             self._save_checkpoint_artifact(
                 run_dir,
                 phase="training_done",
@@ -577,6 +585,7 @@ class SourceTrackingTrainerV2:
                 examples_seen=sum(row["examples"] for row in history),
                 loss=history[-1]["loss"] if history else None,
                 mean_loss=history[-1]["loss"] if history else None,
+                optimizer=self.current_optimizer,
                 force=True,
             )
             self._close_checkpoint_upload_worker()
@@ -613,6 +622,8 @@ class SourceTrackingTrainerV2:
         first_batch: int = 0,
     ) -> list[dict[str, object]]:
         optimizer = torch.optim.AdamW(self.model.parameters(), lr=stage.learning_rate)
+        self._restore_optimizer_state_if_needed(optimizer, stage.name)
+        self.current_optimizer = optimizer
         rows = []
         batches_per_epoch = max(
             1, int(np.ceil(stage.train_examples_per_epoch / self.config.batch_size))
@@ -676,6 +687,7 @@ class SourceTrackingTrainerV2:
                     ),
                     loss=loss_value,
                     mean_loss=float(np.mean(losses)),
+                    optimizer=optimizer,
                 )
             row = {
                 "stage": stage.name,
@@ -699,6 +711,7 @@ class SourceTrackingTrainerV2:
                 examples_seen=(epoch + 1) * stage.train_examples_per_epoch,
                 loss=row["loss"],
                 mean_loss=row["loss"],
+                optimizer=optimizer,
                 force=True,
             )
             rows.append(row)
@@ -716,6 +729,7 @@ class SourceTrackingTrainerV2:
         examples_seen: int,
         loss: float | None,
         mean_loss: float | None,
+        optimizer: torch.optim.Optimizer | None = None,
         force: bool = False,
     ) -> None:
         if self.checkpoint_uploader is None:
@@ -737,6 +751,7 @@ class SourceTrackingTrainerV2:
             batch,
         )
         checkpoint_path = checkpoint_dir / f"{filename_stem}.pt"
+        optimizer_state = self._optimizer_state_dict(optimizer)
         metadata = CheckpointMetadataV2(
             checkpoint_number=self.checkpoint_number,
             phase=phase,
@@ -750,12 +765,15 @@ class SourceTrackingTrainerV2:
             run_id=self.checkpoint_uploader.run_id,
             created_at_utc=datetime.now(UTC).isoformat(),
             local_checkpoint_path=str(checkpoint_path),
+            optimizer_state_included=optimizer_state is not None,
+            optimizer_class=type(optimizer).__name__ if optimizer is not None else None,
         )
         metadata_path = checkpoint_dir / f"{filename_stem}.json"
         latest_path = checkpoint_dir / "latest.json"
         torch.save(
             {
                 "state_dict": self.model.state_dict(),
+                "optimizer_state_dict": optimizer_state,
                 "checkpoint_metadata": asdict(metadata),
             },
             checkpoint_path,
@@ -814,6 +832,55 @@ class SourceTrackingTrainerV2:
         worker = self.checkpoint_upload_worker
         self.checkpoint_upload_worker = None
         worker.close()
+
+    def _save_final_checkpoint(
+        self, checkpoint_path: Path, history: list[dict[str, object]]
+    ) -> None:
+        optimizer_state = self._optimizer_state_dict(self.current_optimizer)
+        torch.save(
+            {
+                "state_dict": self.model.state_dict(),
+                "optimizer_state_dict": optimizer_state,
+                "checkpoint_metadata": {
+                    "phase": "training_done",
+                    "stage": "complete",
+                    "examples_seen": sum(row["examples"] for row in history),
+                    "loss": history[-1]["loss"] if history else None,
+                    "optimizer_state_included": optimizer_state is not None,
+                    "optimizer_class": type(self.current_optimizer).__name__
+                    if self.current_optimizer is not None
+                    else None,
+                },
+            },
+            checkpoint_path,
+        )
+
+    @staticmethod
+    def _optimizer_state_dict(
+        optimizer: torch.optim.Optimizer | None,
+    ) -> dict[str, object] | None:
+        if optimizer is None:
+            return None
+        return optimizer.state_dict()
+
+    def _restore_optimizer_state_if_needed(
+        self, optimizer: torch.optim.Optimizer, stage_name: str
+    ) -> None:
+        if self.warm_start_optimizer_state is None:
+            return
+        if not self.config.resume_from_warm_start_metadata:
+            return
+        if not self.config.resume_optimizer_state:
+            return
+        if self.optimizer_resume_stage != stage_name:
+            return
+        optimizer.load_state_dict(self.warm_start_optimizer_state)
+        self.progress.emit(
+            "optimizer_state_restored",
+            {"stage": stage_name},
+            force=True,
+        )
+        self.warm_start_optimizer_state = None
 
     @staticmethod
     def _checkpoint_filename_stem(
@@ -922,6 +989,9 @@ class SourceTrackingTrainerV2:
             metadata = payload.get("checkpoint_metadata")
             if isinstance(metadata, dict):
                 self.warm_start_metadata = metadata
+            optimizer_state = payload.get("optimizer_state_dict")
+            if isinstance(optimizer_state, dict):
+                self.warm_start_optimizer_state = optimizer_state
         state_dict = (
             payload.get("state_dict", payload) if isinstance(payload, dict) else payload
         )
@@ -991,6 +1061,15 @@ class TrainingCliV2:
             default=TrainingConfigV2.checkpoint_interval_batches,
         )
         parser.add_argument("--resume-from-warm-start-metadata", action="store_true")
+        parser.add_argument(
+            "--no-resume-optimizer-state",
+            dest="resume_optimizer_state",
+            action="store_false",
+            help="Do not restore optimizer state from warm-start checkpoints.",
+        )
+        parser.set_defaults(
+            resume_optimizer_state=TrainingConfigV2.resume_optimizer_state
+        )
         args = parser.parse_args(argv)
         values = vars(args)
         if not values["generate_on_the_fly"]:
