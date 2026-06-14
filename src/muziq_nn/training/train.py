@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 import time
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass
@@ -109,6 +110,7 @@ class TrainingConfigV2:
     seed: int = 7
     device: str = "auto"
     smoke_examples: int = 0
+    progress_interval_s: float = 10.0
 
 
 class TrainingBatchBuilderV2:
@@ -154,6 +156,29 @@ class TrainingBatchBuilderV2:
         return int(active[len(active) // 2])
 
 
+class TrainingProgressLoggerV2:
+    """Emit periodic JSON progress lines during long training runs."""
+
+    def __init__(self, interval_s: float = 10.0):
+        self.interval_s = interval_s
+        self.started = time.monotonic()
+        self.last_emit = 0.0
+
+    def emit(self, event: str, payload: dict[str, object], force: bool = False) -> None:
+        now = time.monotonic()
+        if not force and now - self.last_emit < self.interval_s:
+            return
+        self.last_emit = now
+        print(
+            json.dumps(
+                {"event": event, "elapsed_s": round(now - self.started, 3), **payload},
+                sort_keys=True,
+            ),
+            file=sys.stderr,
+            flush=True,
+        )
+
+
 class SourceTrackingTrainerV2:
     """Train the compact attention model from generated examples."""
 
@@ -166,15 +191,40 @@ class SourceTrackingTrainerV2:
         )
         self.loss_fn = SourceTrackingLossV2()
         self.batch_builder = TrainingBatchBuilderV2(self.device)
+        self.progress = TrainingProgressLoggerV2(config.progress_interval_s)
 
     def run(self) -> dict[str, object]:
+        self.progress.emit(
+            "training_start",
+            {
+                "device": str(self.device),
+                "curriculum_scale": self.config.curriculum_scale,
+                "batch_size": self.config.batch_size,
+            },
+            force=True,
+        )
         plan = CurriculumPlanV2().scale_examples(self.config.curriculum_scale)
         examples_per_second = self.calibrate()
+        self.progress.emit(
+            "training_calibrated",
+            {"examples_per_second": round(examples_per_second, 3)},
+            force=True,
+        )
         stages = plan.trim_for_hours(examples_per_second, self.config.max_hours)
         if self.config.smoke_examples > 0:
             stages = (
                 CurriculumStageV2("single_note_all", self.config.smoke_examples, 1, 3e-4),
             )
+        self.progress.emit(
+            "training_plan",
+            {
+                "stages": [asdict(stage) for stage in stages],
+                "projected_hours": round(
+                    CurriculumPlanV2._project_hours(stages, examples_per_second), 3
+                ),
+            },
+            force=True,
+        )
         run_dir = self._run_dir()
         history = []
         for stage in stages:
@@ -188,6 +238,7 @@ class SourceTrackingTrainerV2:
         run_dir.mkdir(parents=True, exist_ok=True)
         (run_dir / "metrics.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
         torch.save(self.model.state_dict(), run_dir / "checkpoint.pt")
+        self.progress.emit("training_done", {"run_dir": str(run_dir)}, force=True)
         print(json.dumps({"run_dir": str(run_dir), "history": history[-5:]}, sort_keys=True))
         return payload
 
@@ -205,8 +256,19 @@ class SourceTrackingTrainerV2:
         batches_per_epoch = max(
             1, int(np.ceil(stage.train_examples_per_epoch / self.config.batch_size))
         )
+        self.progress.emit(
+            "training_stage_start",
+            {
+                "stage": stage.name,
+                "epochs": stage.epochs,
+                "batches_per_epoch": batches_per_epoch,
+                "examples_per_epoch": stage.train_examples_per_epoch,
+            },
+            force=True,
+        )
         for epoch in range(stage.epochs):
             losses = []
+            epoch_start = time.monotonic()
             for batch_idx in range(batches_per_epoch):
                 examples = [
                     self.renderer.render(
@@ -225,13 +287,27 @@ class SourceTrackingTrainerV2:
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 optimizer.step()
-                losses.append(float(loss.detach().cpu()))
+                loss_value = float(loss.detach().cpu())
+                losses.append(loss_value)
+                self.progress.emit(
+                    "training_batch_progress",
+                    {
+                        "stage": stage.name,
+                        "epoch": epoch + 1,
+                        "batch": batch_idx + 1,
+                        "batches_per_epoch": batches_per_epoch,
+                        "last_loss": round(loss_value, 6),
+                        "mean_loss": round(float(np.mean(losses)), 6),
+                    },
+                )
             row = {
                 "stage": stage.name,
                 "epoch": epoch + 1,
                 "loss": float(np.mean(losses)),
                 "examples": stage.train_examples_per_epoch,
+                "elapsed_s": round(time.monotonic() - epoch_start, 3),
             }
+            self.progress.emit("training_epoch_done", row, force=True)
             print(json.dumps(row, sort_keys=True), flush=True)
             rows.append(row)
         return rows
@@ -282,6 +358,11 @@ class TrainingCliV2:
         parser.add_argument("--device", default=TrainingConfigV2.device)
         parser.add_argument(
             "--smoke-examples", type=int, default=TrainingConfigV2.smoke_examples
+        )
+        parser.add_argument(
+            "--progress-interval-s",
+            type=float,
+            default=TrainingConfigV2.progress_interval_s,
         )
         args = parser.parse_args(argv)
         values = vars(args)
