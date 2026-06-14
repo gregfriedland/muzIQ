@@ -25,6 +25,11 @@ class TestTrainSmokeV2:
 
         assert [stage.epochs for stage in stages] == [6, 6, 6, 6, 4]
 
+    def test_epochs_per_stage_overrides_all_stage_epochs(self):
+        stages = CurriculumPlanV2().scale_epochs(2).with_epochs_per_stage(50).stages
+
+        assert [stage.epochs for stage in stages] == [50, 50, 50, 50, 50]
+
     def test_one_train_step_writes_metrics_and_checkpoint(self, tmp_path):
         TinyCorpusBuilderV2(tmp_path / "data").build()
         config = TrainingConfigV2(

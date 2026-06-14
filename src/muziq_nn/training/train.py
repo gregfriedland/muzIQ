@@ -91,6 +91,23 @@ class CurriculumPlanV2:
             )
         )
 
+    def with_epochs_per_stage(self, epochs: int | None) -> CurriculumPlanV2:
+        if epochs is None:
+            return self
+        if epochs <= 0:
+            raise ValueError("epochs per stage must be positive")
+        return CurriculumPlanV2(
+            tuple(
+                CurriculumStageV2(
+                    stage.name,
+                    stage.train_examples_per_epoch,
+                    epochs,
+                    stage.learning_rate,
+                )
+                for stage in self.stages
+            )
+        )
+
     def trim_for_hours(
         self, examples_per_second: float, max_hours: float
     ) -> tuple[CurriculumStageV2, ...]:
@@ -140,6 +157,7 @@ class TrainingConfigV2:
     render_workers: int = 1
     warm_start_checkpoint: str | None = None
     epoch_multiplier: float = 1.0
+    epochs_per_stage: int | None = None
     checkpoint_upload_uri: str | None = None
     checkpoint_upload_run_id: str | None = None
     checkpoint_interval_batches: int = 100
@@ -560,6 +578,7 @@ class SourceTrackingTrainerV2:
                 "batch_size": self.config.batch_size,
                 "render_workers": self.config.render_workers,
                 "warm_start_checkpoint": self.config.warm_start_checkpoint,
+                "epochs_per_stage": self.config.epochs_per_stage,
                 "checkpoint_upload_uri": self.config.checkpoint_upload_uri,
                 "checkpoint_interval_batches": self.config.checkpoint_interval_batches,
                 "resume_from_warm_start_metadata": (
@@ -591,6 +610,7 @@ class SourceTrackingTrainerV2:
                 CurriculumPlanV2()
                 .scale_examples(self.config.curriculum_scale)
                 .scale_epochs(self.config.epoch_multiplier)
+                .with_epochs_per_stage(self.config.epochs_per_stage)
             )
             examples_per_second = self.calibrate()
             self.progress.emit(
@@ -1319,6 +1339,11 @@ class TrainingCliV2:
             "--epoch-multiplier",
             type=float,
             default=TrainingConfigV2.epoch_multiplier,
+        )
+        parser.add_argument(
+            "--epochs-per-stage",
+            type=int,
+            default=TrainingConfigV2.epochs_per_stage,
         )
         parser.add_argument("--checkpoint-upload-uri")
         parser.add_argument("--checkpoint-upload-run-id")
