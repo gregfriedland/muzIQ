@@ -12,7 +12,8 @@ import sys
 import threading
 import time
 from collections.abc import Sequence
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -147,6 +148,14 @@ class TrainingConfigV2:
     training_slice_frames: int = 256
     training_slice_peak_warmup_frames: int = 512
     gpu_frame_extraction: bool = False
+    pin_memory: bool = False
+    prefetch_batches: int = 0
+    mixed_precision: bool = False
+    partial_warm_start: bool = False
+    model_dim: int = 128
+    model_heads: int = 4
+    model_layers: int = 2
+    identity_dim: int = 16
 
 
 @dataclass(frozen=True)
@@ -160,9 +169,15 @@ class TrainingResumeCursorV2:
 class TrainingBatchBuilderV2:
     """Convert rendered frame endpoints into torch training batches."""
 
-    def __init__(self, device: torch.device, frame_count: int = 256):
+    def __init__(
+        self,
+        device: torch.device,
+        frame_count: int = 256,
+        pin_memory: bool = False,
+    ):
         self.device = device
         self.frame_count = frame_count
+        self.pin_memory = pin_memory and device.type == "cuda"
         extractor = AudioFrameExtractorV2()
         self.frame_window = torch.from_numpy(extractor._window).to(device)
         self.frame_fold = torch.from_numpy(extractor._fold.T).to(device)
@@ -182,12 +197,10 @@ class TrainingBatchBuilderV2:
             offset.append(item["offset"])
         return {
             "frames": self._build_frame_tensor(slices),
-            "activity": torch.from_numpy(np.asarray(activity, dtype=np.float32)).to(
-                self.device
-            ),
-            "family": torch.from_numpy(np.asarray(family, dtype=np.int64)).to(self.device),
-            "onset": torch.from_numpy(np.asarray(onset, dtype=np.float32)).to(self.device),
-            "offset": torch.from_numpy(np.asarray(offset, dtype=np.float32)).to(self.device),
+            "activity": self._to_device(np.asarray(activity, dtype=np.float32)),
+            "family": self._to_device(np.asarray(family, dtype=np.int64)),
+            "onset": self._to_device(np.asarray(onset, dtype=np.float32)),
+            "offset": self._to_device(np.asarray(offset, dtype=np.float32)),
         }
 
     def _build_frame_tensor(self, slices) -> torch.Tensor:
@@ -200,11 +213,11 @@ class TrainingBatchBuilderV2:
         )
         for idx, frame in enumerate(frames):
             padded[idx, -frame.shape[0] :] = frame
-        return torch.from_numpy(padded).to(self.device)
+        return self._to_device(padded)
 
     def _build_frame_tensor_from_audio(self, slices) -> torch.Tensor:
         audio = np.stack([item["audio_context"] for item in slices]).astype(np.float32)
-        audio_tensor = torch.from_numpy(audio).to(self.device)
+        audio_tensor = self._to_device(audio)
         windows = audio_tensor.unfold(
             dimension=1,
             size=SourceTrackingAudioConfigV2.win,
@@ -213,6 +226,12 @@ class TrainingBatchBuilderV2:
         mag = torch.fft.rfft(windows * self.frame_window, dim=-1).abs()
         raw_bands = torch.matmul(mag.float(), self.frame_fold)
         return self._normalize_bands(raw_bands)[:, -self.frame_count :, :]
+
+    def _to_device(self, array: np.ndarray) -> torch.Tensor:
+        tensor = torch.from_numpy(array)
+        if self.pin_memory:
+            tensor = tensor.pin_memory()
+        return tensor.to(self.device, non_blocking=self.pin_memory)
 
     @staticmethod
     def _normalize_bands(raw_bands: torch.Tensor) -> torch.Tensor:
@@ -509,15 +528,21 @@ class SourceTrackingTrainerV2:
         self.warm_start_metadata: dict[str, object] | None = None
         self.warm_start_optimizer_state: dict[str, object] | None = None
         self.optimizer_resume_stage: str | None = None
-        self.model = DualPathTransformerSourceTrackerV2(SourceTrackingModelConfigV2()).to(
-            self.device
+        self.warm_start_load_report: dict[str, object] | None = None
+        self.model_config = SourceTrackingModelConfigV2(
+            model_dim=config.model_dim,
+            heads=config.model_heads,
+            layers=config.model_layers,
+            identity_dim=config.identity_dim,
         )
+        self.model = DualPathTransformerSourceTrackerV2(self.model_config).to(self.device)
         if config.warm_start_checkpoint is not None:
             self._load_warm_start(Path(config.warm_start_checkpoint))
         self.loss_fn = SourceTrackingLossV2()
         self.batch_builder = TrainingBatchBuilderV2(
             self.device,
             frame_count=config.training_slice_frames,
+            pin_memory=config.pin_memory,
         )
         self.progress = TrainingProgressLoggerV2(config.progress_interval_s)
         self.render_executor: ProcessPoolExecutor | None = None
@@ -546,9 +571,17 @@ class SourceTrackingTrainerV2:
                     self.config.training_slice_peak_warmup_frames
                 ),
                 "gpu_frame_extraction": self.config.gpu_frame_extraction,
+                "pin_memory": self.config.pin_memory,
+                "prefetch_batches": self.config.prefetch_batches,
+                "mixed_precision": self.config.mixed_precision,
+                "partial_warm_start": self.config.partial_warm_start,
+                "model_config": asdict(self.model_config),
+                "warm_start_load_report": self.warm_start_load_report,
             },
             force=True,
         )
+        if self.config.mixed_precision and self.device.type == "cuda":
+            torch.set_float32_matmul_precision("high")
         try:
             if self.config.render_workers > 1:
                 self.render_executor = ProcessPoolExecutor(
@@ -711,19 +744,15 @@ class SourceTrackingTrainerV2:
             losses = []
             epoch_start = time.monotonic()
             batch_start = first_batch if epoch == first_epoch - 1 else 0
-            for batch_idx in range(batch_start, batches_per_epoch):
-                seeds = [
-                    self.config.seed
-                    + epoch * 1_000_000
-                    + batch_idx * self.config.batch_size
-                    + row
-                    for row in range(self.config.batch_size)
-                ]
-                batch = self.batch_builder.build_slices(
-                    self._render_slices(stage.name, "train", seeds)
-                )
-                outputs = self.model(batch["frames"])
-                loss = self.loss_fn(outputs, batch)
+            for batch_idx, batch in self._iter_training_batches(
+                stage.name,
+                epoch,
+                batch_start,
+                batches_per_epoch,
+            ):
+                with self._autocast_context():
+                    outputs = self.model(batch["frames"])
+                    loss = self.loss_fn(outputs, batch)
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 optimizer.step()
@@ -783,6 +812,75 @@ class SourceTrackingTrainerV2:
             )
             rows.append(row)
         return rows
+
+    def _iter_training_batches(
+        self,
+        stage_name: str,
+        epoch: int,
+        batch_start: int,
+        batches_per_epoch: int,
+    ):
+        if self.config.prefetch_batches <= 0:
+            for batch_idx in range(batch_start, batches_per_epoch):
+                yield batch_idx, self._build_training_batch(stage_name, epoch, batch_idx)
+            return
+        batch_indices = iter(range(batch_start, batches_per_epoch))
+        pending: list[tuple[int, Future[dict[str, torch.Tensor]]]] = []
+        with ThreadPoolExecutor(
+            max_workers=self.config.prefetch_batches,
+            thread_name_prefix="training-batch-prefetch-v2",
+        ) as prefetch_executor:
+
+            def enqueue_next() -> bool:
+                try:
+                    next_batch_idx = next(batch_indices)
+                except StopIteration:
+                    return False
+                pending.append(
+                    (
+                        next_batch_idx,
+                        prefetch_executor.submit(
+                            self._build_training_batch,
+                            stage_name,
+                            epoch,
+                            next_batch_idx,
+                        ),
+                    )
+                )
+                return True
+
+            for _ in range(self.config.prefetch_batches):
+                if not enqueue_next():
+                    break
+            while pending:
+                batch_idx, future = pending.pop(0)
+                enqueue_next()
+                yield batch_idx, future.result()
+
+    def _build_training_batch(
+        self,
+        stage_name: str,
+        epoch: int,
+        batch_idx: int,
+    ) -> dict[str, torch.Tensor]:
+        seeds = self._batch_seeds(epoch, batch_idx)
+        return self.batch_builder.build_slices(
+            self._render_slices(stage_name, "train", seeds)
+        )
+
+    def _batch_seeds(self, epoch: int, batch_idx: int) -> list[int]:
+        return [
+            self.config.seed
+            + epoch * 1_000_000
+            + batch_idx * self.config.batch_size
+            + row
+            for row in range(self.config.batch_size)
+        ]
+
+    def _autocast_context(self):
+        if self.config.mixed_precision and self.device.type == "cuda":
+            return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+        return nullcontext()
 
     def _save_checkpoint_artifact(
         self,
@@ -934,6 +1032,14 @@ class SourceTrackingTrainerV2:
         self, optimizer: torch.optim.Optimizer, stage_name: str
     ) -> None:
         if self.warm_start_optimizer_state is None:
+            return
+        if self.config.partial_warm_start:
+            self.progress.emit(
+                "optimizer_state_skipped",
+                {"stage": stage_name, "reason": "partial_warm_start"},
+                force=True,
+            )
+            self.warm_start_optimizer_state = None
             return
         if not self.config.resume_from_warm_start_metadata:
             return
@@ -1132,7 +1238,31 @@ class SourceTrackingTrainerV2:
         state_dict = (
             payload.get("state_dict", payload) if isinstance(payload, dict) else payload
         )
-        self.model.load_state_dict(state_dict)
+        if self.config.partial_warm_start:
+            self._load_partial_state_dict(state_dict)
+        else:
+            self.model.load_state_dict(state_dict)
+            self.warm_start_load_report = {
+                "mode": "strict",
+                "loaded_tensors": len(state_dict),
+            }
+
+    def _load_partial_state_dict(self, state_dict: dict[str, torch.Tensor]) -> None:
+        model_state = self.model.state_dict()
+        matched = {
+            name: value
+            for name, value in state_dict.items()
+            if name in model_state and model_state[name].shape == value.shape
+        }
+        skipped = sorted(set(state_dict) - set(matched))
+        result = self.model.load_state_dict(matched, strict=False)
+        self.warm_start_load_report = {
+            "mode": "partial",
+            "loaded_tensors": len(matched),
+            "skipped_tensors": len(skipped),
+            "missing_tensors": len(result.missing_keys),
+            "unexpected_tensors": len(result.unexpected_keys),
+        }
 
     def _run_dir(self) -> Path:
         stamp = time.strftime("%Y%m%d-%H%M%S")
@@ -1215,6 +1345,34 @@ class TrainingCliV2:
             default=TrainingConfigV2.training_slice_peak_warmup_frames,
         )
         parser.add_argument("--gpu-frame-extraction", action="store_true")
+        parser.add_argument("--pin-memory", action="store_true")
+        parser.add_argument(
+            "--prefetch-batches",
+            type=int,
+            default=TrainingConfigV2.prefetch_batches,
+        )
+        parser.add_argument("--mixed-precision", action="store_true")
+        parser.add_argument("--partial-warm-start", action="store_true")
+        parser.add_argument(
+            "--model-dim",
+            type=int,
+            default=TrainingConfigV2.model_dim,
+        )
+        parser.add_argument(
+            "--model-heads",
+            type=int,
+            default=TrainingConfigV2.model_heads,
+        )
+        parser.add_argument(
+            "--model-layers",
+            type=int,
+            default=TrainingConfigV2.model_layers,
+        )
+        parser.add_argument(
+            "--identity-dim",
+            type=int,
+            default=TrainingConfigV2.identity_dim,
+        )
         parser.set_defaults(
             resume_optimizer_state=TrainingConfigV2.resume_optimizer_state
         )

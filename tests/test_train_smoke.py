@@ -75,6 +75,60 @@ class TestTrainSmokeV2:
         assert payload["artifacts"]["checkpoint_path"].endswith("checkpoint.pt")
         assert list((tmp_path / "runs" / "second").glob("*/checkpoint.pt"))
 
+    def test_prefetch_train_step_runs(self, tmp_path):
+        TinyCorpusBuilderV2(tmp_path / "data").build()
+        config = TrainingConfigV2(
+            data_root=str(tmp_path / "data"),
+            run_root=str(tmp_path / "runs"),
+            calibration_examples=2,
+            batch_size=2,
+            smoke_examples=2,
+            device="cpu",
+            prefetch_batches=1,
+        )
+
+        payload = SourceTrackingTrainerV2(config).run()
+
+        assert payload["history"]
+        assert payload["config"]["prefetch_batches"] == 1
+
+    def test_partial_warm_start_loads_matching_deeper_model_tensors(self, tmp_path):
+        TinyCorpusBuilderV2(tmp_path / "data").build()
+        checkpoint_path = tmp_path / "checkpoint.pt"
+        base = SourceTrackingTrainerV2(
+            TrainingConfigV2(data_root=str(tmp_path / "data"), device="cpu")
+        )
+        torch.save(
+            {
+                "state_dict": base.model.state_dict(),
+                "checkpoint_metadata": {
+                    "checkpoint_number": 12,
+                    "phase": "batch_interval",
+                    "stage": "simple_duo_trio",
+                    "epoch": 1,
+                    "batch": 25,
+                    "batches_per_epoch": 313,
+                    "examples_seen": 6_400,
+                },
+            },
+            checkpoint_path,
+        )
+
+        trainer = SourceTrackingTrainerV2(
+            TrainingConfigV2(
+                data_root=str(tmp_path / "data"),
+                device="cpu",
+                warm_start_checkpoint=str(checkpoint_path),
+                partial_warm_start=True,
+                model_layers=4,
+            )
+        )
+
+        assert trainer.warm_start_load_report is not None
+        assert trainer.warm_start_load_report["mode"] == "partial"
+        assert trainer.warm_start_load_report["loaded_tensors"] > 0
+        assert trainer.warm_start_load_report["missing_tensors"] > 0
+
     def test_checkpoint_upload_writes_numbered_artifacts(self, tmp_path):
         TinyCorpusBuilderV2(tmp_path / "data").build()
         upload_root = tmp_path / "uploads"
