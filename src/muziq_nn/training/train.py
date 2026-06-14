@@ -67,6 +67,21 @@ class CurriculumPlanV2:
             )
         )
 
+    def scale_epochs(self, multiplier: float) -> CurriculumPlanV2:
+        if multiplier <= 0.0:
+            raise ValueError("epoch multiplier must be positive")
+        return CurriculumPlanV2(
+            tuple(
+                CurriculumStageV2(
+                    stage.name,
+                    stage.train_examples_per_epoch,
+                    max(1, int(round(stage.epochs * multiplier))),
+                    stage.learning_rate,
+                )
+                for stage in self.stages
+            )
+        )
+
     def trim_for_hours(
         self, examples_per_second: float, max_hours: float
     ) -> tuple[CurriculumStageV2, ...]:
@@ -114,6 +129,8 @@ class TrainingConfigV2:
     smoke_examples: int = 0
     progress_interval_s: float = 10.0
     render_workers: int = 1
+    warm_start_checkpoint: str | None = None
+    epoch_multiplier: float = 1.0
 
 
 class TrainingBatchBuilderV2:
@@ -232,6 +249,8 @@ class SourceTrackingTrainerV2:
         self.model = DualPathTransformerSourceTrackerV2(SourceTrackingModelConfigV2()).to(
             self.device
         )
+        if config.warm_start_checkpoint is not None:
+            self._load_warm_start(Path(config.warm_start_checkpoint))
         self.loss_fn = SourceTrackingLossV2()
         self.batch_builder = TrainingBatchBuilderV2(self.device)
         self.progress = TrainingProgressLoggerV2(config.progress_interval_s)
@@ -245,6 +264,7 @@ class SourceTrackingTrainerV2:
                 "curriculum_scale": self.config.curriculum_scale,
                 "batch_size": self.config.batch_size,
                 "render_workers": self.config.render_workers,
+                "warm_start_checkpoint": self.config.warm_start_checkpoint,
             },
             force=True,
         )
@@ -253,7 +273,11 @@ class SourceTrackingTrainerV2:
                 self.render_executor = ProcessPoolExecutor(
                     max_workers=self.config.render_workers
                 )
-            plan = CurriculumPlanV2().scale_examples(self.config.curriculum_scale)
+            plan = (
+                CurriculumPlanV2()
+                .scale_examples(self.config.curriculum_scale)
+                .scale_epochs(self.config.epoch_multiplier)
+            )
             examples_per_second = self.calibrate()
             self.progress.emit(
                 "training_calibrated",
@@ -279,20 +303,29 @@ class SourceTrackingTrainerV2:
             history = []
             for stage in stages:
                 history.extend(self._train_stage(stage))
+            metrics_path = run_dir / "metrics.json"
+            checkpoint_path = run_dir / "checkpoint.pt"
+            artifacts = {
+                "run_dir": str(run_dir),
+                "metrics_path": str(metrics_path),
+                "checkpoint_path": str(checkpoint_path),
+            }
             payload = {
                 "config": asdict(self.config),
                 "examples_per_second": examples_per_second,
                 "stages": [asdict(stage) for stage in stages],
                 "history": history,
+                "artifacts": artifacts,
             }
             run_dir.mkdir(parents=True, exist_ok=True)
-            (run_dir / "metrics.json").write_text(
-                json.dumps(payload, indent=2), encoding="utf-8"
-            )
-            torch.save(self.model.state_dict(), run_dir / "checkpoint.pt")
-            self.progress.emit("training_done", {"run_dir": str(run_dir)}, force=True)
+            metrics_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            torch.save(self.model.state_dict(), checkpoint_path)
+            self.progress.emit("training_done", artifacts, force=True)
             print(
-                json.dumps({"run_dir": str(run_dir), "history": history[-5:]}, sort_keys=True)
+                json.dumps(
+                    {"artifacts": artifacts, "history": history[-5:]},
+                    sort_keys=True,
+                )
             )
             return payload
         finally:
@@ -391,6 +424,15 @@ class SourceTrackingTrainerV2:
         midi_store = MidiScheduleStoreV2(midi)
         return SourceTrackingRendererV2(note_store, midi_store)
 
+    def _load_warm_start(self, checkpoint: Path) -> None:
+        if not checkpoint.exists():
+            raise FileNotFoundError(f"Warm-start checkpoint not found: {checkpoint}")
+        payload = torch.load(checkpoint, map_location=self.device)
+        state_dict = (
+            payload.get("state_dict", payload) if isinstance(payload, dict) else payload
+        )
+        self.model.load_state_dict(state_dict)
+
     def _run_dir(self) -> Path:
         stamp = time.strftime("%Y%m%d-%H%M%S")
         return Path(self.config.run_root) / stamp
@@ -440,6 +482,12 @@ class TrainingCliV2:
             "--render-workers",
             type=int,
             default=TrainingConfigV2.render_workers,
+        )
+        parser.add_argument("--warm-start-checkpoint")
+        parser.add_argument(
+            "--epoch-multiplier",
+            type=float,
+            default=TrainingConfigV2.epoch_multiplier,
         )
         args = parser.parse_args(argv)
         values = vars(args)
