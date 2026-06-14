@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+import torch
 from conftest import TinyCorpusBuilderV2
 
 from muziq_nn.datasets.midi import MidiIndexV2
@@ -73,3 +74,42 @@ class TestRendererV2:
         assert (sliced["family"] == full["family"]).all()
         assert (sliced["onset"] == full["onset"]).all()
         assert (sliced["offset"] == full["offset"]).all()
+
+    def test_audio_training_slice_matches_cpu_frame_slice_after_batching(
+        self, tmp_path
+    ):
+        TinyCorpusBuilderV2(tmp_path).build()
+        renderer = SourceTrackingRendererV2(
+            NsynthNoteStoreV2(NsynthIndexV2(tmp_path)),
+            MidiScheduleStoreV2(MidiIndexV2(tmp_path)),
+        )
+        builder = TrainingBatchBuilderV2(torch.device("cpu"), frame_count=256)
+
+        frame_slice = renderer.render_training_slice(
+            "single_instrument_melody",
+            "train",
+            seed=6,
+            frame_count=256,
+            peak_warmup_frames=512,
+        )
+        audio_slice = renderer.render_training_audio_slice(
+            "single_instrument_melody",
+            "train",
+            seed=6,
+            frame_count=256,
+            peak_warmup_frames=512,
+        )
+
+        frame_batch = builder.build_slices([frame_slice])
+        audio_batch = builder.build_slices([audio_slice])
+
+        torch.testing.assert_close(
+            audio_batch["frames"],
+            frame_batch["frames"],
+            rtol=5e-4,
+            atol=5e-4,
+        )
+        torch.testing.assert_close(audio_batch["activity"], frame_batch["activity"])
+        torch.testing.assert_close(audio_batch["family"], frame_batch["family"])
+        torch.testing.assert_close(audio_batch["onset"], frame_batch["onset"])
+        torch.testing.assert_close(audio_batch["offset"], frame_batch["offset"])

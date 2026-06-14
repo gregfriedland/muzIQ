@@ -301,6 +301,27 @@ class SourceTrackingRendererV2:
             **target,
         }
 
+    def render_training_audio_slice(
+        self,
+        stage: str,
+        split: SplitName,
+        seed: int,
+        frame_count: int,
+        peak_warmup_frames: int,
+    ) -> dict[str, np.ndarray]:
+        audio, events = self._render_audio_events(stage, split, seed)
+        frame_idx = self._sample_active_frame_from_events(events, len(audio))
+        target = self._label_at_frame(events, len(audio), frame_idx)
+        return {
+            "audio_context": self._audio_context_for_frame(
+                audio,
+                end_frame=frame_idx,
+                frame_count=frame_count,
+                peak_warmup_frames=peak_warmup_frames,
+            ),
+            **target,
+        }
+
     def _render_audio_events(
         self,
         stage: str,
@@ -540,3 +561,23 @@ class SourceTrackingRendererV2:
             int(np.ceil(event.end_s * self.config.sample_rate / self.config.hop)),
         )
         return start, end
+
+    def _audio_context_for_frame(
+        self,
+        audio: np.ndarray,
+        end_frame: int,
+        frame_count: int,
+        peak_warmup_frames: int,
+    ) -> np.ndarray:
+        raw_frame_count = max(1, frame_count + max(0, peak_warmup_frames))
+        segment_len = self.config.win + (raw_frame_count - 1) * self.config.hop
+        end_sample = (end_frame + 1) * self.config.hop
+        start_sample = end_sample - segment_len
+        context = np.zeros(segment_len, dtype=np.float32)
+        src_start = max(0, start_sample)
+        src_end = min(len(audio), end_sample)
+        if src_end <= src_start:
+            return context
+        dst_start = src_start - start_sample
+        context[dst_start : dst_start + src_end - src_start] = audio[src_start:src_end]
+        return context

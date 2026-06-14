@@ -24,6 +24,7 @@ import torch
 from muziq_nn.datasets.midi import MidiIndexV2
 from muziq_nn.datasets.nsynth import NsynthIndexV2
 from muziq_nn.datasets.render import (
+    AudioFrameExtractorV2,
     MidiScheduleStoreV2,
     NsynthNoteStoreV2,
     SourceTrackingAudioConfigV2,
@@ -145,6 +146,7 @@ class TrainingConfigV2:
     resume_optimizer_state: bool = True
     training_slice_frames: int = 256
     training_slice_peak_warmup_frames: int = 512
+    gpu_frame_extraction: bool = False
 
 
 @dataclass(frozen=True)
@@ -158,32 +160,28 @@ class TrainingResumeCursorV2:
 class TrainingBatchBuilderV2:
     """Convert rendered frame endpoints into torch training batches."""
 
-    def __init__(self, device: torch.device):
+    def __init__(self, device: torch.device, frame_count: int = 256):
         self.device = device
+        self.frame_count = frame_count
+        extractor = AudioFrameExtractorV2()
+        self.frame_window = torch.from_numpy(extractor._window).to(device)
+        self.frame_fold = torch.from_numpy(extractor._fold.T).to(device)
 
     def build(self, examples) -> dict[str, torch.Tensor]:
         return self.build_slices([self.slice_from_example(example) for example in examples])
 
     def build_slices(self, slices) -> dict[str, torch.Tensor]:
-        frames = []
         activity = []
         family = []
         onset = []
         offset = []
         for item in slices:
-            frames.append(item["frames"])
             activity.append(item["activity"])
             family.append(np.maximum(item["family"], 0))
             onset.append(item["onset"])
             offset.append(item["offset"])
-        max_len = max(frame.shape[0] for frame in frames)
-        padded = np.zeros(
-            (len(frames), max_len, SourceTrackingAudioConfigV2.bands), dtype=np.float32
-        )
-        for idx, frame in enumerate(frames):
-            padded[idx, -frame.shape[0] :] = frame
         return {
-            "frames": torch.from_numpy(padded).to(self.device),
+            "frames": self._build_frame_tensor(slices),
             "activity": torch.from_numpy(np.asarray(activity, dtype=np.float32)).to(
                 self.device
             ),
@@ -191,6 +189,42 @@ class TrainingBatchBuilderV2:
             "onset": torch.from_numpy(np.asarray(onset, dtype=np.float32)).to(self.device),
             "offset": torch.from_numpy(np.asarray(offset, dtype=np.float32)).to(self.device),
         }
+
+    def _build_frame_tensor(self, slices) -> torch.Tensor:
+        if slices and "audio_context" in slices[0]:
+            return self._build_frame_tensor_from_audio(slices)
+        frames = [item["frames"] for item in slices]
+        max_len = max(frame.shape[0] for frame in frames)
+        padded = np.zeros(
+            (len(frames), max_len, SourceTrackingAudioConfigV2.bands), dtype=np.float32
+        )
+        for idx, frame in enumerate(frames):
+            padded[idx, -frame.shape[0] :] = frame
+        return torch.from_numpy(padded).to(self.device)
+
+    def _build_frame_tensor_from_audio(self, slices) -> torch.Tensor:
+        audio = np.stack([item["audio_context"] for item in slices]).astype(np.float32)
+        audio_tensor = torch.from_numpy(audio).to(self.device)
+        windows = audio_tensor.unfold(
+            dimension=1,
+            size=SourceTrackingAudioConfigV2.win,
+            step=SourceTrackingAudioConfigV2.hop,
+        )
+        mag = torch.fft.rfft(windows * self.frame_window, dim=-1).abs()
+        raw_bands = torch.matmul(mag.float(), self.frame_fold)
+        return self._normalize_bands(raw_bands)[:, -self.frame_count :, :]
+
+    @staticmethod
+    def _normalize_bands(raw_bands: torch.Tensor) -> torch.Tensor:
+        frame_count = raw_bands.shape[1]
+        if frame_count == 0:
+            return raw_bands
+        powers = torch.pow(
+            torch.tensor(0.9996, dtype=raw_bands.dtype, device=raw_bands.device),
+            torch.arange(frame_count, dtype=raw_bands.dtype, device=raw_bands.device),
+        ).view(1, frame_count, 1)
+        peak = torch.cummax(raw_bands / powers, dim=1).values * powers
+        return torch.clamp(raw_bands / torch.clamp_min(peak, 1e-6), 0.0, 1.0)
 
     @classmethod
     def slice_from_example(cls, example) -> dict[str, np.ndarray]:
@@ -241,12 +275,28 @@ class TrainingRenderWorkerV2:
 
     @staticmethod
     def render_slice(
-        task: tuple[str, str, SplitName, int, int, int],
+        task: tuple[str, str, SplitName, int, int, int, bool],
     ) -> dict[str, np.ndarray]:
-        data_root, stage, split, seed, frame_count, peak_warmup_frames = task
+        (
+            data_root,
+            stage,
+            split,
+            seed,
+            frame_count,
+            peak_warmup_frames,
+            gpu_frame_extraction,
+        ) = task
         renderer = TrainingRenderWorkerV2._renderer(
             data_root, include_midi=stage == "midi_complex"
         )
+        if gpu_frame_extraction:
+            return renderer.render_training_audio_slice(
+                stage,
+                split,
+                seed,
+                frame_count=frame_count,
+                peak_warmup_frames=peak_warmup_frames,
+            )
         return renderer.render_training_slice(
             stage,
             split,
@@ -465,7 +515,10 @@ class SourceTrackingTrainerV2:
         if config.warm_start_checkpoint is not None:
             self._load_warm_start(Path(config.warm_start_checkpoint))
         self.loss_fn = SourceTrackingLossV2()
-        self.batch_builder = TrainingBatchBuilderV2(self.device)
+        self.batch_builder = TrainingBatchBuilderV2(
+            self.device,
+            frame_count=config.training_slice_frames,
+        )
         self.progress = TrainingProgressLoggerV2(config.progress_interval_s)
         self.render_executor: ProcessPoolExecutor | None = None
         self.checkpoint_number = 0
@@ -492,6 +545,7 @@ class SourceTrackingTrainerV2:
                 "training_slice_peak_warmup_frames": (
                     self.config.training_slice_peak_warmup_frames
                 ),
+                "gpu_frame_extraction": self.config.gpu_frame_extraction,
             },
             force=True,
         )
@@ -916,14 +970,11 @@ class SourceTrackingTrainerV2:
         if self.render_executor is None:
             renderer = self._renderer_for_stage(stage)
             return [
-                renderer.render_training_slice(
+                self._render_training_slice(
+                    renderer,
                     stage,
                     split,
                     seed,
-                    frame_count=self.config.training_slice_frames,
-                    peak_warmup_frames=(
-                        self.config.training_slice_peak_warmup_frames
-                    ),
                 )
                 for seed in seeds
             ]
@@ -935,10 +986,34 @@ class SourceTrackingTrainerV2:
                 seed,
                 self.config.training_slice_frames,
                 self.config.training_slice_peak_warmup_frames,
+                self.config.gpu_frame_extraction,
             )
             for seed in seeds
         ]
         return list(self.render_executor.map(TrainingRenderWorkerV2.render_slice, tasks))
+
+    def _render_training_slice(
+        self,
+        renderer: SourceTrackingRendererV2,
+        stage: str,
+        split: SplitName,
+        seed: int,
+    ) -> dict[str, np.ndarray]:
+        if self.config.gpu_frame_extraction:
+            return renderer.render_training_audio_slice(
+                stage,
+                split,
+                seed,
+                frame_count=self.config.training_slice_frames,
+                peak_warmup_frames=self.config.training_slice_peak_warmup_frames,
+            )
+        return renderer.render_training_slice(
+            stage,
+            split,
+            seed,
+            frame_count=self.config.training_slice_frames,
+            peak_warmup_frames=self.config.training_slice_peak_warmup_frames,
+        )
 
     def _renderer_for_stage(self, stage: str) -> SourceTrackingRendererV2:
         if stage != "midi_complex":
@@ -1139,6 +1214,7 @@ class TrainingCliV2:
             type=int,
             default=TrainingConfigV2.training_slice_peak_warmup_frames,
         )
+        parser.add_argument("--gpu-frame-extraction", action="store_true")
         parser.set_defaults(
             resume_optimizer_state=TrainingConfigV2.resume_optimizer_state
         )
