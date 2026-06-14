@@ -5,8 +5,11 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import sys
 import tarfile
+import time
 import urllib.request
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import mido
@@ -189,15 +192,87 @@ class MidiScheduleBoundsV2:
     MAX_EVENTS = 2_048
     MAX_DURATION_S = 600.0
     MAX_TRACKS = 12
+    MAX_PAYLOAD_BYTES = 1_000_000
 
     def accepts(self, schedule: MidiScheduleV2) -> bool:
+        return self.reject_reason(schedule) is None
+
+    def reject_reason(self, schedule: MidiScheduleV2) -> str | None:
         if len(schedule.events) == 0:
-            return False
+            return "empty"
         if len(schedule.events) > self.MAX_EVENTS:
-            return False
+            return "too_many_events"
         if schedule.duration_s > self.MAX_DURATION_S:
-            return False
-        return len(schedule.track_ids) <= self.MAX_TRACKS
+            return "too_long"
+        if len(schedule.track_ids) > self.MAX_TRACKS:
+            return "too_many_tracks"
+        return None
+
+
+class MidiCacheBuildStatsV2:
+    """Counters emitted while streaming and parsing Lakh MIDI."""
+
+    def __init__(self):
+        self.archive_members = 0
+        self.midi_members = 0
+        self.payload_bytes = 0
+        self.batches = 0
+        self.parsed = 0
+        self.accepted = 0
+        self.invalid = 0
+        self.too_large = 0
+        self.rejected = 0
+        self.split_full = 0
+        self.payload_too_large = 0
+
+    def as_dict(
+        self,
+        buckets: dict[SplitName, list[MidiScheduleV2]],
+        targets: dict[SplitName, int],
+    ) -> dict[str, object]:
+        return {
+            "archive_members": self.archive_members,
+            "midi_members": self.midi_members,
+            "payload_mb": round(self.payload_bytes / 1_000_000.0, 3),
+            "batches": self.batches,
+            "parsed": self.parsed,
+            "accepted": self.accepted,
+            "invalid": self.invalid,
+            "too_large": self.too_large,
+            "rejected": self.rejected,
+            "split_full": self.split_full,
+            "payload_too_large": self.payload_too_large,
+            "counts": {split: len(buckets[split]) for split in ("train", "validation", "test")},
+            "targets": targets,
+        }
+
+
+class MidiCacheProgressLoggerV2:
+    """Emit periodic JSON progress lines for long MIDI archive scans."""
+
+    def __init__(self, interval_s: float = 10.0):
+        self.interval_s = interval_s
+        self.started = time.monotonic()
+        self.last_emit = 0.0
+
+    def emit(
+        self,
+        event: str,
+        stats: MidiCacheBuildStatsV2,
+        buckets: dict[SplitName, list[MidiScheduleV2]],
+        targets: dict[SplitName, int],
+        force: bool = False,
+    ) -> None:
+        now = time.monotonic()
+        if not force and now - self.last_emit < self.interval_s:
+            return
+        self.last_emit = now
+        payload = {
+            "event": event,
+            "elapsed_s": round(now - self.started, 3),
+            **stats.as_dict(buckets, targets),
+        }
+        print(json.dumps(payload, sort_keys=True), file=sys.stderr, flush=True)
 
 
 class LakhMidiDownloaderV2:
@@ -210,11 +285,20 @@ class LakhMidiDownloaderV2:
         "test": 4_000,
     }
 
-    def __init__(self, data_root: Path):
+    def __init__(
+        self,
+        data_root: Path,
+        workers: int = 1,
+        parse_batch_size: int = 64,
+        progress_interval_s: float = 10.0,
+    ):
         self.paths = MidiPathsV2(data_root)
         self.parser = MidiScheduleParserV2()
         self.invalid_file_policy = MidiInvalidFilePolicyV2()
         self.schedule_bounds = MidiScheduleBoundsV2()
+        self.workers = max(1, workers)
+        self.parse_batch_size = max(1, parse_batch_size)
+        self.progress_interval_s = progress_interval_s
 
     def build_cache(
         self, source: str | None = None, targets: dict[SplitName, int] | None = None
@@ -225,35 +309,127 @@ class LakhMidiDownloaderV2:
             "validation": [],
             "test": [],
         }
+        stats = MidiCacheBuildStatsV2()
+        logger = MidiCacheProgressLoggerV2(self.progress_interval_s)
+        batch: list[tuple[str, bytes, int]] = []
+        executor = (
+            ProcessPoolExecutor(max_workers=self.workers) if self.workers > 1 else None
+        )
+        logger.emit("midi_cache_start", stats, buckets, target_counts, force=True)
         with self._open_stream(source or self.ARCHIVE_URL) as stream:
             with tarfile.open(fileobj=stream, mode="r|gz") as archive:
-                for member in archive:
-                    if self._complete(buckets, target_counts):
-                        break
-                    if not self._is_midi_member(member):
-                        continue
-                    extracted = archive.extractfile(member)
-                    if extracted is None:
-                        continue
-                    payload = extracted.read()
-                    try:
-                        schedule = self.parser.parse_bytes(
-                            payload,
-                            member.name,
-                            max_events=self.schedule_bounds.MAX_EVENTS,
-                        )
-                    except Exception as error:
-                        if self.invalid_file_policy.should_skip(error):
+                try:
+                    for member in archive:
+                        stats.archive_members += 1
+                        if self._complete(buckets, target_counts):
+                            break
+                        if not self._is_midi_member(member):
+                            logger.emit(
+                                "midi_cache_progress", stats, buckets, target_counts
+                            )
                             continue
-                        raise
-                    if not self.schedule_bounds.accepts(schedule):
-                        continue
-                    if len(buckets[schedule.split]) >= target_counts[schedule.split]:
-                        continue
-                    buckets[schedule.split].append(schedule)
+                        stats.midi_members += 1
+                        extracted = archive.extractfile(member)
+                        if extracted is None:
+                            logger.emit(
+                                "midi_cache_progress", stats, buckets, target_counts
+                            )
+                            continue
+                        payload = extracted.read()
+                        stats.payload_bytes += len(payload)
+                        if len(payload) > self.schedule_bounds.MAX_PAYLOAD_BYTES:
+                            stats.payload_too_large += 1
+                            logger.emit(
+                                "midi_cache_progress", stats, buckets, target_counts
+                            )
+                            continue
+                        batch.append((member.name, payload, self.schedule_bounds.MAX_EVENTS))
+                        if len(batch) >= self.parse_batch_size:
+                            self._consume_batch(batch, buckets, target_counts, stats, executor)
+                            batch.clear()
+                        logger.emit("midi_cache_progress", stats, buckets, target_counts)
+                    if batch:
+                        self._consume_batch(batch, buckets, target_counts, stats, executor)
+                        batch.clear()
+                finally:
+                    if executor is not None:
+                        executor.shutdown(wait=True)
         for split, schedules in buckets.items():
             ManifestIOV2.write_midi(self.paths.split_manifest(split), schedules)
+        logger.emit("midi_cache_manifests_written", stats, buckets, target_counts, force=True)
         self.audit_leakage()
+        logger.emit("midi_cache_done", stats, buckets, target_counts, force=True)
+
+    def _consume_batch(
+        self,
+        batch: list[tuple[str, bytes, int]],
+        buckets: dict[SplitName, list[MidiScheduleV2]],
+        targets: dict[SplitName, int],
+        stats: MidiCacheBuildStatsV2,
+        executor: ProcessPoolExecutor | None,
+    ) -> None:
+        stats.batches += 1
+        if executor is None:
+            for task in batch:
+                self._consume_parse_result(
+                    self._parse_payload(task), buckets, targets, stats
+                )
+            return
+        futures = [
+            executor.submit(LakhMidiDownloaderV2._parse_worker, task) for task in batch
+        ]
+        for future in as_completed(futures):
+            self._consume_parse_result(future.result(), buckets, targets, stats)
+
+    def _parse_payload(
+        self, task: tuple[str, bytes, int]
+    ) -> tuple[str, MidiScheduleV2 | None, str | None]:
+        path, payload, max_events = task
+        try:
+            schedule = self.parser.parse_bytes(payload, path, max_events=max_events)
+        except Exception as error:
+            if self.invalid_file_policy.should_skip(error):
+                reason = "too_large" if isinstance(error, MidiScheduleTooLargeV2) else "invalid"
+                return reason, None, error.__class__.__name__
+            raise
+        reject_reason = self.schedule_bounds.reject_reason(schedule)
+        if reject_reason is not None:
+            return "rejected", None, reject_reason
+        return "parsed", schedule, None
+
+    @staticmethod
+    def _parse_worker(
+        task: tuple[str, bytes, int]
+    ) -> tuple[str, MidiScheduleV2 | None, str | None]:
+        downloader = LakhMidiDownloaderV2(Path("."), workers=1)
+        return downloader._parse_payload(task)
+
+    def _consume_parse_result(
+        self,
+        result: tuple[str, MidiScheduleV2 | None, str | None],
+        buckets: dict[SplitName, list[MidiScheduleV2]],
+        targets: dict[SplitName, int],
+        stats: MidiCacheBuildStatsV2,
+    ) -> None:
+        status, schedule, _reason = result
+        if status == "invalid":
+            stats.invalid += 1
+            return
+        if status == "too_large":
+            stats.too_large += 1
+            return
+        if status == "rejected":
+            stats.rejected += 1
+            return
+        if schedule is None:
+            stats.invalid += 1
+            return
+        stats.parsed += 1
+        if len(buckets[schedule.split]) >= targets[schedule.split]:
+            stats.split_full += 1
+            return
+        buckets[schedule.split].append(schedule)
+        stats.accepted += 1
 
     def load_manifests(self) -> dict[SplitName, list[MidiScheduleV2]]:
         return {

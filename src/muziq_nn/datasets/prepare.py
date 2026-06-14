@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,6 +27,9 @@ class PrepareConfigV2:
     midi_train_target: int = 60_000
     midi_validation_target: int = 4_000
     midi_test_target: int = 4_000
+    midi_workers: int = max(1, min(8, os.cpu_count() or 1))
+    midi_parse_batch_size: int = 64
+    progress_interval_s: float = 10.0
     nsynth_train_archive: str | None = None
     nsynth_validation_archive: str | None = None
     nsynth_test_archive: str | None = None
@@ -65,6 +69,12 @@ class PrepareRunnerV2:
                 "max_events": MidiScheduleBoundsV2.MAX_EVENTS,
                 "max_duration_s": MidiScheduleBoundsV2.MAX_DURATION_S,
                 "max_tracks": MidiScheduleBoundsV2.MAX_TRACKS,
+                "max_payload_bytes": MidiScheduleBoundsV2.MAX_PAYLOAD_BYTES,
+            },
+            "midi_cache_runtime": {
+                "workers": self.config.midi_workers,
+                "parse_batch_size": self.config.midi_parse_batch_size,
+                "progress_interval_s": self.config.progress_interval_s,
             },
             "note": (
                 "Metadata records download sources; cache builders stream "
@@ -96,7 +106,12 @@ class PrepareRunnerV2:
         return {"build_nsynth_cache": counts}
 
     def _build_midi_cache(self) -> dict[str, object]:
-        downloader = LakhMidiDownloaderV2(self.data_root)
+        downloader = LakhMidiDownloaderV2(
+            self.data_root,
+            workers=self.config.midi_workers,
+            parse_batch_size=self.config.midi_parse_batch_size,
+            progress_interval_s=self.config.progress_interval_s,
+        )
         targets = {
             "train": self.config.midi_train_target,
             "validation": self.config.midi_validation_target,
@@ -104,7 +119,11 @@ class PrepareRunnerV2:
         }
         downloader.build_cache(self.config.midi_archive, targets)
         counts = {split: len(items) for split, items in downloader.load_manifests().items()}
-        return {"build_midi_cache": counts}
+        return {
+            "build_midi_cache": counts,
+            "workers": self.config.midi_workers,
+            "parse_batch_size": self.config.midi_parse_batch_size,
+        }
 
     def _audit_leakage(self) -> dict[str, object]:
         nsynth = NsynthDownloaderV2(self.data_root, self.config.storage_budget_gb)
@@ -149,6 +168,17 @@ class PrepareCliV2:
         )
         parser.add_argument(
             "--midi-test-target", type=int, default=PrepareConfigV2.midi_test_target
+        )
+        parser.add_argument("--midi-workers", type=int, default=PrepareConfigV2.midi_workers)
+        parser.add_argument(
+            "--midi-parse-batch-size",
+            type=int,
+            default=PrepareConfigV2.midi_parse_batch_size,
+        )
+        parser.add_argument(
+            "--progress-interval-s",
+            type=float,
+            default=PrepareConfigV2.progress_interval_s,
         )
         parser.add_argument("--nsynth-train-archive")
         parser.add_argument("--nsynth-validation-archive")

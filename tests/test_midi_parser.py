@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 import tarfile
 
 import pytest
@@ -84,6 +85,48 @@ class TestMidiParserV2:
 
         downloader = LakhMidiDownloaderV2(tmp_path / "data")
         downloader.parser = ParserWithOneBadMidiV2()
+        downloader.build_cache(
+            str(archive_path), {"train": 1, "validation": 0, "test": 0}
+        )
+
+        assert len(downloader.load_manifests()["train"]) == 1
+
+    def test_downloader_emits_progress_logging(self, tmp_path, capsys):
+        archive_path = tmp_path / "lakh_subset.tar.gz"
+        payload = TinyCorpusBuilderV2._midi_bytes()
+        with tarfile.open(archive_path, "w:gz") as archive:
+            info = tarfile.TarInfo("good.mid")
+            info.size = len(payload)
+            archive.addfile(info, io.BytesIO(payload))
+
+        downloader = LakhMidiDownloaderV2(
+            tmp_path / "data", parse_batch_size=1, progress_interval_s=0.0
+        )
+        downloader.build_cache(
+            str(archive_path), {"train": 1, "validation": 0, "test": 0}
+        )
+
+        events = [
+            json.loads(line)["event"]
+            for line in capsys.readouterr().err.splitlines()
+            if line.strip()
+        ]
+        assert "midi_cache_start" in events
+        assert "midi_cache_manifests_written" in events
+        assert "midi_cache_done" in events
+
+    def test_downloader_parallel_parse_cache(self, tmp_path):
+        archive_path = tmp_path / "lakh_subset.tar.gz"
+        payload = TinyCorpusBuilderV2._midi_bytes()
+        with tarfile.open(archive_path, "w:gz") as archive:
+            for idx in range(2):
+                info = tarfile.TarInfo(f"good_{idx}.mid")
+                info.size = len(payload)
+                archive.addfile(info, io.BytesIO(payload))
+
+        downloader = LakhMidiDownloaderV2(
+            tmp_path / "data", workers=2, parse_batch_size=2, progress_interval_s=0.0
+        )
         downloader.build_cache(
             str(archive_path), {"train": 1, "validation": 0, "test": 0}
         )
