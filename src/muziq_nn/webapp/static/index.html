@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>muziq-nn Source Grid</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <section class="control-pane">
+        <div class="brand-row">
+          <div>
+            <h1>muziq-nn Source Grid</h1>
+            <p id="status">Loading checkpoint...</p>
+          </div>
+          <div class="status-dot" id="statusDot"></div>
+        </div>
+
+        <label class="field-label" for="spotifyUrl">Spotify track URL</label>
+        <div class="inline-control">
+          <input id="spotifyUrl" type="url" placeholder="https://open.spotify.com/track/..." />
+          <button id="loadSpotify" type="button">Load</button>
+        </div>
+        <div id="spotifyFrame" class="spotify-frame"></div>
+
+        <label class="field-label" for="checkpointPath">Checkpoint path</label>
+        <input id="checkpointPath" type="text" spellcheck="false" />
+
+        <div class="audio-controls">
+          <label class="file-button">
+            <input id="fileInput" type="file" accept="audio/*" />
+            Audio File
+          </label>
+          <button id="captureButton" type="button">Capture Audio</button>
+          <button id="stopButton" type="button">Stop</button>
+          <button id="resetButton" type="button">Reset</button>
+        </div>
+
+        <audio id="filePlayer" controls></audio>
+
+        <div class="meter-panel">
+          <div>
+            <span class="metric-label">Sources</span>
+            <strong id="sourceCount">0</strong>
+          </div>
+          <div>
+            <span class="metric-label">Frames</span>
+            <strong id="frameCount">0</strong>
+          </div>
+          <div>
+            <span class="metric-label">Latency</span>
+            <strong id="latency">-</strong>
+          </div>
+        </div>
+      </section>
+
+      <section class="visual-pane">
+        <canvas id="sourceGrid" width="960" height="360"></canvas>
+        <div id="sourceRows" class="source-rows"></div>
+      </section>
+    </main>
+    <script src="/static/app.js"></script>
+  </body>
+</html>

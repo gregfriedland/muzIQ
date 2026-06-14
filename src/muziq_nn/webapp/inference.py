@@ -1,0 +1,293 @@
+"""Realtime checkpoint-backed source tracking inference."""
+
+from __future__ import annotations
+
+import os
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import torch
+from scipy import signal as sps
+
+from muziq_nn.datasets.render import (
+    AudioFrameExtractorV2,
+    FamilyVocabularyV2,
+    SourceTrackingAudioConfigV2,
+)
+from muziq_nn.models.attention import (
+    DualPathTransformerSourceTrackerV2,
+    SourceTrackingModelConfigV2,
+)
+
+
+@dataclass(frozen=True)
+class SourcePredictionV2:
+    slot: int
+    activity: float
+    family: str
+    family_index: int
+    confidence: float
+    onset: float
+    offset: float
+    position: float
+
+    def to_json(self) -> dict[str, float | int | str]:
+        return {
+            "slot": self.slot,
+            "activity": self.activity,
+            "family": self.family,
+            "family_index": self.family_index,
+            "confidence": self.confidence,
+            "onset": self.onset,
+            "offset": self.offset,
+            "position": self.position,
+        }
+
+
+@dataclass(frozen=True)
+class SourceTrackingInferenceResultV2:
+    timestamp_s: float
+    frame_count: int
+    sample_count: int
+    source_count: int
+    checkpoint_path: str
+    sources: tuple[SourcePredictionV2, ...]
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "type": "prediction",
+            "timestamp_s": self.timestamp_s,
+            "frame_count": self.frame_count,
+            "sample_count": self.sample_count,
+            "source_count": self.source_count,
+            "checkpoint_path": self.checkpoint_path,
+            "sources": [source.to_json() for source in self.sources],
+        }
+
+
+class SourceTrackingCheckpointLoaderV2:
+    """Load trained source-tracking checkpoints without training-side objects."""
+
+    def __init__(self, checkpoint_path: str | Path, device: str = "auto"):
+        self.checkpoint_path = str(checkpoint_path)
+        self.device = self._select_device(device)
+        self.payload = self._load_payload()
+        self.state_dict = self._state_dict_from_payload(self.payload)
+        self.config = self._infer_config(self.state_dict)
+        self.model = self._load_model()
+
+    def _load_payload(self) -> Any:
+        return torch.load(self.checkpoint_path, map_location=self.device)
+
+    def _load_model(self) -> DualPathTransformerSourceTrackerV2:
+        model = DualPathTransformerSourceTrackerV2(self.config).to(self.device)
+        model.load_state_dict(self.state_dict)
+        model.eval()
+        return model
+
+    @staticmethod
+    def _select_device(device: str) -> torch.device:
+        if device == "auto":
+            return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        return torch.device(device)
+
+    @staticmethod
+    def _state_dict_from_payload(payload: Any) -> dict[str, torch.Tensor]:
+        if isinstance(payload, dict) and isinstance(payload.get("state_dict"), dict):
+            return payload["state_dict"]
+        if isinstance(payload, dict):
+            return payload
+        raise ValueError("checkpoint payload does not contain a PyTorch state dict")
+
+    @classmethod
+    def _infer_config(
+        cls, state_dict: dict[str, torch.Tensor]
+    ) -> SourceTrackingModelConfigV2:
+        input_weight = state_dict["input.weight"]
+        family_weight = state_dict["head.family.weight"]
+        slot_queries = state_dict["head.slot_queries"]
+        identity_weight = state_dict["head.identity.weight"]
+        layer_count = cls._infer_layer_count(state_dict)
+        return SourceTrackingModelConfigV2(
+            n_bands=int(input_weight.shape[1]),
+            n_families=int(family_weight.shape[0]),
+            max_sources=int(slot_queries.shape[0]),
+            model_dim=int(input_weight.shape[0]),
+            heads=4,
+            layers=layer_count,
+            identity_dim=int(identity_weight.shape[0]),
+        )
+
+    @staticmethod
+    def _infer_layer_count(state_dict: dict[str, torch.Tensor]) -> int:
+        layer_ids: set[int] = set()
+        for name in state_dict:
+            if not name.startswith("encoder.layers."):
+                continue
+            parts = name.split(".")
+            if len(parts) > 2 and parts[2].isdigit():
+                layer_ids.add(int(parts[2]))
+        return max(layer_ids) + 1 if layer_ids else 2
+
+
+class RealtimeSourceTrackerV2:
+    """Maintain rolling audio context and emit source-slot predictions."""
+
+    def __init__(
+        self,
+        checkpoint_path: str | Path,
+        device: str = "auto",
+        context_frames: int = 256,
+        activity_threshold: float = 0.35,
+    ):
+        self.loaded = SourceTrackingCheckpointLoaderV2(checkpoint_path, device=device)
+        self.context_frames = context_frames
+        self.activity_threshold = activity_threshold
+        self.extractor = AudioFrameExtractorV2()
+        self.families = FamilyVocabularyV2()
+        self.audio = np.zeros(0, dtype=np.float32)
+        self.started_at = time.monotonic()
+        self.max_samples = int(
+            SourceTrackingAudioConfigV2.sample_rate
+            * SourceTrackingAudioConfigV2.duration_s
+        )
+
+    @property
+    def checkpoint_path(self) -> str:
+        return self.loaded.checkpoint_path
+
+    def append_audio(
+        self, samples: np.ndarray, sample_rate: int = SourceTrackingAudioConfigV2.sample_rate
+    ) -> SourceTrackingInferenceResultV2:
+        mono = self._prepare_audio(samples, sample_rate)
+        if len(mono):
+            self.audio = np.concatenate((self.audio, mono))
+            if len(self.audio) > self.max_samples:
+                self.audio = self.audio[-self.max_samples :]
+        return self.predict()
+
+    def predict(self) -> SourceTrackingInferenceResultV2:
+        if len(self.audio) == 0:
+            return self._empty_result(0)
+        frames = self.extractor.extract_context(
+            self.audio,
+            end_frame=int(np.ceil(len(self.audio) / SourceTrackingAudioConfigV2.hop)) - 1,
+            frame_count=self.context_frames,
+            peak_warmup_frames=self.context_frames,
+        )
+        if len(frames) == 0:
+            return self._empty_result(0)
+        return self._predict_frames(frames)
+
+    def reset(self) -> None:
+        self.audio = np.zeros(0, dtype=np.float32)
+        self.started_at = time.monotonic()
+
+    def _predict_frames(self, frames: np.ndarray) -> SourceTrackingInferenceResultV2:
+        tensor = torch.from_numpy(frames).unsqueeze(0).float().to(self.loaded.device)
+        with torch.inference_mode():
+            outputs = self.loaded.model(tensor)
+        activity = torch.sigmoid(outputs["activity_logits"])[0].detach().cpu().numpy()
+        family_probs = torch.softmax(outputs["family_logits"], dim=-1)[0].detach().cpu()
+        onset = torch.sigmoid(outputs["onset_logits"])[0].detach().cpu().numpy()
+        offset = torch.sigmoid(outputs["offset_logits"])[0].detach().cpu().numpy()
+        identity = outputs["identity"][0].detach().cpu().numpy()
+        sources = []
+        for slot, slot_activity in enumerate(activity):
+            family_index = int(torch.argmax(family_probs[slot]).item())
+            family_confidence = float(family_probs[slot, family_index].item())
+            sources.append(
+                SourcePredictionV2(
+                    slot=slot,
+                    activity=float(slot_activity),
+                    family=self._family_name(family_index),
+                    family_index=family_index,
+                    confidence=float(slot_activity * family_confidence),
+                    onset=float(onset[slot]),
+                    offset=float(offset[slot]),
+                    position=self._slot_position(identity[slot], family_index),
+                )
+            )
+        return SourceTrackingInferenceResultV2(
+            timestamp_s=time.monotonic() - self.started_at,
+            frame_count=int(frames.shape[0]),
+            sample_count=int(len(self.audio)),
+            source_count=sum(
+                1 for source in sources if source.activity >= self.activity_threshold
+            ),
+            checkpoint_path=self.loaded.checkpoint_path,
+            sources=tuple(sources),
+        )
+
+    def _empty_result(self, frame_count: int) -> SourceTrackingInferenceResultV2:
+        return SourceTrackingInferenceResultV2(
+            timestamp_s=time.monotonic() - self.started_at,
+            frame_count=frame_count,
+            sample_count=int(len(self.audio)),
+            source_count=0,
+            checkpoint_path=self.loaded.checkpoint_path,
+            sources=tuple(),
+        )
+
+    def _family_name(self, family_index: int) -> str:
+        if 0 <= family_index < len(self.families.families):
+            return self.families.families[family_index]
+        return f"family_{family_index}"
+
+    @staticmethod
+    def _slot_position(identity: np.ndarray, family_index: int) -> float:
+        if identity.size:
+            value = float(1.0 / (1.0 + np.exp(-identity[0] * 2.0)))
+            return float(np.clip(0.25 * (family_index / 10.0) + 0.75 * value, 0.0, 1.0))
+        return float(np.clip(family_index / 10.0, 0.0, 1.0))
+
+    @staticmethod
+    def _prepare_audio(samples: np.ndarray, sample_rate: int) -> np.ndarray:
+        audio = np.asarray(samples, dtype=np.float32)
+        if audio.ndim > 1:
+            audio = audio.mean(axis=1)
+        if sample_rate != SourceTrackingAudioConfigV2.sample_rate:
+            gcd = int(np.gcd(sample_rate, SourceTrackingAudioConfigV2.sample_rate))
+            audio = sps.resample_poly(
+                audio,
+                SourceTrackingAudioConfigV2.sample_rate // gcd,
+                sample_rate // gcd,
+            ).astype(np.float32)
+        return np.clip(np.nan_to_num(audio), -1.0, 1.0)
+
+
+class SourceTrackingCheckpointLocatorV2:
+    """Find a usable local checkpoint for the web app."""
+
+    ENV_VAR = "MUZIQ_NN_CHECKPOINT"
+
+    def __init__(self, root: str | Path = "."):
+        self.root = Path(root).resolve()
+
+    def locate(self, explicit: str | None = None) -> Path | None:
+        for value in (explicit, os.environ.get(self.ENV_VAR)):
+            if value:
+                path = self._resolve_path(value)
+                if path.exists():
+                    return path
+        candidates = self._run_checkpoint_candidates()
+        existing = [path for path in candidates if path.exists()]
+        if not existing:
+            return None
+        return max(existing, key=lambda path: path.stat().st_mtime)
+
+    def _resolve_path(self, value: str) -> Path:
+        path = Path(value).expanduser()
+        return path if path.is_absolute() else self.root / path
+
+    def _run_checkpoint_candidates(self) -> list[Path]:
+        candidates: list[Path] = []
+        runs = self.root / "runs"
+        if runs.exists():
+            candidates.extend(runs.glob("**/*phase-training_done*.pt"))
+            candidates.extend(runs.glob("**/checkpoint.pt"))
+            candidates.extend(runs.glob("**/*.pt"))
+        return candidates

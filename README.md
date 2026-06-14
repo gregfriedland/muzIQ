@@ -1,6 +1,6 @@
-# muziq-nn
+# muzIQ
 
-`muziq-nn` is a standalone neural source-tracking repo for music visualization
+`muzIQ` is a standalone neural source-tracking repo for music visualization
 analysis. It trains label-prediction models from bounded local caches of
 instrument notes and MIDI schedules.
 
@@ -14,7 +14,7 @@ The repo is built for the 10 GB local-storage constraint:
 ## Setup
 
 ```bash
-cd /Users/gregfriedland/src/external/muziq-nn
+cd /Users/gregfriedland/src/external/muziq
 uv venv --python 3.12
 uv sync --extra dev
 ```
@@ -60,3 +60,21 @@ Uploads are written under
 `gs://rezo-flyte/scratch/serializable/muziq-nn/YYYYMMDD/RUN_ID/checkpoints/`.
 Each checkpoint has a matching JSON metadata file with checkpoint number,
 phase, stage, epoch, batch, loss, and timestamp, plus a `latest.json` pointer.
+
+## Web Source Grid
+
+The web app visualizes realtime source-slot predictions from a trained
+checkpoint. It can embed a Spotify track for playback context, but inference
+runs on uploaded audio files or browser-captured tab/system audio. The app does
+not download or decode Spotify streams directly.
+
+```bash
+uv sync --extra dev --extra web
+export MUZIQ_NN_CHECKPOINT=/Users/gregfriedland/src/external/muziq/runs/k8s_downloads/20260614-g4spot-889993c-50ep-oomfix-scratch2/checkpoint.pt
+uv run muziq-web --host 127.0.0.1 --port 8765
+```
+
+Open `http://127.0.0.1:8765`, load a Spotify track URL if desired, then choose
+either an audio file or browser audio capture. The backend expects 16 kHz
+float32 mono chunks over `/ws/infer` and returns source activity, family,
+onset/offset, confidence, and stable visual position for each source slot.

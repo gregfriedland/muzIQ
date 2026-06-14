@@ -23,13 +23,21 @@ dev = [
     "pytest>=8.0.0",
     "ruff>=0.6.0",
 ]
+web = [
+    "fastapi>=0.137.0",
+    "uvicorn[standard]>=0.49.0",
+]
 
 [project.scripts]
 muziq-prepare = "muziq_nn.datasets.prepare:main"
 muziq-train = "muziq_nn.training.train:main"
+muziq-web = "muziq_nn.webapp.app:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+muziq_nn = ["webapp/static/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
