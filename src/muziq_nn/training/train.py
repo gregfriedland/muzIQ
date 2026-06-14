@@ -155,6 +155,7 @@ class TrainingConfigV2:
     smoke_examples: int = 0
     progress_interval_s: float = 10.0
     render_workers: int = 1
+    midi_render_workers: int | None = None
     warm_start_checkpoint: str | None = None
     epoch_multiplier: float = 1.0
     epochs_per_stage: int | None = None
@@ -564,6 +565,7 @@ class SourceTrackingTrainerV2:
         )
         self.progress = TrainingProgressLoggerV2(config.progress_interval_s)
         self.render_executor: ProcessPoolExecutor | None = None
+        self.render_executor_stage: str | None = None
         self.checkpoint_number = 0
         self.checkpoint_uploader: CheckpointArtifactUploaderV2 | None = None
         self.checkpoint_upload_worker: CheckpointUploadWorkerV2 | None = None
@@ -577,6 +579,7 @@ class SourceTrackingTrainerV2:
                 "curriculum_scale": self.config.curriculum_scale,
                 "batch_size": self.config.batch_size,
                 "render_workers": self.config.render_workers,
+                "midi_render_workers": self.config.midi_render_workers,
                 "warm_start_checkpoint": self.config.warm_start_checkpoint,
                 "epochs_per_stage": self.config.epochs_per_stage,
                 "checkpoint_upload_uri": self.config.checkpoint_upload_uri,
@@ -602,10 +605,6 @@ class SourceTrackingTrainerV2:
         if self.config.mixed_precision and self.device.type == "cuda":
             torch.set_float32_matmul_precision("high")
         try:
-            if self.config.render_workers > 1:
-                self.render_executor = ProcessPoolExecutor(
-                    max_workers=self.config.render_workers
-                )
             plan = (
                 CurriculumPlanV2()
                 .scale_examples(self.config.curriculum_scale)
@@ -673,9 +672,7 @@ class SourceTrackingTrainerV2:
                     if resume_cursor is not None and stage.name == resume_cursor.stage
                     else 0
                 )
-                history.extend(
-                    self._train_stage(stage, run_dir, first_epoch, first_batch)
-                )
+                history.extend(self._train_stage(stage, run_dir, first_epoch, first_batch))
             metrics_path = run_dir / "metrics.json"
             checkpoint_path = run_dir / "checkpoint.pt"
             artifacts = {
@@ -720,19 +717,126 @@ class SourceTrackingTrainerV2:
         finally:
             self._close_checkpoint_upload_worker()
             if self.render_executor is not None:
-                self.render_executor.shutdown(wait=True)
+                self._shutdown_render_executor()
 
     def calibrate(self) -> float:
         start = time.perf_counter()
         count = max(1, min(self.config.calibration_examples, 128))
-        for idx in range(0, count, self.config.batch_size):
-            seeds = [
-                self.config.seed + row
-                for row in range(idx, min(idx + self.config.batch_size, count))
-            ]
-            self._render_slices("single_note_all", "train", seeds)
+        self._start_render_executor("single_note_all")
+        try:
+            for idx in range(0, count, self.config.batch_size):
+                seeds = [
+                    self.config.seed + row
+                    for row in range(idx, min(idx + self.config.batch_size, count))
+                ]
+                self._render_slices("single_note_all", "train", seeds)
+        finally:
+            self._shutdown_render_executor()
         elapsed = max(time.perf_counter() - start, 1e-6)
         return count / elapsed
+
+    def _start_render_executor(self, stage_name: str) -> None:
+        self._shutdown_render_executor()
+        workers = self._render_worker_count(stage_name)
+        if workers > 1:
+            self.render_executor = ProcessPoolExecutor(max_workers=workers)
+            self.render_executor_stage = stage_name
+        self.progress.emit(
+            "render_executor_started",
+            {
+                "stage": stage_name,
+                "workers": workers,
+                "include_midi": stage_name == "midi_complex",
+            },
+            force=True,
+        )
+
+    def _shutdown_render_executor(self) -> None:
+        if self.render_executor is None:
+            self.render_executor_stage = None
+            return
+        stage_name = self.render_executor_stage
+        self._emit_memory_usage(
+            "memory_usage",
+            stage=stage_name,
+            phase="before_render_executor_shutdown",
+        )
+        self.render_executor.shutdown(wait=True, cancel_futures=True)
+        self.render_executor = None
+        self.render_executor_stage = None
+        self.progress.emit(
+            "render_executor_stopped",
+            {"stage": stage_name},
+            force=True,
+        )
+
+    def _render_worker_count(self, stage_name: str) -> int:
+        if stage_name == "midi_complex" and self.config.midi_render_workers is not None:
+            return max(1, self.config.midi_render_workers)
+        return max(1, self.config.render_workers)
+
+    def _emit_memory_usage(
+        self,
+        event: str,
+        *,
+        stage: str | None,
+        phase: str,
+        epoch: int | None = None,
+    ) -> None:
+        payload: dict[str, object] = {
+            "stage": stage,
+            "phase": phase,
+            **self._memory_snapshot(),
+        }
+        if epoch is not None:
+            payload["epoch"] = epoch
+        self.progress.emit(event, payload, force=True)
+
+    def _memory_snapshot(self) -> dict[str, object]:
+        child_rss = [
+            rss_mb
+            for pid in self._render_child_pids()
+            if (rss_mb := self._rss_mb_for_pid(pid)) is not None
+        ]
+        payload: dict[str, object] = {
+            "main_rss_mb": self._rss_mb_for_pid(None),
+            "render_worker_count": len(child_rss),
+            "render_worker_rss_mb": round(sum(child_rss), 1) if child_rss else 0.0,
+        }
+        if self.device.type == "cuda" and torch.cuda.is_available():
+            payload.update(
+                {
+                    "cuda_allocated_mb": round(
+                        torch.cuda.memory_allocated(self.device) / 1_000_000.0, 1
+                    ),
+                    "cuda_reserved_mb": round(
+                        torch.cuda.memory_reserved(self.device) / 1_000_000.0, 1
+                    ),
+                    "cuda_max_allocated_mb": round(
+                        torch.cuda.max_memory_allocated(self.device) / 1_000_000.0, 1
+                    ),
+                }
+            )
+        return payload
+
+    def _render_child_pids(self) -> list[int]:
+        if self.render_executor is None:
+            return []
+        processes = getattr(self.render_executor, "_processes", None)
+        if not processes:
+            return []
+        return [process.pid for process in processes.values() if process.pid is not None]
+
+    @staticmethod
+    def _rss_mb_for_pid(pid: int | None) -> float | None:
+        path = Path("/proc/self/status") if pid is None else Path(f"/proc/{pid}/status")
+        try:
+            for line in path.read_text(encoding="utf-8").splitlines():
+                if line.startswith("VmRSS:"):
+                    return round(float(line.split()[1]) / 1024.0, 1)
+        except OSError:
+            return None
+        return None
 
     def _train_stage(
         self,
@@ -741,6 +845,7 @@ class SourceTrackingTrainerV2:
         first_epoch: int = 1,
         first_batch: int = 0,
     ) -> list[dict[str, object]]:
+        self._start_render_executor(stage.name)
         optimizer = torch.optim.AdamW(self.model.parameters(), lr=stage.learning_rate)
         self._restore_optimizer_state_if_needed(optimizer, stage.name)
         self.current_optimizer = optimizer
@@ -760,78 +865,90 @@ class SourceTrackingTrainerV2:
             },
             force=True,
         )
-        for epoch in range(first_epoch - 1, stage.epochs):
-            losses = []
-            epoch_start = time.monotonic()
-            batch_start = first_batch if epoch == first_epoch - 1 else 0
-            for batch_idx, batch in self._iter_training_batches(
-                stage.name,
-                epoch,
-                batch_start,
-                batches_per_epoch,
-            ):
-                with self._autocast_context():
-                    outputs = self.model(batch["frames"])
-                    loss = self.loss_fn(outputs, batch)
-                optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                optimizer.step()
-                loss_value = float(loss.detach().cpu())
-                losses.append(loss_value)
-                self.progress.emit(
-                    "training_batch_progress",
-                    {
-                        "stage": stage.name,
-                        "epoch": epoch + 1,
-                        "batch": batch_idx + 1,
-                        "batches_per_epoch": batches_per_epoch,
-                        "last_loss": round(loss_value, 6),
-                        "mean_loss": round(float(np.mean(losses)), 6),
-                    },
+        self._emit_memory_usage("memory_usage", stage=stage.name, phase="stage_start")
+        try:
+            for epoch in range(first_epoch - 1, stage.epochs):
+                losses = []
+                epoch_start = time.monotonic()
+                batch_start = first_batch if epoch == first_epoch - 1 else 0
+                for batch_idx, batch in self._iter_training_batches(
+                    stage.name,
+                    epoch,
+                    batch_start,
+                    batches_per_epoch,
+                ):
+                    with self._autocast_context():
+                        outputs = self.model(batch["frames"])
+                        loss = self.loss_fn(outputs, batch)
+                    optimizer.zero_grad(set_to_none=True)
+                    loss.backward()
+                    optimizer.step()
+                    loss_value = float(loss.detach().cpu())
+                    losses.append(loss_value)
+                    self.progress.emit(
+                        "training_batch_progress",
+                        {
+                            "stage": stage.name,
+                            "epoch": epoch + 1,
+                            "batch": batch_idx + 1,
+                            "batches_per_epoch": batches_per_epoch,
+                            "last_loss": round(loss_value, 6),
+                            "mean_loss": round(float(np.mean(losses)), 6),
+                        },
+                    )
+                    self._save_checkpoint_artifact(
+                        run_dir,
+                        phase="batch_interval",
+                        stage=stage.name,
+                        epoch=epoch + 1,
+                        batch=batch_idx + 1,
+                        batches_per_epoch=batches_per_epoch,
+                        examples_seen=(epoch * stage.train_examples_per_epoch)
+                        + min(
+                            stage.train_examples_per_epoch,
+                            (batch_idx + 1) * self.config.batch_size,
+                        ),
+                        loss=loss_value,
+                        mean_loss=float(np.mean(losses)),
+                        optimizer=optimizer,
+                    )
+                row = {
+                    "stage": stage.name,
+                    "epoch": epoch + 1,
+                    "loss": float(np.mean(losses)),
+                    "examples": max(
+                        0,
+                        stage.train_examples_per_epoch
+                        - batch_start * self.config.batch_size,
+                    ),
+                    "elapsed_s": round(time.monotonic() - epoch_start, 3),
+                }
+                self.progress.emit("training_epoch_done", row, force=True)
+                self._emit_memory_usage(
+                    "memory_usage",
+                    stage=stage.name,
+                    phase="epoch_done",
+                    epoch=epoch + 1,
                 )
+                print(json.dumps(row, sort_keys=True), flush=True)
                 self._save_checkpoint_artifact(
                     run_dir,
-                    phase="batch_interval",
+                    phase="epoch_done",
                     stage=stage.name,
                     epoch=epoch + 1,
-                    batch=batch_idx + 1,
+                    batch=batches_per_epoch,
                     batches_per_epoch=batches_per_epoch,
-                    examples_seen=(epoch * stage.train_examples_per_epoch)
-                    + min(
-                        stage.train_examples_per_epoch,
-                        (batch_idx + 1) * self.config.batch_size,
-                    ),
-                    loss=loss_value,
-                    mean_loss=float(np.mean(losses)),
+                    examples_seen=(epoch + 1) * stage.train_examples_per_epoch,
+                    loss=row["loss"],
+                    mean_loss=row["loss"],
                     optimizer=optimizer,
+                    force=True,
                 )
-            row = {
-                "stage": stage.name,
-                "epoch": epoch + 1,
-                "loss": float(np.mean(losses)),
-                "examples": max(
-                    0,
-                    stage.train_examples_per_epoch - batch_start * self.config.batch_size,
-                ),
-                "elapsed_s": round(time.monotonic() - epoch_start, 3),
-            }
-            self.progress.emit("training_epoch_done", row, force=True)
-            print(json.dumps(row, sort_keys=True), flush=True)
-            self._save_checkpoint_artifact(
-                run_dir,
-                phase="epoch_done",
-                stage=stage.name,
-                epoch=epoch + 1,
-                batch=batches_per_epoch,
-                batches_per_epoch=batches_per_epoch,
-                examples_seen=(epoch + 1) * stage.train_examples_per_epoch,
-                loss=row["loss"],
-                mean_loss=row["loss"],
-                optimizer=optimizer,
-                force=True,
-            )
-            rows.append(row)
-        return rows
+                rows.append(row)
+            return rows
+        finally:
+            self._shutdown_render_executor()
+            self._emit_memory_usage("memory_usage", stage=stage.name, phase="stage_done")
 
     def _iter_training_batches(
         self,
@@ -1333,6 +1450,11 @@ class TrainingCliV2:
             "--render-workers",
             type=int,
             default=TrainingConfigV2.render_workers,
+        )
+        parser.add_argument(
+            "--midi-render-workers",
+            type=int,
+            default=TrainingConfigV2.midi_render_workers,
         )
         parser.add_argument("--warm-start-checkpoint")
         parser.add_argument(

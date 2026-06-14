@@ -5,7 +5,12 @@ import json
 import torch
 from conftest import TinyCorpusBuilderV2
 
-from muziq_nn.training.train import CurriculumPlanV2, SourceTrackingTrainerV2, TrainingConfigV2
+from muziq_nn.training.train import (
+    CurriculumPlanV2,
+    SourceTrackingTrainerV2,
+    TrainingCliV2,
+    TrainingConfigV2,
+)
 
 
 class TestTrainSmokeV2:
@@ -29,6 +34,25 @@ class TestTrainSmokeV2:
         stages = CurriculumPlanV2().scale_epochs(2).with_epochs_per_stage(50).stages
 
         assert [stage.epochs for stage in stages] == [50, 50, 50, 50, 50]
+
+    def test_midi_render_workers_override_only_midi_stage(self, tmp_path):
+        TinyCorpusBuilderV2(tmp_path / "data").build()
+        trainer = SourceTrackingTrainerV2(
+            TrainingConfigV2(
+                data_root=str(tmp_path / "data"),
+                device="cpu",
+                render_workers=8,
+                midi_render_workers=2,
+            )
+        )
+
+        assert trainer._render_worker_count("simple_duo_trio") == 8
+        assert trainer._render_worker_count("midi_complex") == 2
+
+    def test_cli_parses_midi_render_workers(self):
+        config = TrainingCliV2.parse(["--midi-render-workers", "4"])
+
+        assert config.midi_render_workers == 4
 
     def test_one_train_step_writes_metrics_and_checkpoint(self, tmp_path):
         TinyCorpusBuilderV2(tmp_path / "data").build()
@@ -96,6 +120,23 @@ class TestTrainSmokeV2:
 
         assert payload["history"]
         assert payload["config"]["prefetch_batches"] == 1
+
+    def test_process_render_pool_train_step_runs(self, tmp_path):
+        TinyCorpusBuilderV2(tmp_path / "data").build()
+        config = TrainingConfigV2(
+            data_root=str(tmp_path / "data"),
+            run_root=str(tmp_path / "runs"),
+            calibration_examples=2,
+            batch_size=2,
+            smoke_examples=2,
+            device="cpu",
+            render_workers=2,
+        )
+
+        payload = SourceTrackingTrainerV2(config).run()
+
+        assert payload["history"]
+        assert payload["config"]["render_workers"] == 2
 
     def test_partial_warm_start_loads_matching_deeper_model_tensors(self, tmp_path):
         TinyCorpusBuilderV2(tmp_path / "data").build()
