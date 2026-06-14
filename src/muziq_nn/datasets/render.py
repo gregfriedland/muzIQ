@@ -71,18 +71,22 @@ class AudioFrameExtractorV2:
 
     def extract(self, audio: np.ndarray) -> np.ndarray:
         n_frames = int(np.ceil(len(audio) / self.config.hop))
-        ring = np.zeros(self.config.win, dtype=np.float32)
-        frames = np.zeros((n_frames, self.config.bands), dtype=np.float32)
+        if n_frames == 0:
+            return np.zeros((0, self.config.bands), dtype=np.float32)
+        target_samples = n_frames * self.config.hop
+        tail = target_samples - len(audio)
+        padded = np.pad(
+            audio.astype(np.float32, copy=False),
+            (self.config.win - self.config.hop, tail),
+        )
+        windows = np.lib.stride_tricks.sliding_window_view(padded, self.config.win)[
+            :: self.config.hop
+        ][:n_frames]
+        mag = np.abs(np.fft.rfft(windows * self._window, axis=1))
+        raw_bands = (mag @ self._fold.T).astype(np.float32)
+        frames = np.zeros_like(raw_bands, dtype=np.float32)
         peak = np.full(self.config.bands, 1e-6, dtype=np.float32)
-        for frame_idx in range(n_frames):
-            start = frame_idx * self.config.hop
-            hop_audio = np.zeros(self.config.hop, dtype=np.float32)
-            chunk = audio[start : start + self.config.hop]
-            hop_audio[: len(chunk)] = chunk
-            ring = np.roll(ring, -self.config.hop)
-            ring[-self.config.hop :] = hop_audio
-            mag = np.abs(np.fft.rfft(ring * self._window))
-            bands = self._fold @ mag
+        for frame_idx, bands in enumerate(raw_bands):
             peak = np.maximum(bands, peak * 0.9996)
             frames[frame_idx] = np.clip(bands / np.maximum(peak, 1e-6), 0.0, 1.0)
         return frames
