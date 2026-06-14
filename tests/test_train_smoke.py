@@ -144,3 +144,42 @@ class TestTrainSmokeV2:
         assert trainer._stages_from_resume(stages, cursor)[0].name == (
             "single_instrument_melody"
         )
+
+    def test_resume_cursor_recomputes_batch_when_batch_size_changes(self, tmp_path):
+        TinyCorpusBuilderV2(tmp_path / "data").build()
+        checkpoint_path = tmp_path / "checkpoint.pt"
+        base = SourceTrackingTrainerV2(
+            TrainingConfigV2(data_root=str(tmp_path / "data"), device="cpu")
+        )
+        torch.save(
+            {
+                "state_dict": base.model.state_dict(),
+                "checkpoint_metadata": {
+                    "checkpoint_number": 64,
+                    "phase": "batch_interval",
+                    "stage": "single_instrument_melody",
+                    "epoch": 4,
+                    "batch": 400,
+                    "batches_per_epoch": 938,
+                    "examples_seen": 205_600,
+                },
+            },
+            checkpoint_path,
+        )
+        config = TrainingConfigV2(
+            data_root=str(tmp_path / "data"),
+            device="cpu",
+            batch_size=256,
+            warm_start_checkpoint=str(checkpoint_path),
+            resume_from_warm_start_metadata=True,
+        )
+        trainer = SourceTrackingTrainerV2(config)
+        stages = CurriculumPlanV2().scale_epochs(2).stages
+
+        cursor = trainer._resume_cursor(stages)
+
+        assert cursor is not None
+        assert cursor.stage == "single_instrument_melody"
+        assert cursor.epoch == 4
+        assert cursor.batch == 100
+        assert cursor.checkpoint_number == 64

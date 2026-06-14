@@ -973,6 +973,13 @@ class SourceTrackingTrainerV2:
         if stage_name == "complete":
             return None
         stage_index = self._stage_index(stages, stage_name)
+        if "examples_seen" in metadata:
+            return self._resume_cursor_from_examples_seen(
+                stages,
+                stage_index,
+                int(metadata["examples_seen"]),
+                checkpoint_number,
+            )
         epoch = int(metadata["epoch"])
         batch = int(metadata["batch"])
         phase = str(metadata.get("phase", ""))
@@ -996,6 +1003,32 @@ class SourceTrackingTrainerV2:
             batch=batch,
             checkpoint_number=checkpoint_number,
         )
+
+    def _resume_cursor_from_examples_seen(
+        self,
+        stages: tuple[CurriculumStageV2, ...],
+        stage_index: int,
+        examples_seen: int,
+        checkpoint_number: int,
+    ) -> TrainingResumeCursorV2 | None:
+        examples_seen = max(0, examples_seen)
+        while stage_index < len(stages):
+            stage = stages[stage_index]
+            stage_examples = stage.train_examples_per_epoch * stage.epochs
+            if examples_seen < stage_examples:
+                completed_epochs, examples_in_epoch = divmod(
+                    examples_seen,
+                    stage.train_examples_per_epoch,
+                )
+                return TrainingResumeCursorV2(
+                    stage=stage.name,
+                    epoch=completed_epochs + 1,
+                    batch=examples_in_epoch // self.config.batch_size,
+                    checkpoint_number=checkpoint_number,
+                )
+            examples_seen -= stage_examples
+            stage_index += 1
+        return None
 
     @staticmethod
     def _stages_from_resume(
