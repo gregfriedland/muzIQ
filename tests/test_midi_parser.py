@@ -9,11 +9,12 @@ from conftest import TinyCorpusBuilderV2
 
 from muziq_nn.datasets.midi import (
     LakhMidiDownloaderV2,
+    MidiIndexV2,
     MidiScheduleBoundsV2,
     MidiScheduleParserV2,
     MidiSplitAuditV2,
 )
-from muziq_nn.datasets.schema import MidiNoteEventV2, MidiScheduleV2
+from muziq_nn.datasets.schema import ManifestIOV2, MidiNoteEventV2, MidiScheduleV2
 
 
 class TestMidiParserV2:
@@ -132,6 +133,24 @@ class TestMidiParserV2:
         )
 
         assert len(downloader.load_manifests()["train"]) == 1
+
+    def test_midi_index_samples_without_eager_manifest_load(
+        self, tmp_path, monkeypatch
+    ):
+        TinyCorpusBuilderV2(tmp_path).build()
+
+        def reject_eager_read(path):
+            raise AssertionError(f"eager MIDI read for {path}")
+
+        monkeypatch.setattr(ManifestIOV2, "read_midi", reject_eager_read)
+
+        index = MidiIndexV2(tmp_path)
+        train = index.schedules("train")
+        assert len(train) == 1
+        assert train[0].split == "train"
+
+        downloader = LakhMidiDownloaderV2(tmp_path)
+        assert downloader.manifest_counts()["train"] == 1
 
     def test_downloader_rejects_oversized_schedules(self, tmp_path):
         class OversizedParserV2:

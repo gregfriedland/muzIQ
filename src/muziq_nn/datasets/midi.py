@@ -9,6 +9,8 @@ import sys
 import tarfile
 import time
 import urllib.request
+from collections import OrderedDict
+from collections.abc import Sequence
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
@@ -437,8 +439,35 @@ class LakhMidiDownloaderV2:
             for split in ("train", "validation", "test")
         }
 
+    def manifest_counts(self) -> dict[SplitName, int]:
+        return {
+            split: self._count_manifest_records(self.paths.split_manifest(split))
+            for split in ("train", "validation", "test")
+        }
+
     def audit_leakage(self) -> None:
-        MidiSplitAuditV2().audit(self.load_manifests())
+        owners: dict[str, set[str]] = {}
+        for split in ("train", "validation", "test"):
+            path = self.paths.split_manifest(split)
+            if not path.exists():
+                continue
+            with path.open("r", encoding="utf-8") as fh:
+                for line in fh:
+                    if not line.strip():
+                        continue
+                    schedule_id = json.loads(line)["schedule_id"]
+                    owners.setdefault(schedule_id, set()).add(split)
+        leaks = {key: sorted(value) for key, value in owners.items() if len(value) > 1}
+        if leaks:
+            sample = dict(list(sorted(leaks.items()))[:5])
+            raise ValueError(f"MIDI hash leakage detected: {sample}")
+
+    @staticmethod
+    def _count_manifest_records(path: Path) -> int:
+        if not path.exists():
+            return 0
+        with path.open("rb") as fh:
+            return sum(1 for line in fh if line.strip())
 
     @staticmethod
     def _open_stream(source: str):
@@ -464,17 +493,19 @@ class MidiIndexV2:
 
     def __init__(self, data_root: Path):
         self.paths = MidiPathsV2(data_root)
-        self.schedules_by_split = {
-            split: ManifestIOV2.read_midi(self.paths.split_manifest(split))
+        self.schedules_by_split: dict[SplitName, MidiScheduleSequenceV2] = {
+            split: MidiScheduleSequenceV2(self.paths.split_manifest(split))
             for split in ("train", "validation", "test")
         }
 
-    def schedules(self, split: SplitName) -> list[MidiScheduleV2]:
+    def schedules(self, split: SplitName) -> Sequence[MidiScheduleV2]:
         return self.schedules_by_split[split]
 
     def write_from_records(self, split: SplitName, schedules: list[MidiScheduleV2]) -> None:
         ManifestIOV2.write_midi(self.paths.split_manifest(split), schedules)
-        self.schedules_by_split[split] = schedules
+        self.schedules_by_split[split] = MidiScheduleSequenceV2(
+            self.paths.split_manifest(split)
+        )
 
     def write_metadata(self) -> None:
         self.paths.manifest_root.mkdir(parents=True, exist_ok=True)
@@ -489,3 +520,55 @@ class MidiIndexV2:
             json.dumps(payload, indent=2, sort_keys=True),
             encoding="utf-8",
         )
+
+
+class MidiScheduleSequenceV2(Sequence[MidiScheduleV2]):
+    """Random-access MIDI manifest view without materializing all schedules."""
+
+    CACHE_SIZE = 128
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.offsets = self._build_offsets(path)
+        self.cache: OrderedDict[int, MidiScheduleV2] = OrderedDict()
+
+    def __len__(self) -> int:
+        return len(self.offsets)
+
+    def __getitem__(self, index: int | slice) -> MidiScheduleV2 | list[MidiScheduleV2]:
+        if isinstance(index, slice):
+            return [self[item] for item in range(*index.indices(len(self)))]
+        if index < 0:
+            index += len(self)
+        if index < 0 or index >= len(self.offsets):
+            raise IndexError(index)
+        cached = self.cache.get(index)
+        if cached is not None:
+            self.cache.move_to_end(index)
+            return cached
+        schedule = self._read_schedule(index)
+        self.cache[index] = schedule
+        if len(self.cache) > self.CACHE_SIZE:
+            self.cache.popitem(last=False)
+        return schedule
+
+    @staticmethod
+    def _build_offsets(path: Path) -> tuple[int, ...]:
+        if not path.exists():
+            return ()
+        offsets: list[int] = []
+        with path.open("rb") as fh:
+            offset = fh.tell()
+            line = fh.readline()
+            while line:
+                if line.strip():
+                    offsets.append(offset)
+                offset = fh.tell()
+                line = fh.readline()
+        return tuple(offsets)
+
+    def _read_schedule(self, index: int) -> MidiScheduleV2:
+        with self.path.open("rb") as fh:
+            fh.seek(self.offsets[index])
+            line = fh.readline()
+        return MidiScheduleV2.model_validate_json(line)

@@ -118,7 +118,7 @@ class PrepareRunnerV2:
             "test": self.config.midi_test_target,
         }
         downloader.build_cache(self.config.midi_archive, targets)
-        counts = {split: len(items) for split, items in downloader.load_manifests().items()}
+        counts = downloader.manifest_counts()
         return {
             "build_midi_cache": counts,
             "workers": self.config.midi_workers,
