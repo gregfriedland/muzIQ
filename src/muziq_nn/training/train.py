@@ -5,15 +5,18 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
+import queue
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Sequence
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
@@ -265,6 +268,13 @@ class CheckpointMetadataV2:
     local_checkpoint_path: str
 
 
+@dataclass(frozen=True)
+class CheckpointUploadTaskV2:
+    files: tuple[tuple[Path, str], ...]
+    checkpoint_relative_path: str
+    event_payload: dict[str, Any]
+
+
 class CheckpointArtifactUploaderV2:
     """Upload numbered checkpoint artifacts to GCS or a local test directory."""
 
@@ -278,10 +288,17 @@ class CheckpointArtifactUploaderV2:
             return None
         return f"{self.base_uri}/{self.date_stamp}/{self.run_id}"
 
+    def remote_uri(self, relative_path: str) -> str | None:
+        if self.base_uri is None:
+            return None
+        return f"{self.remote_run_uri()}/{relative_path}"
+
     def upload(self, local_path: Path, relative_path: str) -> str | None:
         if self.base_uri is None:
             return None
-        remote_uri = f"{self.remote_run_uri()}/{relative_path}"
+        remote_uri = self.remote_uri(relative_path)
+        if remote_uri is None:
+            return None
         if self.base_uri.startswith("gs://"):
             self._upload_gcs(local_path, remote_uri)
         else:
@@ -344,6 +361,72 @@ class CheckpointArtifactUploaderV2:
         return "".join(safe).strip("-") or "run"
 
 
+class CheckpointUploadWorkerV2:
+    """Copy checkpoint artifacts without blocking model training on GCS I/O."""
+
+    def __init__(
+        self,
+        uploader: CheckpointArtifactUploaderV2,
+        progress: TrainingProgressLoggerV2,
+    ):
+        self.uploader = uploader
+        self.progress = progress
+        self.tasks: queue.Queue[CheckpointUploadTaskV2 | None] = queue.Queue()
+        self.failures: list[str] = []
+        self.thread = threading.Thread(
+            target=self._run,
+            name="checkpoint-upload-worker-v2",
+            daemon=False,
+        )
+        self.thread.start()
+
+    def enqueue(self, task: CheckpointUploadTaskV2) -> None:
+        self.raise_if_failed()
+        self.tasks.put(task)
+
+    def close(self) -> None:
+        self.tasks.put(None)
+        self.thread.join()
+        self.raise_if_failed()
+
+    def raise_if_failed(self) -> None:
+        if self.failures:
+            raise RuntimeError(self.failures[0])
+
+    def _run(self) -> None:
+        while True:
+            task = self.tasks.get()
+            try:
+                if task is None:
+                    return
+                uploaded = {}
+                for local_path, relative_path in task.files:
+                    uploaded[relative_path] = self.uploader.upload(
+                        local_path, relative_path
+                    )
+                self.progress.emit(
+                    "checkpoint_uploaded",
+                    {
+                        **task.event_payload,
+                        "remote_checkpoint_uri": uploaded.get(
+                            task.checkpoint_relative_path
+                        ),
+                        "upload_queue_size": self.tasks.qsize(),
+                    },
+                    force=True,
+                )
+            except Exception as exc:
+                message = f"checkpoint upload failed: {exc}"
+                self.failures.append(message)
+                self.progress.emit(
+                    "checkpoint_upload_failed",
+                    {"error": message},
+                    force=True,
+                )
+            finally:
+                self.tasks.task_done()
+
+
 class SourceTrackingTrainerV2:
     """Train the compact attention model from generated examples."""
 
@@ -363,6 +446,7 @@ class SourceTrackingTrainerV2:
         self.render_executor: ProcessPoolExecutor | None = None
         self.checkpoint_number = 0
         self.checkpoint_uploader: CheckpointArtifactUploaderV2 | None = None
+        self.checkpoint_upload_worker: CheckpointUploadWorkerV2 | None = None
 
     def run(self) -> dict[str, object]:
         self.progress.emit(
@@ -416,6 +500,10 @@ class SourceTrackingTrainerV2:
                 self.config.checkpoint_upload_run_id or run_dir.name,
                 time.strftime("%Y%m%d"),
             )
+            if self.checkpoint_uploader.base_uri is not None:
+                self.checkpoint_upload_worker = CheckpointUploadWorkerV2(
+                    self.checkpoint_uploader, self.progress
+                )
             history = []
             for stage in stages:
                 history.extend(self._train_stage(stage, run_dir))
@@ -450,6 +538,7 @@ class SourceTrackingTrainerV2:
                 mean_loss=history[-1]["loss"] if history else None,
                 force=True,
             )
+            self._close_checkpoint_upload_worker()
             self.progress.emit("training_done", artifacts, force=True)
             print(
                 json.dumps(
@@ -459,6 +548,7 @@ class SourceTrackingTrainerV2:
             )
             return payload
         finally:
+            self._close_checkpoint_upload_worker()
             if self.render_executor is not None:
                 self.render_executor.shutdown(wait=True)
 
@@ -619,31 +709,58 @@ class SourceTrackingTrainerV2:
         )
         metadata_payload = asdict(metadata)
         metadata_path.write_text(json.dumps(metadata_payload, indent=2), encoding="utf-8")
-        uploaded_checkpoint = self.checkpoint_uploader.upload(
-            checkpoint_path, f"checkpoints/{checkpoint_path.name}"
-        )
-        uploaded_metadata = self.checkpoint_uploader.upload(
-            metadata_path, f"checkpoints/{metadata_path.name}"
-        )
+        checkpoint_relative_path = f"checkpoints/{checkpoint_path.name}"
+        metadata_relative_path = f"checkpoints/{metadata_path.name}"
+        latest_relative_path = "checkpoints/latest.json"
         latest_payload = {
             **metadata_payload,
-            "remote_checkpoint_uri": uploaded_checkpoint,
-            "remote_metadata_uri": uploaded_metadata,
+            "remote_checkpoint_uri": self.checkpoint_uploader.remote_uri(
+                checkpoint_relative_path
+            ),
+            "remote_metadata_uri": self.checkpoint_uploader.remote_uri(
+                metadata_relative_path
+            ),
         }
         latest_path.write_text(json.dumps(latest_payload, indent=2), encoding="utf-8")
-        self.checkpoint_uploader.upload(latest_path, "checkpoints/latest.json")
+        event_payload = {
+            "checkpoint_number": self.checkpoint_number,
+            "phase": phase,
+            "stage": stage,
+            "epoch": epoch,
+            "batch": batch,
+        }
+        if self.checkpoint_upload_worker is not None:
+            self.checkpoint_upload_worker.enqueue(
+                CheckpointUploadTaskV2(
+                    files=(
+                        (checkpoint_path, checkpoint_relative_path),
+                        (metadata_path, metadata_relative_path),
+                        (latest_path, latest_relative_path),
+                    ),
+                    checkpoint_relative_path=checkpoint_relative_path,
+                    event_payload=event_payload,
+                )
+            )
         self.progress.emit(
-            "checkpoint_uploaded",
+            "checkpoint_upload_queued",
             {
-                "checkpoint_number": self.checkpoint_number,
-                "phase": phase,
-                "stage": stage,
-                "epoch": epoch,
-                "batch": batch,
-                "remote_checkpoint_uri": uploaded_checkpoint,
+                **event_payload,
+                "remote_checkpoint_uri": self.checkpoint_uploader.remote_uri(
+                    checkpoint_relative_path
+                ),
+                "upload_queue_size": self.checkpoint_upload_worker.tasks.qsize()
+                if self.checkpoint_upload_worker is not None
+                else 0,
             },
             force=True,
         )
+
+    def _close_checkpoint_upload_worker(self) -> None:
+        if self.checkpoint_upload_worker is None:
+            return
+        worker = self.checkpoint_upload_worker
+        self.checkpoint_upload_worker = None
+        worker.close()
 
     @staticmethod
     def _checkpoint_filename_stem(
