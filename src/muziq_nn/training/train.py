@@ -7,6 +7,7 @@ import json
 import sys
 import time
 from collections.abc import Sequence
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -21,6 +22,7 @@ from muziq_nn.datasets.render import (
     SourceTrackingAudioConfigV2,
     SourceTrackingRendererV2,
 )
+from muziq_nn.datasets.schema import SplitName
 from muziq_nn.models.attention import (
     DualPathTransformerSourceTrackerV2,
     SourceTrackingLossV2,
@@ -111,6 +113,7 @@ class TrainingConfigV2:
     device: str = "auto"
     smoke_examples: int = 0
     progress_interval_s: float = 10.0
+    render_workers: int = 1
 
 
 class TrainingBatchBuilderV2:
@@ -120,18 +123,20 @@ class TrainingBatchBuilderV2:
         self.device = device
 
     def build(self, examples) -> dict[str, torch.Tensor]:
+        return self.build_slices([self.slice_from_example(example) for example in examples])
+
+    def build_slices(self, slices) -> dict[str, torch.Tensor]:
         frames = []
         activity = []
         family = []
         onset = []
         offset = []
-        for example in examples:
-            frame_idx = self._sample_active_frame(example)
-            frames.append(example.frames[max(0, frame_idx - 255) : frame_idx + 1])
-            activity.append(example.labels.active[frame_idx])
-            family.append(np.maximum(example.labels.family[frame_idx], 0))
-            onset.append(example.labels.onset[frame_idx])
-            offset.append(example.labels.offset[frame_idx])
+        for item in slices:
+            frames.append(item["frames"])
+            activity.append(item["activity"])
+            family.append(np.maximum(item["family"], 0))
+            onset.append(item["onset"])
+            offset.append(item["offset"])
         max_len = max(frame.shape[0] for frame in frames)
         padded = np.zeros(
             (len(frames), max_len, SourceTrackingAudioConfigV2.bands), dtype=np.float32
@@ -146,6 +151,17 @@ class TrainingBatchBuilderV2:
             "family": torch.from_numpy(np.asarray(family, dtype=np.int64)).to(self.device),
             "onset": torch.from_numpy(np.asarray(onset, dtype=np.float32)).to(self.device),
             "offset": torch.from_numpy(np.asarray(offset, dtype=np.float32)).to(self.device),
+        }
+
+    @classmethod
+    def slice_from_example(cls, example) -> dict[str, np.ndarray]:
+        frame_idx = cls._sample_active_frame(example)
+        return {
+            "frames": example.frames[max(0, frame_idx - 255) : frame_idx + 1],
+            "activity": example.labels.active[frame_idx],
+            "family": example.labels.family[frame_idx],
+            "onset": example.labels.onset[frame_idx],
+            "offset": example.labels.offset[frame_idx],
         }
 
     @staticmethod
@@ -179,6 +195,33 @@ class TrainingProgressLoggerV2:
         )
 
 
+class TrainingRenderWorkerV2:
+    """Render batch slices in worker processes with one renderer per process."""
+
+    _renderers: dict[str, SourceTrackingRendererV2] = {}
+
+    @staticmethod
+    def render_slice(task: tuple[str, str, SplitName, int]) -> dict[str, np.ndarray]:
+        data_root, stage, split, seed = task
+        renderer = TrainingRenderWorkerV2._renderer(data_root)
+        example = renderer.render(stage, split, seed)
+        return TrainingBatchBuilderV2.slice_from_example(example)
+
+    @staticmethod
+    def _renderer(data_root: str) -> SourceTrackingRendererV2:
+        renderer = TrainingRenderWorkerV2._renderers.get(data_root)
+        if renderer is not None:
+            return renderer
+        nsynth = NsynthIndexV2(Path(data_root))
+        midi = MidiIndexV2(Path(data_root))
+        renderer = SourceTrackingRendererV2(
+            NsynthNoteStoreV2(nsynth),
+            MidiScheduleStoreV2(midi),
+        )
+        TrainingRenderWorkerV2._renderers[data_root] = renderer
+        return renderer
+
+
 class SourceTrackingTrainerV2:
     """Train the compact attention model from generated examples."""
 
@@ -192,6 +235,7 @@ class SourceTrackingTrainerV2:
         self.loss_fn = SourceTrackingLossV2()
         self.batch_builder = TrainingBatchBuilderV2(self.device)
         self.progress = TrainingProgressLoggerV2(config.progress_interval_s)
+        self.render_executor: ProcessPoolExecutor | None = None
 
     def run(self) -> dict[str, object]:
         self.progress.emit(
@@ -200,53 +244,70 @@ class SourceTrackingTrainerV2:
                 "device": str(self.device),
                 "curriculum_scale": self.config.curriculum_scale,
                 "batch_size": self.config.batch_size,
+                "render_workers": self.config.render_workers,
             },
             force=True,
         )
-        plan = CurriculumPlanV2().scale_examples(self.config.curriculum_scale)
-        examples_per_second = self.calibrate()
-        self.progress.emit(
-            "training_calibrated",
-            {"examples_per_second": round(examples_per_second, 3)},
-            force=True,
-        )
-        stages = plan.trim_for_hours(examples_per_second, self.config.max_hours)
-        if self.config.smoke_examples > 0:
-            stages = (
-                CurriculumStageV2("single_note_all", self.config.smoke_examples, 1, 3e-4),
+        try:
+            if self.config.render_workers > 1:
+                self.render_executor = ProcessPoolExecutor(
+                    max_workers=self.config.render_workers
+                )
+            plan = CurriculumPlanV2().scale_examples(self.config.curriculum_scale)
+            examples_per_second = self.calibrate()
+            self.progress.emit(
+                "training_calibrated",
+                {"examples_per_second": round(examples_per_second, 3)},
+                force=True,
             )
-        self.progress.emit(
-            "training_plan",
-            {
+            stages = plan.trim_for_hours(examples_per_second, self.config.max_hours)
+            if self.config.smoke_examples > 0:
+                stages = (
+                    CurriculumStageV2("single_note_all", self.config.smoke_examples, 1, 3e-4),
+                )
+            self.progress.emit(
+                "training_plan",
+                {
+                    "stages": [asdict(stage) for stage in stages],
+                    "projected_hours": round(
+                        CurriculumPlanV2._project_hours(stages, examples_per_second), 3
+                    ),
+                },
+                force=True,
+            )
+            run_dir = self._run_dir()
+            history = []
+            for stage in stages:
+                history.extend(self._train_stage(stage))
+            payload = {
+                "config": asdict(self.config),
+                "examples_per_second": examples_per_second,
                 "stages": [asdict(stage) for stage in stages],
-                "projected_hours": round(
-                    CurriculumPlanV2._project_hours(stages, examples_per_second), 3
-                ),
-            },
-            force=True,
-        )
-        run_dir = self._run_dir()
-        history = []
-        for stage in stages:
-            history.extend(self._train_stage(stage))
-        payload = {
-            "config": asdict(self.config),
-            "examples_per_second": examples_per_second,
-            "stages": [asdict(stage) for stage in stages],
-            "history": history,
-        }
-        run_dir.mkdir(parents=True, exist_ok=True)
-        (run_dir / "metrics.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        torch.save(self.model.state_dict(), run_dir / "checkpoint.pt")
-        self.progress.emit("training_done", {"run_dir": str(run_dir)}, force=True)
-        print(json.dumps({"run_dir": str(run_dir), "history": history[-5:]}, sort_keys=True))
-        return payload
+                "history": history,
+            }
+            run_dir.mkdir(parents=True, exist_ok=True)
+            (run_dir / "metrics.json").write_text(
+                json.dumps(payload, indent=2), encoding="utf-8"
+            )
+            torch.save(self.model.state_dict(), run_dir / "checkpoint.pt")
+            self.progress.emit("training_done", {"run_dir": str(run_dir)}, force=True)
+            print(
+                json.dumps({"run_dir": str(run_dir), "history": history[-5:]}, sort_keys=True)
+            )
+            return payload
+        finally:
+            if self.render_executor is not None:
+                self.render_executor.shutdown(wait=True)
 
     def calibrate(self) -> float:
         start = time.perf_counter()
         count = max(1, min(self.config.calibration_examples, 128))
-        for idx in range(count):
-            self.renderer.render("single_note_all", "train", self.config.seed + idx)
+        for idx in range(0, count, self.config.batch_size):
+            seeds = [
+                self.config.seed + row
+                for row in range(idx, min(idx + self.config.batch_size, count))
+            ]
+            self._render_slices("single_note_all", "train", seeds)
         elapsed = max(time.perf_counter() - start, 1e-6)
         return count / elapsed
 
@@ -270,18 +331,16 @@ class SourceTrackingTrainerV2:
             losses = []
             epoch_start = time.monotonic()
             for batch_idx in range(batches_per_epoch):
-                examples = [
-                    self.renderer.render(
-                        stage.name,
-                        "train",
-                        self.config.seed
-                        + epoch * 1_000_000
-                        + batch_idx * self.config.batch_size
-                        + row,
-                    )
+                seeds = [
+                    self.config.seed
+                    + epoch * 1_000_000
+                    + batch_idx * self.config.batch_size
+                    + row
                     for row in range(self.config.batch_size)
                 ]
-                batch = self.batch_builder.build(examples)
+                batch = self.batch_builder.build_slices(
+                    self._render_slices(stage.name, "train", seeds)
+                )
                 outputs = self.model(batch["frames"])
                 loss = self.loss_fn(outputs, batch)
                 optimizer.zero_grad(set_to_none=True)
@@ -311,6 +370,19 @@ class SourceTrackingTrainerV2:
             print(json.dumps(row, sort_keys=True), flush=True)
             rows.append(row)
         return rows
+
+    def _render_slices(
+        self, stage: str, split: SplitName, seeds: list[int]
+    ) -> list[dict[str, np.ndarray]]:
+        if self.render_executor is None:
+            return [
+                TrainingBatchBuilderV2.slice_from_example(
+                    self.renderer.render(stage, split, seed)
+                )
+                for seed in seeds
+            ]
+        tasks = [(self.config.data_root, stage, split, seed) for seed in seeds]
+        return list(self.render_executor.map(TrainingRenderWorkerV2.render_slice, tasks))
 
     def _build_renderer(self) -> SourceTrackingRendererV2:
         nsynth = NsynthIndexV2(Path(self.config.data_root))
@@ -363,6 +435,11 @@ class TrainingCliV2:
             "--progress-interval-s",
             type=float,
             default=TrainingConfigV2.progress_interval_s,
+        )
+        parser.add_argument(
+            "--render-workers",
+            type=int,
+            default=TrainingConfigV2.render_workers,
         )
         args = parser.parse_args(argv)
         values = vars(args)
