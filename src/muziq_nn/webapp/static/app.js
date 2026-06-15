@@ -21,28 +21,30 @@ class SourceGridApp {
     this.fileInput = document.getElementById("fileInput");
     this.filePlayer = document.getElementById("filePlayer");
     this.captureButton = document.getElementById("captureButton");
+    this.demoButton = document.getElementById("demoButton");
     this.stopButton = document.getElementById("stopButton");
     this.resetButton = document.getElementById("resetButton");
     this.loadSpotify = document.getElementById("loadSpotify");
     this.spotifyUrl = document.getElementById("spotifyUrl");
     this.spotifyFrame = document.getElementById("spotifyFrame");
-    this.history = Array.from({ length: 5 }, () => []);
-    this.sources = Array.from({ length: 5 }, (_, slot) => ({
-      slot,
-      activity: 0,
-      family: "-",
-      confidence: 0,
-      position: 0.5,
-    }));
+    this.instrumentRows = [];
     this.ws = null;
     this.captureContext = null;
     this.captureStream = null;
     this.captureNode = null;
+    this.pendingFeatures = [];
     this.sendingFile = false;
+    this.waitingForManualDemoPlay = false;
+    this.demoAudio = null;
+    this.demoInferenceStarted = false;
+    this.noteActive = false;
+    this.activeRowKey = null;
+    this.lastSignalAt = 0;
     this.lastPredictionAt = 0;
     this.bind();
     this.resize();
     window.addEventListener("resize", () => this.resize());
+    window.setInterval(() => this.clearRowsAfterSilence(performance.now()), 250);
     requestAnimationFrame(() => this.draw());
   }
 
@@ -59,7 +61,9 @@ class SourceGridApp {
 
   bind() {
     this.fileInput.addEventListener("change", () => this.handleFile());
+    this.filePlayer.addEventListener("play", () => this.handleAudioPlay());
     this.captureButton.addEventListener("click", () => this.startCapture());
+    this.demoButton.addEventListener("click", () => this.playDemoBeat());
     this.stopButton.addEventListener("click", () => this.stopAudio());
     this.resetButton.addEventListener("click", () => this.reset());
     this.loadSpotify.addEventListener("click", () => this.loadSpotifyEmbed());
@@ -91,7 +95,9 @@ class SourceGridApp {
   handleServerMessage(event) {
     const payload = JSON.parse(event.data);
     if (payload.type === "ready") {
-      this.setStatus("Inference ready", "ready");
+      if (!this.waitingForManualDemoPlay) {
+        this.setStatus("Inference ready", "ready");
+      }
       return;
     }
     if (payload.type === "error") {
@@ -102,17 +108,83 @@ class SourceGridApp {
       return;
     }
     this.lastPredictionAt = performance.now();
-    this.sourceCount.textContent = String(payload.source_count);
+    const feature = this.pendingFeatures.shift() || emptyAudioFeature();
+    this.updateInstrumentRows(payload, feature);
+    this.sourceCount.textContent = String(this.instrumentRows.length);
     this.frameCount.textContent = String(payload.frame_count);
     this.latency.textContent = `${Math.max(0, performance.now() - this.lastSentAt).toFixed(0)} ms`;
-    for (const source of payload.sources) {
-      this.sources[source.slot] = source;
-      this.history[source.slot].push(source.activity);
-      if (this.history[source.slot].length > this.canvas.width) {
-        this.history[source.slot].shift();
+    this.renderCards();
+  }
+
+  updateInstrumentRows(payload, feature) {
+    const now = performance.now();
+    if (feature.rms > 0.006) {
+      this.lastSignalAt = now;
+    }
+    if (this.noteActive && feature.rms <= 0.012) {
+      this.hideActiveNote();
+    }
+    if (!this.noteActive && feature.rms >= 0.026) {
+      const source = chooseSourceForFeature(payload.sources, feature);
+      if (source) {
+        this.showNote(source, feature, now);
       }
     }
+    this.clearRowsAfterSilence(now);
+  }
+
+  showNote(source, feature, now) {
+    const key = `slot:${source.slot}`;
+    let row = this.instrumentRows.find((candidate) => candidate.key === key);
+    if (!row) {
+      row = {
+        key,
+        slot: source.slot,
+        family: source.family,
+        color: ROW_COLORS[source.slot % ROW_COLORS.length],
+        minFrequency: feature.meanFrequency,
+        maxFrequency: feature.meanFrequency,
+        lastSeenAt: now,
+        activeNote: null,
+      };
+      this.instrumentRows.push(row);
+    }
+    row.family = source.family;
+    row.lastSeenAt = now;
+    row.minFrequency = Math.min(row.minFrequency, feature.meanFrequency);
+    row.maxFrequency = Math.max(row.maxFrequency, feature.meanFrequency);
+    row.activeNote = {
+      frequency: feature.meanFrequency,
+      activity: Math.max(source.activity, feature.rms * 12),
+    };
+    this.noteActive = true;
+    this.activeRowKey = key;
+  }
+
+  hideActiveNote() {
+    const row = this.instrumentRows.find((candidate) => candidate.key === this.activeRowKey);
+    if (row) {
+      row.activeNote = null;
+    }
+    this.noteActive = false;
+    this.activeRowKey = null;
+  }
+
+  clearRowsAfterSilence(now) {
+    if (!this.instrumentRows.length || !this.lastSignalAt) {
+      return;
+    }
+    if (now - this.lastSignalAt < 3000) {
+      return;
+    }
+    this.instrumentRows = [];
+    this.noteActive = false;
+    this.activeRowKey = null;
+    this.sourceCount.textContent = "0";
     this.renderCards();
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send("reset");
+    }
   }
 
   async handleFile() {
@@ -189,9 +261,66 @@ class SourceGridApp {
     this.setStatus("Capturing audio", "ready");
   }
 
+  async playDemoBeat() {
+    this.stopAudio();
+    await this.connect();
+    this.reset();
+    const audio = makeAlternatingBeat(TARGET_SAMPLE_RATE, 8);
+    this.demoAudio = audio;
+    this.demoInferenceStarted = false;
+    const isPlaying = await this.playDemoAudio(audio);
+    this.waitingForManualDemoPlay = !isPlaying;
+    this.setStatus(
+      isPlaying ? "Playing demo beat" : "Press play in the audio control",
+      isPlaying ? "ready" : "error",
+    );
+    if (isPlaying && !this.demoInferenceStarted) {
+      this.startDemoInference();
+    }
+  }
+
+  handleAudioPlay() {
+    if (!this.demoAudio || this.demoInferenceStarted) {
+      return;
+    }
+    this.waitingForManualDemoPlay = false;
+    this.setStatus("Playing demo beat", "ready");
+    this.startDemoInference();
+  }
+
+  startDemoInference() {
+    if (!this.demoAudio || this.demoInferenceStarted) {
+      return;
+    }
+    this.demoInferenceStarted = true;
+    this.sendingFile = true;
+    void this.streamAudioArray(this.demoAudio);
+  }
+
+  async playDemoAudio(audio) {
+    const wav = audioToWavBlob(audio, TARGET_SAMPLE_RATE);
+    if (this.filePlayer.src) {
+      URL.revokeObjectURL(this.filePlayer.src);
+    }
+    this.filePlayer.src = URL.createObjectURL(wav);
+    this.filePlayer.currentTime = 0;
+    this.filePlayer.volume = 1;
+    this.filePlayer.muted = false;
+    try {
+      await this.filePlayer.play();
+      return !this.filePlayer.paused;
+    } catch (_error) {
+      return false;
+    }
+  }
+
   sendChunk(chunk) {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN || !chunk.length) {
       return;
+    }
+    this.pendingFeatures.push(analyzeAudioChunk(chunk, TARGET_SAMPLE_RATE));
+    if (this.pendingFeatures.length > 12) {
+      this.pendingFeatures.shift();
     }
     this.lastSentAt = performance.now();
     this.ws.send(chunk.buffer.slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength));
@@ -199,6 +328,11 @@ class SourceGridApp {
 
   stopAudio() {
     this.sendingFile = false;
+    this.waitingForManualDemoPlay = false;
+    this.demoAudio = null;
+    this.demoInferenceStarted = false;
+    this.pendingFeatures = [];
+    this.hideActiveNote();
     if (this.captureNode) {
       this.captureNode.disconnect();
       this.captureNode = null;
@@ -217,14 +351,13 @@ class SourceGridApp {
   }
 
   reset() {
-    this.history = Array.from({ length: 5 }, () => []);
-    this.sources = Array.from({ length: 5 }, (_, slot) => ({
-      slot,
-      activity: 0,
-      family: "-",
-      confidence: 0,
-      position: 0.5,
-    }));
+    this.instrumentRows = [];
+    this.pendingFeatures = [];
+    this.noteActive = false;
+    this.activeRowKey = null;
+    this.lastSignalAt = 0;
+    this.sourceCount.textContent = "0";
+    this.frameCount.textContent = "0";
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       this.ws.send("reset");
     }
@@ -246,17 +379,21 @@ class SourceGridApp {
   }
 
   renderCards() {
-    this.sourceRows.replaceChildren(...this.sources.map((source, slot) => {
+    this.sourceRows.replaceChildren(...this.sortedRows().map((source) => {
       const card = document.createElement("div");
       card.className = "source-card";
-      card.style.borderColor = colorCss(ROW_COLORS[slot], Math.max(0.25, source.activity));
+      card.style.borderColor = colorCss(source.color, source.activeNote ? 1 : 0.25);
       const title = document.createElement("strong");
-      title.textContent = `ID ${slot + 1}`;
+      title.textContent = `ID ${source.slot + 1}`;
       const detail = document.createElement("span");
-      detail.textContent = `${source.family}  ${(source.activity * 100).toFixed(0)}%`;
+      detail.textContent = `${source.family}  ${frequencyRangeLabel(source)}`;
       card.append(title, detail);
       return card;
     }));
+  }
+
+  sortedRows() {
+    return [...this.instrumentRows].sort((left, right) => right.lastSeenAt - left.lastSeenAt);
   }
 
   resize() {
@@ -271,32 +408,28 @@ class SourceGridApp {
     const height = this.canvas.height;
     this.ctx.fillStyle = "#050607";
     this.ctx.fillRect(0, 0, width, height);
-    const rowHeight = Math.floor(height / 5);
-    for (let slot = 0; slot < 5; slot += 1) {
-      const y = slot * rowHeight;
-      this.drawRow(slot, y, rowHeight, width);
-    }
+    const rows = this.sortedRows();
+    const rowCount = Math.max(1, rows.length);
+    const rowHeight = Math.floor(height / rowCount);
+    rows.forEach((row, index) => this.drawRow(row, index * rowHeight, rowHeight, width));
     requestAnimationFrame(() => this.draw());
   }
 
-  drawRow(slot, y, rowHeight, width) {
-    const history = this.history[slot];
-    const color = ROW_COLORS[slot];
+  drawRow(row, y, rowHeight, width) {
+    const color = row.color;
     this.ctx.fillStyle = "rgba(255,255,255,0.05)";
     this.ctx.fillRect(0, y + rowHeight - 1, width, 1);
-    for (let i = 0; i < history.length; i += 1) {
-      const level = Math.min(1, Math.max(0, history[i]));
-      const x = width - history.length + i;
-      this.ctx.fillStyle = colorCss(color, level);
-      this.ctx.fillRect(x, y + 4, 1, Math.max(1, rowHeight - 8));
-    }
-    const source = this.sources[slot];
-    const boxWidth = Math.max(12, Math.floor(width * 0.035));
-    const x = Math.max(0, Math.min(width - boxWidth, Math.floor(source.position * width)));
-    const pulse = Math.max(source.activity, source.onset || 0);
-    if (pulse > 0.05) {
-      this.ctx.fillStyle = colorCss(color, Math.min(1, 0.25 + pulse));
-      this.ctx.fillRect(x, y + 6, boxWidth, Math.max(1, rowHeight - 12));
+    this.ctx.fillStyle = "rgba(237,242,247,0.72)";
+    this.ctx.font = `${Math.max(11, Math.floor(rowHeight * 0.12))}px sans-serif`;
+    this.ctx.fillText(`ID ${row.slot + 1} ${row.family}`, 12, y + 24);
+    if (row.activeNote) {
+      const boxSize = Math.max(18, Math.min(54, Math.floor(rowHeight * 0.48)));
+      const labelWidth = Math.min(170, Math.floor(width * 0.18));
+      const usableWidth = Math.max(1, width - labelWidth - boxSize - 20);
+      const x = labelWidth + frequencyPosition(row, row.activeNote.frequency) * usableWidth;
+      const centerY = y + rowHeight / 2;
+      this.ctx.fillStyle = colorCss(color, Math.min(1, 0.35 + row.activeNote.activity));
+      this.ctx.fillRect(x, centerY - boxSize / 2, boxSize, boxSize);
     }
   }
 
@@ -321,6 +454,142 @@ function resampleLinear(input, inputRate, outputRate) {
     output[i] = input[left] * (1 - frac) + input[right] * frac;
   }
   return output;
+}
+
+function analyzeAudioChunk(input, sampleRate) {
+  let energy = 0;
+  for (let i = 0; i < input.length; i += 1) {
+    energy += input[i] * input[i];
+  }
+  const rms = Math.sqrt(energy / Math.max(1, input.length));
+  if (rms < 0.000001) {
+    return { rms, meanFrequency: 0 };
+  }
+  const windowSize = Math.min(512, input.length);
+  let weightedFrequency = 0;
+  let weight = 0;
+  for (let bin = 1; bin < windowSize / 2; bin += 1) {
+    let real = 0;
+    let imag = 0;
+    for (let index = 0; index < windowSize; index += 1) {
+      const window = 0.5 - 0.5 * Math.cos((2 * Math.PI * index) / Math.max(1, windowSize - 1));
+      const phase = (2 * Math.PI * bin * index) / windowSize;
+      const sample = input[index] * window;
+      real += sample * Math.cos(phase);
+      imag -= sample * Math.sin(phase);
+    }
+    const magnitude = Math.sqrt(real * real + imag * imag);
+    const frequency = (bin * sampleRate) / windowSize;
+    weightedFrequency += frequency * magnitude;
+    weight += magnitude;
+  }
+  return {
+    rms,
+    meanFrequency: Math.max(20, Math.min(sampleRate / 2, weightedFrequency / Math.max(weight, 0.000001))),
+  };
+}
+
+function emptyAudioFeature() {
+  return { rms: 0, meanFrequency: 0 };
+}
+
+function chooseSourceForFeature(sources, feature) {
+  const active = sources
+    .filter((source) => source.activity >= 0.35)
+    .sort((left, right) => right.confidence - left.confidence);
+  if (!active.length) {
+    return sources.slice().sort((left, right) => right.activity - left.activity)[0] || null;
+  }
+  if (feature.meanFrequency > 0 && feature.meanFrequency < 280) {
+    return active.find((source) => source.family === "bass") || active[0];
+  }
+  if (feature.meanFrequency >= 280) {
+    return active.find((source) => source.family !== "bass") || active[0];
+  }
+  return active[0];
+}
+
+function frequencyPosition(row, frequency) {
+  const range = row.maxFrequency - row.minFrequency;
+  if (range < 20) {
+    return 0.5;
+  }
+  return Math.max(0, Math.min(1, (frequency - row.minFrequency) / range));
+}
+
+function frequencyRangeLabel(row) {
+  if (row.maxFrequency <= 0) {
+    return "-";
+  }
+  if (row.maxFrequency - row.minFrequency < 20) {
+    return `${Math.round(row.maxFrequency)} Hz`;
+  }
+  return `${Math.round(row.minFrequency)}-${Math.round(row.maxFrequency)} Hz`;
+}
+
+function makeAlternatingBeat(sampleRate, seconds) {
+  const length = Math.floor(sampleRate * seconds);
+  const output = new Float32Array(length);
+  for (let beat = 0; beat < seconds * 2; beat += 1) {
+    const start = Math.floor(beat * 0.5 * sampleRate);
+    if (beat % 2 === 0) {
+      addKick(output, sampleRate, start);
+    } else {
+      addPing(output, sampleRate, start);
+    }
+  }
+  return output;
+}
+
+function audioToWavBlob(audio, sampleRate) {
+  const bytesPerSample = 2;
+  const headerBytes = 44;
+  const buffer = new ArrayBuffer(headerBytes + audio.length * bytesPerSample);
+  const view = new DataView(buffer);
+  writeAscii(view, 0, "RIFF");
+  view.setUint32(4, 36 + audio.length * bytesPerSample, true);
+  writeAscii(view, 8, "WAVE");
+  writeAscii(view, 12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * bytesPerSample, true);
+  view.setUint16(32, bytesPerSample, true);
+  view.setUint16(34, 8 * bytesPerSample, true);
+  writeAscii(view, 36, "data");
+  view.setUint32(40, audio.length * bytesPerSample, true);
+  for (let i = 0; i < audio.length; i += 1) {
+    const sample = Math.max(-1, Math.min(1, audio[i]));
+    view.setInt16(headerBytes + i * bytesPerSample, sample * 0x7fff, true);
+  }
+  return new Blob([buffer], { type: "audio/wav" });
+}
+
+function writeAscii(view, offset, text) {
+  for (let i = 0; i < text.length; i += 1) {
+    view.setUint8(offset + i, text.charCodeAt(i));
+  }
+}
+
+function addKick(output, sampleRate, start) {
+  const length = Math.floor(sampleRate * 0.22);
+  for (let i = 0; i < length && start + i < output.length; i += 1) {
+    const t = i / sampleRate;
+    const envelope = Math.exp(-t * 16);
+    const frequency = 95 - 38 * Math.min(1, t / 0.18);
+    output[start + i] += 0.72 * envelope * Math.sin(2 * Math.PI * frequency * t);
+  }
+}
+
+function addPing(output, sampleRate, start) {
+  const length = Math.floor(sampleRate * 0.16);
+  for (let i = 0; i < length && start + i < output.length; i += 1) {
+    const t = i / sampleRate;
+    const envelope = Math.exp(-t * 24);
+    const tone = Math.sin(2 * Math.PI * 760 * t) + 0.35 * Math.sin(2 * Math.PI * 1520 * t);
+    output[start + i] += 0.42 * envelope * tone;
+  }
 }
 
 function spotifyTrackId(value) {
