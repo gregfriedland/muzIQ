@@ -32,6 +32,8 @@ class SourcePredictionV2:
     confidence: float
     onset: float
     offset: float
+    onset_delta: float
+    offset_delta: float
     position: float
 
     def to_json(self) -> dict[str, float | int | str]:
@@ -43,6 +45,8 @@ class SourcePredictionV2:
             "confidence": self.confidence,
             "onset": self.onset,
             "offset": self.offset,
+            "onset_delta": self.onset_delta,
+            "offset_delta": self.offset_delta,
             "position": self.position,
         }
 
@@ -76,6 +80,7 @@ class SourceTrackingCheckpointLoaderV2:
         self.device = self._select_device(device)
         self.payload = self._load_payload()
         self.state_dict = self._state_dict_from_payload(self.payload)
+        self.has_count_head = any(name.startswith("head.count.") for name in self.state_dict)
         self.config = self._infer_config(self.state_dict)
         self.model = self._load_model()
 
@@ -84,7 +89,21 @@ class SourceTrackingCheckpointLoaderV2:
 
     def _load_model(self) -> DualPathTransformerSourceTrackerV2:
         model = DualPathTransformerSourceTrackerV2(self.config).to(self.device)
-        model.load_state_dict(self.state_dict)
+        result = model.load_state_dict(self.state_dict, strict=False)
+        missing = [
+            name
+            for name in result.missing_keys
+            if (
+                (self.has_count_head or not name.startswith("head.count."))
+                and not name.startswith("head.onset_delta.")
+                and not name.startswith("head.offset_delta.")
+            )
+        ]
+        if missing or result.unexpected_keys:
+            raise RuntimeError(
+                "checkpoint state dict did not match model: "
+                f"missing={missing}, unexpected={result.unexpected_keys}"
+            )
         model.eval()
         return model
 
@@ -194,7 +213,10 @@ class RealtimeSourceTrackerV2:
         family_probs = torch.softmax(outputs["family_logits"], dim=-1)[0].detach().cpu()
         onset = torch.sigmoid(outputs["onset_logits"])[0].detach().cpu().numpy()
         offset = torch.sigmoid(outputs["offset_logits"])[0].detach().cpu().numpy()
+        onset_delta = outputs["onset_delta"][0].detach().cpu().numpy()
+        offset_delta = outputs["offset_delta"][0].detach().cpu().numpy()
         identity = outputs["identity"][0].detach().cpu().numpy()
+        predicted_count = self._predicted_count(outputs)
         sources = []
         for slot, slot_activity in enumerate(activity):
             family_index = int(torch.argmax(family_probs[slot]).item())
@@ -208,19 +230,27 @@ class RealtimeSourceTrackerV2:
                     confidence=float(slot_activity * family_confidence),
                     onset=float(onset[slot]),
                     offset=float(offset[slot]),
-                    position=self._slot_position(identity[slot], family_index),
+                    onset_delta=float(onset_delta[slot]),
+                    offset_delta=float(offset_delta[slot]),
+                    position=self._slot_position(identity[slot]),
                 )
             )
         return SourceTrackingInferenceResultV2(
             timestamp_s=time.monotonic() - self.started_at,
             frame_count=int(frames.shape[0]),
             sample_count=int(len(self.audio)),
-            source_count=sum(
-                1 for source in sources if source.activity >= self.activity_threshold
-            ),
+            source_count=predicted_count
+            if predicted_count is not None
+            else sum(1 for source in sources if source.activity >= self.activity_threshold),
             checkpoint_path=self.loaded.checkpoint_path,
             sources=tuple(sources),
         )
+
+    def _predicted_count(self, outputs: dict[str, torch.Tensor]) -> int | None:
+        if not self.loaded.has_count_head or "count_logits" not in outputs:
+            return None
+        count = int(torch.argmax(outputs["count_logits"][0]).detach().cpu().item())
+        return int(np.clip(count, 0, self.loaded.config.max_sources))
 
     def _empty_result(self, frame_count: int) -> SourceTrackingInferenceResultV2:
         return SourceTrackingInferenceResultV2(
@@ -238,11 +268,11 @@ class RealtimeSourceTrackerV2:
         return f"family_{family_index}"
 
     @staticmethod
-    def _slot_position(identity: np.ndarray, family_index: int) -> float:
+    def _slot_position(identity: np.ndarray) -> float:
         if identity.size:
             value = float(1.0 / (1.0 + np.exp(-identity[0] * 2.0)))
-            return float(np.clip(0.25 * (family_index / 10.0) + 0.75 * value, 0.0, 1.0))
-        return float(np.clip(family_index / 10.0, 0.0, 1.0))
+            return float(np.clip(value, 0.0, 1.0))
+        return 0.5
 
     @staticmethod
     def _prepare_audio(samples: np.ndarray, sample_rate: int) -> np.ndarray:

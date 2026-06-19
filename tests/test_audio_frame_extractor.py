@@ -39,6 +39,32 @@ class TestAudioFrameExtractorV2:
 
         np.testing.assert_allclose(actual, full[105:121], rtol=1e-6, atol=1e-6)
 
+    def test_phase_offset_changes_context_without_changing_shape(self):
+        rng = np.random.default_rng(13)
+        audio = rng.normal(
+            0.0,
+            0.2,
+            SourceTrackingAudioConfigV2.sample_rate * 2 + 17,
+        ).astype(np.float32)
+        extractor = AudioFrameExtractorV2()
+
+        baseline = extractor.extract_context(
+            audio,
+            end_frame=120,
+            frame_count=16,
+            peak_warmup_frames=64,
+        )
+        shifted = extractor.extract_context(
+            audio,
+            end_frame=120,
+            frame_count=16,
+            peak_warmup_frames=64,
+            phase_offset_samples=SourceTrackingAudioConfigV2.hop // 2,
+        )
+
+        assert shifted.shape == baseline.shape
+        assert float(np.mean(np.abs(shifted - baseline))) > 0.0
+
     @staticmethod
     def _legacy_extract(
         extractor: AudioFrameExtractorV2, audio: np.ndarray
@@ -47,7 +73,7 @@ class TestAudioFrameExtractorV2:
         n_frames = int(np.ceil(len(audio) / config.hop))
         ring = np.zeros(config.win, dtype=np.float32)
         frames = np.zeros((n_frames, config.bands), dtype=np.float32)
-        peak = np.full(config.bands, 1e-6, dtype=np.float32)
+        peak = 1e-6
         for frame_idx in range(n_frames):
             start = frame_idx * config.hop
             hop_audio = np.zeros(config.hop, dtype=np.float32)
@@ -57,6 +83,7 @@ class TestAudioFrameExtractorV2:
             ring[-config.hop :] = hop_audio
             mag = np.abs(np.fft.rfft(ring * extractor._window))
             bands = extractor._fold @ mag
-            peak = np.maximum(bands, peak * 0.9996)
-            frames[frame_idx] = np.clip(bands / np.maximum(peak, 1e-6), 0.0, 1.0)
+            log_bands = np.log1p(bands * config.log_feature_scale).astype(np.float32)
+            peak = max(float(np.max(log_bands)), peak * 0.9996)
+            frames[frame_idx] = np.clip(log_bands / max(peak, 1e-6), 0.0, 1.0)
         return frames

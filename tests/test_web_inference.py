@@ -9,7 +9,8 @@ from muziq_nn.models.attention import (
     DualPathTransformerSourceTrackerV2,
     SourceTrackingModelConfigV2,
 )
-from muziq_nn.webapp.app import SourceTrackingWebAppV2, create_app
+from muziq_nn.webapp import app as web_app
+from muziq_nn.webapp.app import MacAudioDeviceProbeV2, SourceTrackingWebAppV2, create_app
 from muziq_nn.webapp.inference import (
     RealtimeSourceTrackerV2,
     SourceTrackingCheckpointLocatorV2,
@@ -45,6 +46,30 @@ class TestRealtimeSourceTrackerV2:
         assert len(prediction.sources) == config.max_sources
         assert prediction.sources[0].family
 
+    def test_loads_checkpoint_without_count_head(self, tmp_path: Path):
+        checkpoint_path = tmp_path / "checkpoint.pt"
+        config = SourceTrackingModelConfigV2(model_dim=32, heads=4, layers=1)
+        model = DualPathTransformerSourceTrackerV2(config)
+        state_dict = {
+            name: value
+            for name, value in model.state_dict().items()
+            if not name.startswith("head.count.")
+        }
+        torch.save({"state_dict": state_dict}, checkpoint_path)
+
+        tracker = RealtimeSourceTrackerV2(
+            checkpoint_path,
+            device="cpu",
+            context_frames=64,
+        )
+        audio = np.zeros(16_000, dtype=np.float32)
+
+        prediction = tracker.append_audio(audio, 16_000)
+
+        assert tracker.loaded.has_count_head is False
+        assert len(prediction.sources) == config.max_sources
+        assert isinstance(prediction.source_count, int)
+
     def test_status_route_reports_explicit_checkpoint(self, tmp_path: Path):
         checkpoint_path = tmp_path / "checkpoint.pt"
         self._write_checkpoint(checkpoint_path)
@@ -56,7 +81,9 @@ class TestRealtimeSourceTrackerV2:
         )
 
         assert "/api/status" in paths
+        assert "/api/audio-devices" in paths
         assert "/ws/infer" in paths
+        assert "/ws/capture" in paths
         assert payload["checkpoint_found"] is True
         assert payload["checkpoint_path"] == str(checkpoint_path)
         assert payload["sample_rate"] == 16_000
@@ -73,3 +100,33 @@ class TestRealtimeSourceTrackerV2:
         located = SourceTrackingCheckpointLocatorV2(tmp_path).locate(str(explicit_path))
 
         assert located == explicit_path
+
+    def test_slot_position_uses_identity_only(self):
+        assert RealtimeSourceTrackerV2._slot_position(np.array([], dtype=np.float32)) == 0.5
+        assert RealtimeSourceTrackerV2._slot_position(np.array([0.0], dtype=np.float32)) == 0.5
+        assert RealtimeSourceTrackerV2._slot_position(np.array([2.0], dtype=np.float32)) > 0.9
+
+
+class TestMacAudioDeviceProbeV2:
+    def test_parses_avfoundation_audio_devices(self, monkeypatch):
+        class Result:
+            stderr = "\n".join(
+                [
+                    "[AVFoundation indev @ 0x0] AVFoundation video devices:",
+                    "[AVFoundation indev @ 0x0] [0] FaceTime HD Camera",
+                    "[AVFoundation indev @ 0x0] AVFoundation audio devices:",
+                    "[AVFoundation indev @ 0x0] [0] BlackHole 2ch",
+                    "[AVFoundation indev @ 0x0] [1] MacBook Pro Microphone",
+                    "Error opening input file .",
+                ]
+            )
+
+        def fake_run(*_args, **_kwargs):
+            return Result()
+
+        monkeypatch.setattr(web_app.sys, "platform", "darwin")
+        monkeypatch.setattr(web_app.subprocess, "run", fake_run)
+
+        devices = MacAudioDeviceProbeV2().list_avfoundation_audio_devices()
+
+        assert devices == ["BlackHole 2ch", "MacBook Pro Microphone"]

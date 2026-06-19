@@ -10,7 +10,11 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from muziq_nn.datasets.midi import LakhMidiDownloaderV2, MidiScheduleBoundsV2
-from muziq_nn.datasets.nsynth import NsynthDownloaderV2, NsynthSplitAuditV2
+from muziq_nn.datasets.nsynth import (
+    NsynthDownloaderV2,
+    NsynthMetadataCacheBuilderV2,
+    NsynthSplitAuditV2,
+)
 
 
 @dataclass(frozen=True)
@@ -19,11 +23,16 @@ class PrepareConfigV2:
     storage_budget_gb: float = 10.0
     download_metadata: bool = False
     build_nsynth_cache: bool = False
+    nsynth_metadata_instrument_split: bool = False
     build_midi_cache: bool = False
     audit_leakage: bool = False
     nsynth_train_target: int = 25_000
     nsynth_validation_target: int = 2_000
     nsynth_test_target: int = 2_000
+    nsynth_train_instruments: int = 800
+    nsynth_validation_instruments: int = 100
+    nsynth_test_instruments: int = 100
+    nsynth_notes_per_instrument: int = 24
     midi_train_target: int = 60_000
     midi_validation_target: int = 4_000
     midi_test_target: int = 4_000
@@ -94,6 +103,17 @@ class PrepareRunnerV2:
             or downloader.ARCHIVE_URLS["validation"],
             "test": self.config.nsynth_test_archive or downloader.ARCHIVE_URLS["test"],
         }
+        if self.config.nsynth_metadata_instrument_split:
+            builder = NsynthMetadataCacheBuilderV2(
+                self.data_root,
+                sources=sources,
+                train_instruments=self.config.nsynth_train_instruments,
+                validation_instruments=self.config.nsynth_validation_instruments,
+                test_instruments=self.config.nsynth_test_instruments,
+                notes_per_instrument=self.config.nsynth_notes_per_instrument,
+                progress_interval_s=self.config.progress_interval_s,
+            )
+            return {"build_nsynth_metadata_cache": builder.build_cache()}
         targets = {
             "train": self.config.nsynth_train_target,
             "validation": self.config.nsynth_validation_target,
@@ -145,6 +165,7 @@ class PrepareCliV2:
         )
         parser.add_argument("--download-metadata", action="store_true")
         parser.add_argument("--build-nsynth-cache", action="store_true")
+        parser.add_argument("--nsynth-metadata-instrument-split", action="store_true")
         parser.add_argument("--build-midi-cache", action="store_true")
         parser.add_argument("--audit-leakage", action="store_true")
         parser.add_argument(
@@ -157,6 +178,26 @@ class PrepareCliV2:
         )
         parser.add_argument(
             "--nsynth-test-target", type=int, default=PrepareConfigV2.nsynth_test_target
+        )
+        parser.add_argument(
+            "--nsynth-train-instruments",
+            type=int,
+            default=PrepareConfigV2.nsynth_train_instruments,
+        )
+        parser.add_argument(
+            "--nsynth-validation-instruments",
+            type=int,
+            default=PrepareConfigV2.nsynth_validation_instruments,
+        )
+        parser.add_argument(
+            "--nsynth-test-instruments",
+            type=int,
+            default=PrepareConfigV2.nsynth_test_instruments,
+        )
+        parser.add_argument(
+            "--nsynth-notes-per-instrument",
+            type=int,
+            default=PrepareConfigV2.nsynth_notes_per_instrument,
         )
         parser.add_argument(
             "--midi-train-target", type=int, default=PrepareConfigV2.midi_train_target

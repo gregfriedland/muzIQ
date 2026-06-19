@@ -145,6 +145,7 @@ class TrainingConfigV2:
     data_root: str = "data"
     run_root: str = "runs"
     curriculum: str = "all"
+    stage_filter: str | None = None
     curriculum_scale: float = 1.0
     max_hours: float = 8.0
     generate_on_the_fly: bool = True
@@ -171,10 +172,24 @@ class TrainingConfigV2:
     prefetch_batches: int = 0
     mixed_precision: bool = False
     partial_warm_start: bool = False
+    metric_activity_threshold: float = 0.35
+    activity_pos_weight: float = 10.0
+    inactive_slot_weight: float = 6.0
+    family_loss_weight: float = 2.5
+    count_loss_weight: float = 8.0
+    onset_pos_weight: float = 10.0
+    offset_pos_weight: float = 10.0
+    boundary_loss_weight: float = 0.5
+    boundary_timing_loss_weight: float = 0.25
     model_dim: int = 128
     model_heads: int = 4
     model_layers: int = 2
     identity_dim: int = 16
+    frame_cache_examples_per_stage: int = 0
+    frame_cache_build_batch_size: int = 512
+    frame_cache_dtype: str = "float16"
+    frame_cache_phase_jitter_samples: int = 0
+    frame_phase_noise_std: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -209,29 +224,46 @@ class TrainingBatchBuilderV2:
         family = []
         onset = []
         offset = []
+        onset_delta = []
+        offset_delta = []
+        onset_timing_mask = []
+        offset_timing_mask = []
         for item in slices:
             activity.append(item["activity"])
             family.append(np.maximum(item["family"], 0))
             onset.append(item["onset"])
             offset.append(item["offset"])
+            onset_delta.append(item["onset_delta"])
+            offset_delta.append(item["offset_delta"])
+            onset_timing_mask.append(item["onset_timing_mask"])
+            offset_timing_mask.append(item["offset_timing_mask"])
         return {
             "frames": self._build_frame_tensor(slices),
             "activity": self._to_device(np.asarray(activity, dtype=np.float32)),
             "family": self._to_device(np.asarray(family, dtype=np.int64)),
             "onset": self._to_device(np.asarray(onset, dtype=np.float32)),
             "offset": self._to_device(np.asarray(offset, dtype=np.float32)),
+            "onset_delta": self._to_device(np.asarray(onset_delta, dtype=np.float32)),
+            "offset_delta": self._to_device(np.asarray(offset_delta, dtype=np.float32)),
+            "onset_timing_mask": self._to_device(
+                np.asarray(onset_timing_mask, dtype=np.float32)
+            ),
+            "offset_timing_mask": self._to_device(
+                np.asarray(offset_timing_mask, dtype=np.float32)
+            ),
         }
 
     def _build_frame_tensor(self, slices) -> torch.Tensor:
         if slices and "audio_context" in slices[0]:
             return self._build_frame_tensor_from_audio(slices)
         frames = [item["frames"] for item in slices]
-        max_len = max(frame.shape[0] for frame in frames)
         padded = np.zeros(
-            (len(frames), max_len, SourceTrackingAudioConfigV2.bands), dtype=np.float32
+            (len(frames), self.frame_count, SourceTrackingAudioConfigV2.bands),
+            dtype=np.float32,
         )
         for idx, frame in enumerate(frames):
-            padded[idx, -frame.shape[0] :] = frame
+            clipped = frame[-self.frame_count :]
+            padded[idx, -clipped.shape[0] :] = clipped
         return self._to_device(padded)
 
     def _build_frame_tensor_from_audio(self, slices) -> torch.Tensor:
@@ -257,12 +289,14 @@ class TrainingBatchBuilderV2:
         frame_count = raw_bands.shape[1]
         if frame_count == 0:
             return raw_bands
+        log_bands = torch.log1p(raw_bands * SourceTrackingAudioConfigV2.log_feature_scale)
         powers = torch.pow(
-            torch.tensor(0.9996, dtype=raw_bands.dtype, device=raw_bands.device),
-            torch.arange(frame_count, dtype=raw_bands.dtype, device=raw_bands.device),
+            torch.tensor(0.9996, dtype=log_bands.dtype, device=log_bands.device),
+            torch.arange(frame_count, dtype=log_bands.dtype, device=log_bands.device),
         ).view(1, frame_count, 1)
-        peak = torch.cummax(raw_bands / powers, dim=1).values * powers
-        return torch.clamp(raw_bands / torch.clamp_min(peak, 1e-6), 0.0, 1.0)
+        frame_peak = torch.amax(log_bands, dim=2, keepdim=True).clamp_min(1e-6)
+        peak = torch.cummax(frame_peak / powers, dim=1).values * powers
+        return torch.clamp(log_bands / torch.clamp_min(peak, 1e-6), 0.0, 1.0)
 
     @classmethod
     def slice_from_example(cls, example) -> dict[str, np.ndarray]:
@@ -273,6 +307,10 @@ class TrainingBatchBuilderV2:
             "family": example.labels.family[frame_idx],
             "onset": example.labels.onset[frame_idx],
             "offset": example.labels.offset[frame_idx],
+            "onset_delta": example.labels.onset_delta[frame_idx],
+            "offset_delta": example.labels.offset_delta[frame_idx],
+            "onset_timing_mask": example.labels.onset_timing_mask[frame_idx],
+            "offset_timing_mask": example.labels.offset_timing_mask[frame_idx],
         }
 
     @staticmethod
@@ -281,6 +319,164 @@ class TrainingBatchBuilderV2:
         if len(active) == 0:
             return int(example.frames.shape[0] - 1)
         return int(active[len(active) // 2])
+
+
+class CachedFramePoolV2:
+    """In-memory shuffled feature/label pool for frame-cached training stages."""
+
+    def __init__(
+        self,
+        examples: int,
+        frame_count: int,
+        frame_dtype: str,
+    ):
+        dtype = np.float16 if frame_dtype == "float16" else np.float32
+        if frame_dtype not in {"float16", "float32"}:
+            raise ValueError("frame_cache_dtype must be float16 or float32")
+        self.frames = np.empty(
+            (examples, frame_count, SourceTrackingAudioConfigV2.bands),
+            dtype=dtype,
+        )
+        self.activity = np.empty(
+            (examples, SourceTrackingAudioConfigV2.max_sources),
+            dtype=np.float32,
+        )
+        self.family = np.empty(
+            (examples, SourceTrackingAudioConfigV2.max_sources),
+            dtype=np.int64,
+        )
+        self.onset = np.empty(
+            (examples, SourceTrackingAudioConfigV2.max_sources),
+            dtype=np.float32,
+        )
+        self.offset = np.empty(
+            (examples, SourceTrackingAudioConfigV2.max_sources),
+            dtype=np.float32,
+        )
+        self.onset_delta = np.empty(
+            (examples, SourceTrackingAudioConfigV2.max_sources),
+            dtype=np.float32,
+        )
+        self.offset_delta = np.empty(
+            (examples, SourceTrackingAudioConfigV2.max_sources),
+            dtype=np.float32,
+        )
+        self.onset_timing_mask = np.empty(
+            (examples, SourceTrackingAudioConfigV2.max_sources),
+            dtype=np.float32,
+        )
+        self.offset_timing_mask = np.empty(
+            (examples, SourceTrackingAudioConfigV2.max_sources),
+            dtype=np.float32,
+        )
+
+    def write(self, start: int, batch: dict[str, torch.Tensor]) -> None:
+        stop = start + int(batch["frames"].shape[0])
+        self.frames[start:stop] = batch["frames"].detach().cpu().numpy().astype(
+            self.frames.dtype, copy=False
+        )
+        self.activity[start:stop] = batch["activity"].detach().cpu().numpy()
+        self.family[start:stop] = batch["family"].detach().cpu().numpy()
+        self.onset[start:stop] = batch["onset"].detach().cpu().numpy()
+        self.offset[start:stop] = batch["offset"].detach().cpu().numpy()
+        self.onset_delta[start:stop] = batch["onset_delta"].detach().cpu().numpy()
+        self.offset_delta[start:stop] = batch["offset_delta"].detach().cpu().numpy()
+        self.onset_timing_mask[start:stop] = (
+            batch["onset_timing_mask"].detach().cpu().numpy()
+        )
+        self.offset_timing_mask[start:stop] = (
+            batch["offset_timing_mask"].detach().cpu().numpy()
+        )
+
+    def write_slices(
+        self,
+        start: int,
+        slices: list[dict[str, np.ndarray]],
+        frame_count: int,
+    ) -> None:
+        stop = start + len(slices)
+        padded = np.zeros(
+            (len(slices), frame_count, SourceTrackingAudioConfigV2.bands),
+            dtype=self.frames.dtype,
+        )
+        for idx, item in enumerate(slices):
+            clipped = item["frames"][-frame_count:]
+            padded[idx, -clipped.shape[0] :] = clipped.astype(
+                self.frames.dtype, copy=False
+            )
+        self.frames[start:stop] = padded
+        self.activity[start:stop] = np.asarray(
+            [item["activity"] for item in slices], dtype=np.float32
+        )
+        self.family[start:stop] = np.asarray(
+            [np.maximum(item["family"], 0) for item in slices], dtype=np.int64
+        )
+        self.onset[start:stop] = np.asarray(
+            [item["onset"] for item in slices], dtype=np.float32
+        )
+        self.offset[start:stop] = np.asarray(
+            [item["offset"] for item in slices], dtype=np.float32
+        )
+        self.onset_delta[start:stop] = np.asarray(
+            [item["onset_delta"] for item in slices], dtype=np.float32
+        )
+        self.offset_delta[start:stop] = np.asarray(
+            [item["offset_delta"] for item in slices], dtype=np.float32
+        )
+        self.onset_timing_mask[start:stop] = np.asarray(
+            [item["onset_timing_mask"] for item in slices], dtype=np.float32
+        )
+        self.offset_timing_mask[start:stop] = np.asarray(
+            [item["offset_timing_mask"] for item in slices], dtype=np.float32
+        )
+
+    def batch(
+        self,
+        indices: np.ndarray,
+        device: torch.device,
+        *,
+        pin_memory: bool,
+        phase_noise_std: float,
+    ) -> dict[str, torch.Tensor]:
+        frames = self._to_device(self.frames[indices], device, pin_memory).float()
+        if phase_noise_std > 0.0:
+            frames = torch.clamp(
+                frames + torch.randn_like(frames) * phase_noise_std,
+                0.0,
+                1.0,
+            )
+        return {
+            "frames": frames,
+            "activity": self._to_device(
+                self.activity[indices], device, pin_memory
+            ).float(),
+            "family": self._to_device(self.family[indices], device, pin_memory).long(),
+            "onset": self._to_device(self.onset[indices], device, pin_memory).float(),
+            "offset": self._to_device(self.offset[indices], device, pin_memory).float(),
+            "onset_delta": self._to_device(
+                self.onset_delta[indices], device, pin_memory
+            ).float(),
+            "offset_delta": self._to_device(
+                self.offset_delta[indices], device, pin_memory
+            ).float(),
+            "onset_timing_mask": self._to_device(
+                self.onset_timing_mask[indices], device, pin_memory
+            ).float(),
+            "offset_timing_mask": self._to_device(
+                self.offset_timing_mask[indices], device, pin_memory
+            ).float(),
+        }
+
+    @staticmethod
+    def _to_device(
+        array: np.ndarray,
+        device: torch.device,
+        pin_memory: bool,
+    ) -> torch.Tensor:
+        tensor = torch.from_numpy(np.ascontiguousarray(array))
+        if pin_memory and device.type == "cuda":
+            tensor = tensor.pin_memory()
+        return tensor.to(device, non_blocking=pin_memory and device.type == "cuda")
 
 
 class TrainingProgressLoggerV2:
@@ -313,7 +509,7 @@ class TrainingRenderWorkerV2:
 
     @staticmethod
     def render_slice(
-        task: tuple[str, str, SplitName, int, int, int, bool],
+        task: tuple[str, str, SplitName, int, int, int, bool, int],
     ) -> dict[str, np.ndarray]:
         (
             data_root,
@@ -323,6 +519,7 @@ class TrainingRenderWorkerV2:
             frame_count,
             peak_warmup_frames,
             gpu_frame_extraction,
+            phase_offset_samples,
         ) = task
         renderer = TrainingRenderWorkerV2._renderer(
             data_root, include_midi=stage == "midi_complex"
@@ -341,6 +538,7 @@ class TrainingRenderWorkerV2:
             seed,
             frame_count=frame_count,
             peak_warmup_frames=peak_warmup_frames,
+            phase_offset_samples=phase_offset_samples,
         )
 
     @staticmethod
@@ -539,6 +737,11 @@ class CheckpointUploadWorkerV2:
 class SourceTrackingTrainerV2:
     """Train the compact attention model from generated examples."""
 
+    FRAME_CACHE_STAGE_TO_BASE = {
+        "single_note_frames_cached": "single_note_all",
+        "single_instrument_melody_frames_cached": "single_instrument_melody",
+    }
+
     def __init__(self, config: TrainingConfigV2):
         self.config = config
         self.device = self._resolve_device(config.device)
@@ -557,7 +760,16 @@ class SourceTrackingTrainerV2:
         self.model = DualPathTransformerSourceTrackerV2(self.model_config).to(self.device)
         if config.warm_start_checkpoint is not None:
             self._load_warm_start(Path(config.warm_start_checkpoint))
-        self.loss_fn = SourceTrackingLossV2()
+        self.loss_fn = SourceTrackingLossV2(
+            activity_pos_weight=config.activity_pos_weight,
+            inactive_slot_weight=config.inactive_slot_weight,
+            family_loss_weight=config.family_loss_weight,
+            count_loss_weight=config.count_loss_weight,
+            onset_pos_weight=config.onset_pos_weight,
+            offset_pos_weight=config.offset_pos_weight,
+            boundary_loss_weight=config.boundary_loss_weight,
+            boundary_timing_loss_weight=config.boundary_timing_loss_weight,
+        )
         self.batch_builder = TrainingBatchBuilderV2(
             self.device,
             frame_count=config.training_slice_frames,
@@ -578,6 +790,7 @@ class SourceTrackingTrainerV2:
                 "device": str(self.device),
                 "curriculum_scale": self.config.curriculum_scale,
                 "batch_size": self.config.batch_size,
+                "stage_filter": self.config.stage_filter,
                 "render_workers": self.config.render_workers,
                 "midi_render_workers": self.config.midi_render_workers,
                 "warm_start_checkpoint": self.config.warm_start_checkpoint,
@@ -597,6 +810,28 @@ class SourceTrackingTrainerV2:
                 "prefetch_batches": self.config.prefetch_batches,
                 "mixed_precision": self.config.mixed_precision,
                 "partial_warm_start": self.config.partial_warm_start,
+                "frame_cache_examples_per_stage": (
+                    self.config.frame_cache_examples_per_stage
+                ),
+                "frame_cache_build_batch_size": self.config.frame_cache_build_batch_size,
+                "frame_cache_dtype": self.config.frame_cache_dtype,
+                "frame_cache_phase_jitter_samples": (
+                    self.config.frame_cache_phase_jitter_samples
+                ),
+                "frame_phase_noise_std": self.config.frame_phase_noise_std,
+                "metric_activity_threshold": self.config.metric_activity_threshold,
+                "loss_weights": {
+                    "activity_pos_weight": self.config.activity_pos_weight,
+                    "inactive_slot_weight": self.config.inactive_slot_weight,
+                    "family_loss_weight": self.config.family_loss_weight,
+                    "count_loss_weight": self.config.count_loss_weight,
+                    "onset_pos_weight": self.config.onset_pos_weight,
+                    "offset_pos_weight": self.config.offset_pos_weight,
+                    "boundary_loss_weight": self.config.boundary_loss_weight,
+                    "boundary_timing_loss_weight": (
+                        self.config.boundary_timing_loss_weight
+                    ),
+                },
                 "model_config": asdict(self.model_config),
                 "warm_start_load_report": self.warm_start_load_report,
             },
@@ -618,6 +853,7 @@ class SourceTrackingTrainerV2:
                 force=True,
             )
             stages = plan.trim_for_hours(examples_per_second, self.config.max_hours)
+            stages = self._filter_stages(stages)
             if self.config.smoke_examples > 0:
                 stages = (
                     CurriculumStageV2("single_note_all", self.config.smoke_examples, 1, 3e-4),
@@ -845,7 +1081,13 @@ class SourceTrackingTrainerV2:
         first_epoch: int = 1,
         first_batch: int = 0,
     ) -> list[dict[str, object]]:
-        self._start_render_executor(stage.name)
+        frame_cache: CachedFramePoolV2 | None = None
+        if self._is_frame_cache_stage(stage.name):
+            self._start_render_executor(self._base_stage_for_training(stage.name))
+            frame_cache = self._build_frame_cache(stage)
+            self._shutdown_render_executor()
+        else:
+            self._start_render_executor(stage.name)
         optimizer = torch.optim.AdamW(self.model.parameters(), lr=stage.learning_rate)
         self._restore_optimizer_state_if_needed(optimizer, stage.name)
         self.current_optimizer = optimizer
@@ -869,20 +1111,35 @@ class SourceTrackingTrainerV2:
         try:
             for epoch in range(first_epoch - 1, stage.epochs):
                 losses = []
+                batch_metrics = []
                 epoch_start = time.monotonic()
                 batch_start = first_batch if epoch == first_epoch - 1 else 0
-                for batch_idx, batch in self._iter_training_batches(
-                    stage.name,
-                    epoch,
-                    batch_start,
-                    batches_per_epoch,
-                ):
+                batch_iter = (
+                    self._iter_cached_frame_batches(
+                        frame_cache,
+                        stage.name,
+                        epoch,
+                        batch_start,
+                        batches_per_epoch,
+                    )
+                    if frame_cache is not None
+                    else self._iter_training_batches(
+                        stage.name,
+                        epoch,
+                        batch_start,
+                        batches_per_epoch,
+                    )
+                )
+                for batch_idx, batch, batch_timing in batch_iter:
+                    compute_start = time.perf_counter()
                     with self._autocast_context():
                         outputs = self.model(batch["frames"])
                         loss = self.loss_fn(outputs, batch)
+                    batch_metrics.append(self._batch_metrics(outputs, batch))
                     optimizer.zero_grad(set_to_none=True)
                     loss.backward()
                     optimizer.step()
+                    compute_s = time.perf_counter() - compute_start
                     loss_value = float(loss.detach().cpu())
                     losses.append(loss_value)
                     self.progress.emit(
@@ -894,6 +1151,18 @@ class SourceTrackingTrainerV2:
                             "batches_per_epoch": batches_per_epoch,
                             "last_loss": round(loss_value, 6),
                             "mean_loss": round(float(np.mean(losses)), 6),
+                        },
+                    )
+                    self.progress.emit(
+                        "training_batch_timing",
+                        {
+                            "stage": stage.name,
+                            "epoch": epoch + 1,
+                            "batch": batch_idx + 1,
+                            "batches_per_epoch": batches_per_epoch,
+                            "batch_wait_s": round(batch_timing, 6),
+                            "compute_s": round(compute_s, 6),
+                            "cached_frames": frame_cache is not None,
                         },
                     )
                     self._save_checkpoint_artifact(
@@ -922,6 +1191,7 @@ class SourceTrackingTrainerV2:
                         - batch_start * self.config.batch_size,
                     ),
                     "elapsed_s": round(time.monotonic() - epoch_start, 3),
+                    **self._mean_batch_metrics(batch_metrics),
                 }
                 self.progress.emit("training_epoch_done", row, force=True)
                 self._emit_memory_usage(
@@ -959,7 +1229,9 @@ class SourceTrackingTrainerV2:
     ):
         if self.config.prefetch_batches <= 0:
             for batch_idx in range(batch_start, batches_per_epoch):
-                yield batch_idx, self._build_training_batch(stage_name, epoch, batch_idx)
+                start = time.perf_counter()
+                batch = self._build_training_batch(stage_name, epoch, batch_idx)
+                yield batch_idx, batch, time.perf_counter() - start
             return
         batch_indices = iter(range(batch_start, batches_per_epoch))
         pending: list[tuple[int, Future[dict[str, torch.Tensor]]]] = []
@@ -992,7 +1264,32 @@ class SourceTrackingTrainerV2:
             while pending:
                 batch_idx, future = pending.pop(0)
                 enqueue_next()
-                yield batch_idx, future.result()
+                start = time.perf_counter()
+                yield batch_idx, future.result(), time.perf_counter() - start
+
+    def _iter_cached_frame_batches(
+        self,
+        frame_cache: CachedFramePoolV2,
+        stage_name: str,
+        epoch: int,
+        batch_start: int,
+        batches_per_epoch: int,
+    ):
+        order = self._cached_frame_epoch_order(frame_cache, stage_name, epoch)
+        for batch_idx in range(batch_start, batches_per_epoch):
+            start = time.perf_counter()
+            offset = batch_idx * self.config.batch_size
+            indices = order[offset : offset + self.config.batch_size]
+            yield (
+                batch_idx,
+                frame_cache.batch(
+                    indices,
+                    self.device,
+                    pin_memory=self.config.pin_memory,
+                    phase_noise_std=self.config.frame_phase_noise_std,
+                ),
+                time.perf_counter() - start,
+            )
 
     def _build_training_batch(
         self,
@@ -1005,6 +1302,78 @@ class SourceTrackingTrainerV2:
             self._render_slices(stage_name, "train", seeds)
         )
 
+    def _build_frame_cache(self, stage: CurriculumStageV2) -> CachedFramePoolV2:
+        base_stage = self._base_stage_for_training(stage.name)
+        examples = stage.train_examples_per_epoch
+        cache = CachedFramePoolV2(
+            examples,
+            self.config.training_slice_frames,
+            self.config.frame_cache_dtype,
+        )
+        build_batch_size = max(1, self.config.frame_cache_build_batch_size)
+        self.progress.emit(
+            "frame_cache_build_start",
+            {
+                "stage": stage.name,
+                "base_stage": base_stage,
+                "examples": examples,
+                "build_batch_size": build_batch_size,
+                "frame_dtype": self.config.frame_cache_dtype,
+                "phase_jitter_samples": self.config.frame_cache_phase_jitter_samples,
+            },
+            force=True,
+        )
+        started = time.perf_counter()
+        for start in range(0, examples, build_batch_size):
+            stop = min(examples, start + build_batch_size)
+            seeds = [
+                self._frame_cache_seed(stage.name, row)
+                for row in range(start, stop)
+            ]
+            slices = self._render_slices(
+                base_stage,
+                "train",
+                seeds,
+                gpu_frame_extraction=False,
+                phase_jitter_samples=self.config.frame_cache_phase_jitter_samples,
+            )
+            cache.write_slices(start, slices, self.config.training_slice_frames)
+            self.progress.emit(
+                "frame_cache_build_progress",
+                {
+                    "stage": stage.name,
+                    "cached_examples": stop,
+                    "examples": examples,
+                    "elapsed_s": round(time.perf_counter() - started, 3),
+                },
+            )
+        payload = {
+            "stage": stage.name,
+            "base_stage": base_stage,
+            "examples": examples,
+            "elapsed_s": round(time.perf_counter() - started, 3),
+            "frames_gb": round(cache.frames.nbytes / 1_000_000_000.0, 3),
+        }
+        self.progress.emit("frame_cache_build_done", payload, force=True)
+        return cache
+
+    def _cached_frame_epoch_order(
+        self,
+        frame_cache: CachedFramePoolV2,
+        stage_name: str,
+        epoch: int,
+    ) -> np.ndarray:
+        rng = np.random.default_rng(self._frame_cache_seed(stage_name, epoch + 17_003))
+        return rng.permutation(frame_cache.frames.shape[0])
+
+    def _frame_cache_seed(self, stage_name: str, row: int) -> int:
+        stage_offset = (
+            31_000_000
+            if stage_name == "single_note_frames_cached"
+            else 43_000_000
+        )
+        return self.config.seed + stage_offset + row
+
     def _batch_seeds(self, epoch: int, batch_idx: int) -> list[int]:
         return [
             self.config.seed
@@ -1013,6 +1382,145 @@ class SourceTrackingTrainerV2:
             + row
             for row in range(self.config.batch_size)
         ]
+
+    def _filter_stages(
+        self, stages: tuple[CurriculumStageV2, ...]
+    ) -> tuple[CurriculumStageV2, ...]:
+        if not self.config.stage_filter:
+            return stages
+        requested = {
+            item.strip() for item in self.config.stage_filter.split(",") if item.strip()
+        }
+        known = {stage.name for stage in stages} | set(self.FRAME_CACHE_STAGE_TO_BASE)
+        unknown = sorted(requested - known)
+        if unknown:
+            raise ValueError(f"Unknown training stage(s): {unknown}")
+        filtered_rows = []
+        for stage in stages:
+            if stage.name in requested:
+                filtered_rows.append(stage)
+            for cache_stage, base_stage in self.FRAME_CACHE_STAGE_TO_BASE.items():
+                if cache_stage in requested and base_stage == stage.name:
+                    filtered_rows.append(
+                        CurriculumStageV2(
+                            cache_stage,
+                            self._frame_cache_examples_for_stage(stage),
+                            stage.epochs,
+                            stage.learning_rate,
+                        )
+                    )
+        filtered = tuple(filtered_rows)
+        if not filtered:
+            raise ValueError("stage_filter selected no training stages")
+        return filtered
+
+    def _frame_cache_examples_for_stage(self, stage: CurriculumStageV2) -> int:
+        if self.config.frame_cache_examples_per_stage > 0:
+            return self.config.frame_cache_examples_per_stage
+        return stage.train_examples_per_epoch
+
+    def _is_frame_cache_stage(self, stage_name: str) -> bool:
+        return stage_name in self.FRAME_CACHE_STAGE_TO_BASE
+
+    def _base_stage_for_training(self, stage_name: str) -> str:
+        return self.FRAME_CACHE_STAGE_TO_BASE.get(stage_name, stage_name)
+
+    def _batch_metrics(
+        self,
+        outputs: dict[str, torch.Tensor],
+        batch: dict[str, torch.Tensor],
+    ) -> dict[str, float]:
+        with torch.no_grad():
+            true_active = batch["activity"] > 0.5
+            pred_active = (
+                torch.sigmoid(outputs["activity_logits"])
+                >= self.config.metric_activity_threshold
+            )
+            true_count = true_active.sum(dim=1)
+            if "count_logits" in outputs:
+                pred_count = torch.argmax(outputs["count_logits"], dim=-1)
+            else:
+                pred_count = pred_active.sum(dim=1)
+            family_pred = torch.argmax(outputs["family_logits"], dim=-1)
+            family_mask = true_active
+            family_ok = family_pred[family_mask] == batch["family"][family_mask]
+            onset_target = batch["onset"] > 0.5
+            onset_pred = (
+                torch.sigmoid(outputs["onset_logits"])
+                >= self.config.metric_activity_threshold
+            )
+            offset_target = batch["offset"] > 0.5
+            offset_pred = (
+                torch.sigmoid(outputs["offset_logits"])
+                >= self.config.metric_activity_threshold
+            )
+            onset_delta_metrics = self._timing_delta_metrics(
+                outputs.get("onset_delta"),
+                batch.get("onset_delta"),
+                batch.get("onset_timing_mask"),
+                "onset",
+            )
+            offset_delta_metrics = self._timing_delta_metrics(
+                outputs.get("offset_delta"),
+                batch.get("offset_delta"),
+                batch.get("offset_timing_mask"),
+                "offset",
+            )
+            return {
+                "source_count_accuracy": float((true_count == pred_count).float().mean().cpu()),
+                "mean_predicted_active_count": float(pred_count.float().mean().cpu()),
+                "family_accuracy": float(family_ok.float().mean().cpu())
+                if family_ok.numel()
+                else 1.0,
+                "onset_recall": self._positive_recall(onset_target, onset_pred),
+                "offset_recall": self._positive_recall(offset_target, offset_pred),
+                **onset_delta_metrics,
+                **offset_delta_metrics,
+            }
+
+    @staticmethod
+    def _timing_delta_metrics(
+        prediction: torch.Tensor | None,
+        target: torch.Tensor | None,
+        mask: torch.Tensor | None,
+        prefix: str,
+    ) -> dict[str, float]:
+        if prediction is None or target is None or mask is None:
+            return {
+                f"{prefix}_timing_mae_frames": float("nan"),
+                f"{prefix}_timing_rmsd_frames": float("nan"),
+                f"{prefix}_timing_points": 0.0,
+            }
+        active = mask > 0.5
+        if not active.any():
+            return {
+                f"{prefix}_timing_mae_frames": float("nan"),
+                f"{prefix}_timing_rmsd_frames": float("nan"),
+                f"{prefix}_timing_points": 0.0,
+            }
+        delta = prediction[active] - target[active]
+        return {
+            f"{prefix}_timing_mae_frames": float(delta.abs().mean().cpu()),
+            f"{prefix}_timing_rmsd_frames": float(torch.sqrt((delta * delta).mean()).cpu()),
+            f"{prefix}_timing_points": float(active.float().sum().cpu()),
+        }
+
+    @staticmethod
+    def _positive_recall(target: torch.Tensor, predicted: torch.Tensor) -> float:
+        positives = target > 0.5
+        if not positives.any():
+            return float("nan")
+        return float(predicted[positives].float().mean().cpu())
+
+    @staticmethod
+    def _mean_batch_metrics(rows: list[dict[str, float]]) -> dict[str, float | None]:
+        if not rows:
+            return {}
+        metrics: dict[str, float | None] = {}
+        for key in rows[0]:
+            values = [row[key] for row in rows if not np.isnan(row[key])]
+            metrics[key] = float(np.mean(values)) if values else None
+        return metrics
 
     def _autocast_context(self):
         if self.config.mixed_precision and self.device.type == "cuda":
@@ -1208,8 +1716,21 @@ class SourceTrackingTrainerV2:
         )
 
     def _render_slices(
-        self, stage: str, split: SplitName, seeds: list[int]
+        self,
+        stage: str,
+        split: SplitName,
+        seeds: list[int],
+        *,
+        gpu_frame_extraction: bool | None = None,
+        phase_jitter_samples: int = 0,
     ) -> list[dict[str, np.ndarray]]:
+        use_gpu_frame_extraction = (
+            self.config.gpu_frame_extraction
+            if gpu_frame_extraction is None
+            else gpu_frame_extraction
+        )
+        phase_jitter_samples = max(0, int(phase_jitter_samples))
+        phase_offsets = self._phase_offsets_for_seeds(seeds, phase_jitter_samples)
         if self.render_executor is None:
             renderer = self._renderer_for_stage(stage)
             return [
@@ -1218,8 +1739,10 @@ class SourceTrackingTrainerV2:
                     stage,
                     split,
                     seed,
+                    gpu_frame_extraction=use_gpu_frame_extraction,
+                    phase_offset_samples=phase_offset,
                 )
-                for seed in seeds
+                for seed, phase_offset in zip(seeds, phase_offsets, strict=True)
             ]
         tasks = [
             (
@@ -1229,9 +1752,10 @@ class SourceTrackingTrainerV2:
                 seed,
                 self.config.training_slice_frames,
                 self.config.training_slice_peak_warmup_frames,
-                self.config.gpu_frame_extraction,
+                use_gpu_frame_extraction,
+                phase_offset,
             )
-            for seed in seeds
+            for seed, phase_offset in zip(seeds, phase_offsets, strict=True)
         ]
         return list(self.render_executor.map(TrainingRenderWorkerV2.render_slice, tasks))
 
@@ -1241,8 +1765,11 @@ class SourceTrackingTrainerV2:
         stage: str,
         split: SplitName,
         seed: int,
+        *,
+        gpu_frame_extraction: bool,
+        phase_offset_samples: int,
     ) -> dict[str, np.ndarray]:
-        if self.config.gpu_frame_extraction:
+        if gpu_frame_extraction:
             return renderer.render_training_audio_slice(
                 stage,
                 split,
@@ -1256,7 +1783,22 @@ class SourceTrackingTrainerV2:
             seed,
             frame_count=self.config.training_slice_frames,
             peak_warmup_frames=self.config.training_slice_peak_warmup_frames,
+            phase_offset_samples=phase_offset_samples,
         )
+
+    def _phase_offsets_for_seeds(
+        self,
+        seeds: list[int],
+        phase_jitter_samples: int,
+    ) -> list[int]:
+        if phase_jitter_samples <= 0:
+            return [0 for _ in seeds]
+        upper = min(phase_jitter_samples, SourceTrackingAudioConfigV2.hop - 1)
+        offsets = []
+        for seed in seeds:
+            rng = np.random.default_rng(seed + 71_291)
+            offsets.append(int(rng.integers(0, upper + 1)))
+        return offsets
 
     def _renderer_for_stage(self, stage: str) -> SourceTrackingRendererV2:
         if stage != "midi_complex":
@@ -1425,6 +1967,7 @@ class TrainingCliV2:
         parser.add_argument("--data-root", default=TrainingConfigV2.data_root)
         parser.add_argument("--run-root", default=TrainingConfigV2.run_root)
         parser.add_argument("--curriculum", default=TrainingConfigV2.curriculum)
+        parser.add_argument("--stage-filter", default=TrainingConfigV2.stage_filter)
         parser.add_argument(
             "--curriculum-scale",
             type=float,
@@ -1501,6 +2044,51 @@ class TrainingCliV2:
         parser.add_argument("--mixed-precision", action="store_true")
         parser.add_argument("--partial-warm-start", action="store_true")
         parser.add_argument(
+            "--metric-activity-threshold",
+            type=float,
+            default=TrainingConfigV2.metric_activity_threshold,
+        )
+        parser.add_argument(
+            "--activity-pos-weight",
+            type=float,
+            default=TrainingConfigV2.activity_pos_weight,
+        )
+        parser.add_argument(
+            "--inactive-slot-weight",
+            type=float,
+            default=TrainingConfigV2.inactive_slot_weight,
+        )
+        parser.add_argument(
+            "--family-loss-weight",
+            type=float,
+            default=TrainingConfigV2.family_loss_weight,
+        )
+        parser.add_argument(
+            "--count-loss-weight",
+            type=float,
+            default=TrainingConfigV2.count_loss_weight,
+        )
+        parser.add_argument(
+            "--onset-pos-weight",
+            type=float,
+            default=TrainingConfigV2.onset_pos_weight,
+        )
+        parser.add_argument(
+            "--offset-pos-weight",
+            type=float,
+            default=TrainingConfigV2.offset_pos_weight,
+        )
+        parser.add_argument(
+            "--boundary-loss-weight",
+            type=float,
+            default=TrainingConfigV2.boundary_loss_weight,
+        )
+        parser.add_argument(
+            "--boundary-timing-loss-weight",
+            type=float,
+            default=TrainingConfigV2.boundary_timing_loss_weight,
+        )
+        parser.add_argument(
             "--model-dim",
             type=int,
             default=TrainingConfigV2.model_dim,
@@ -1519,6 +2107,34 @@ class TrainingCliV2:
             "--identity-dim",
             type=int,
             default=TrainingConfigV2.identity_dim,
+        )
+        parser.add_argument(
+            "--frame-cache-examples-per-stage",
+            type=int,
+            default=TrainingConfigV2.frame_cache_examples_per_stage,
+            help="Examples to pre-render for each optional frame-cached stage.",
+        )
+        parser.add_argument(
+            "--frame-cache-build-batch-size",
+            type=int,
+            default=TrainingConfigV2.frame_cache_build_batch_size,
+        )
+        parser.add_argument(
+            "--frame-cache-dtype",
+            choices=("float16", "float32"),
+            default=TrainingConfigV2.frame_cache_dtype,
+        )
+        parser.add_argument(
+            "--frame-cache-phase-jitter-samples",
+            type=int,
+            default=TrainingConfigV2.frame_cache_phase_jitter_samples,
+            help="Max random STFT start offset, in samples, used while caching frames.",
+        )
+        parser.add_argument(
+            "--frame-phase-noise-std",
+            type=float,
+            default=TrainingConfigV2.frame_phase_noise_std,
+            help="Gaussian feature noise std added to cached frames at train time.",
         )
         parser.set_defaults(
             resume_optimizer_state=TrainingConfigV2.resume_optimizer_state

@@ -54,6 +54,56 @@ class TestTrainSmokeV2:
 
         assert config.midi_render_workers == 4
 
+    def test_stage_filter_selects_requested_stages(self, tmp_path):
+        TinyCorpusBuilderV2(tmp_path / "data").build()
+        trainer = SourceTrackingTrainerV2(
+            TrainingConfigV2(
+                data_root=str(tmp_path / "data"),
+                stage_filter="single_note_all,single_instrument_melody",
+                device="cpu",
+            )
+        )
+        stages = trainer._filter_stages(CurriculumPlanV2().stages)
+
+        assert [stage.name for stage in stages] == [
+            "single_note_all",
+            "single_instrument_melody",
+        ]
+
+    def test_stage_filter_selects_optional_cached_frame_stages(self, tmp_path):
+        TinyCorpusBuilderV2(tmp_path / "data").build()
+        trainer = SourceTrackingTrainerV2(
+            TrainingConfigV2(
+                data_root=str(tmp_path / "data"),
+                stage_filter="single_note_frames_cached,single_instrument_melody_frames_cached",
+                frame_cache_examples_per_stage=5,
+                device="cpu",
+            )
+        )
+        stages = trainer._filter_stages(CurriculumPlanV2().stages)
+
+        assert [stage.name for stage in stages] == [
+            "single_note_frames_cached",
+            "single_instrument_melody_frames_cached",
+        ]
+        assert [stage.train_examples_per_epoch for stage in stages] == [5, 5]
+
+    def test_cli_parses_loss_weights_and_stage_filter(self):
+        config = TrainingCliV2.parse(
+            [
+                "--stage-filter",
+                "single_note_all,single_instrument_melody",
+                "--inactive-slot-weight",
+                "6",
+                "--count-loss-weight",
+                "3",
+            ]
+        )
+
+        assert config.stage_filter == "single_note_all,single_instrument_melody"
+        assert config.inactive_slot_weight == 6
+        assert config.count_loss_weight == 3
+
     def test_one_train_step_writes_metrics_and_checkpoint(self, tmp_path):
         TinyCorpusBuilderV2(tmp_path / "data").build()
         config = TrainingConfigV2(
@@ -120,6 +170,28 @@ class TestTrainSmokeV2:
 
         assert payload["history"]
         assert payload["config"]["prefetch_batches"] == 1
+
+    def test_cached_frame_train_step_runs(self, tmp_path):
+        TinyCorpusBuilderV2(tmp_path / "data").build()
+        config = TrainingConfigV2(
+            data_root=str(tmp_path / "data"),
+            run_root=str(tmp_path / "runs"),
+            calibration_examples=2,
+            batch_size=2,
+            epochs_per_stage=1,
+            stage_filter="single_note_frames_cached",
+            frame_cache_examples_per_stage=4,
+            frame_cache_phase_jitter_samples=12,
+            frame_phase_noise_std=0.01,
+            device="cpu",
+        )
+
+        payload = SourceTrackingTrainerV2(config).run()
+
+        assert payload["history"]
+        assert payload["history"][0]["stage"] == "single_note_frames_cached"
+        assert payload["history"][0]["examples"] == 4
+        assert payload["config"]["frame_cache_phase_jitter_samples"] == 12
 
     def test_process_render_pool_train_step_runs(self, tmp_path):
         TinyCorpusBuilderV2(tmp_path / "data").build()

@@ -31,6 +31,10 @@ class SourceTrackingAudioConfigV2:
     max_sources = 5
     log_min_hz = 40.0
     log_max_hz = 8_000.0
+    log_feature_scale = 1_000.0
+    onset_label_radius_frames = 2
+    offset_label_radius_frames = 16
+    boundary_negative_radius_frames = 24
 
 
 class FamilyVocabularyV2:
@@ -81,10 +85,14 @@ class AudioFrameExtractorV2:
         end_frame: int,
         frame_count: int,
         peak_warmup_frames: int,
+        phase_offset_samples: int = 0,
     ) -> np.ndarray:
         n_frames = self._frame_count(audio)
         if n_frames == 0 or frame_count <= 0:
             return np.zeros((0, self.config.bands), dtype=np.float32)
+        phase_offset_samples = int(
+            np.clip(phase_offset_samples, 0, max(0, self.config.hop - 1))
+        )
         end_frame = min(max(0, int(end_frame)), n_frames - 1)
         output_start = max(0, end_frame - frame_count + 1)
         normalize_start = max(0, output_start - max(0, peak_warmup_frames))
@@ -92,6 +100,7 @@ class AudioFrameExtractorV2:
             audio,
             normalize_start,
             end_frame - normalize_start + 1,
+            phase_offset_samples=phase_offset_samples,
         )
         normalized = self._normalize_bands(raw_bands)
         return normalized[output_start - normalize_start :]
@@ -101,16 +110,20 @@ class AudioFrameExtractorV2:
         audio: np.ndarray,
         start_frame: int,
         frame_count: int,
+        phase_offset_samples: int = 0,
     ) -> np.ndarray:
         n_frames = self._frame_count(audio)
-        target_samples = n_frames * self.config.hop
+        phase_offset_samples = int(
+            np.clip(phase_offset_samples, 0, max(0, self.config.hop - 1))
+        )
+        target_samples = n_frames * self.config.hop + phase_offset_samples
         tail = target_samples - len(audio)
         padded = np.pad(
             audio.astype(np.float32, copy=False),
-            (self.config.win - self.config.hop, tail),
+            (self.config.win - self.config.hop, max(0, tail)),
         )
-        window_start = start_frame * self.config.hop
-        window_stop = (start_frame + frame_count) * self.config.hop
+        window_start = start_frame * self.config.hop + phase_offset_samples
+        window_stop = (start_frame + frame_count) * self.config.hop + phase_offset_samples
         windows = np.lib.stride_tricks.sliding_window_view(padded, self.config.win)[
             window_start:window_stop:self.config.hop
         ]
@@ -118,11 +131,14 @@ class AudioFrameExtractorV2:
         return (mag @ self._fold.T).astype(np.float32)
 
     def _normalize_bands(self, raw_bands: np.ndarray) -> np.ndarray:
-        frames = np.zeros_like(raw_bands, dtype=np.float32)
-        peak = np.full(self.config.bands, 1e-6, dtype=np.float32)
-        for frame_idx, bands in enumerate(raw_bands):
-            peak = np.maximum(bands, peak * 0.9996)
-            frames[frame_idx] = np.clip(bands / np.maximum(peak, 1e-6), 0.0, 1.0)
+        log_bands = np.log1p(raw_bands * self.config.log_feature_scale).astype(
+            np.float32
+        )
+        frames = np.zeros_like(log_bands, dtype=np.float32)
+        peak = 1e-6
+        for frame_idx, bands in enumerate(log_bands):
+            peak = max(float(np.max(bands)), peak * 0.9996)
+            frames[frame_idx] = np.clip(bands / max(peak, 1e-6), 0.0, 1.0)
         return frames
 
     def _frame_count(self, audio: np.ndarray) -> int:
@@ -181,6 +197,14 @@ class NsynthNoteStoreV2:
             raise ValueError(f"No NSynth notes cached for split {split!r}")
         return instruments[int(rng.integers(len(instruments)))]
 
+    def sample_family(self, split: SplitName, rng: np.random.Generator) -> str:
+        families = sorted(
+            family for family, notes in self._by_split_family[split].items() if notes
+        )
+        if not families:
+            raise ValueError(f"No NSynth families cached for split {split!r}")
+        return families[int(rng.integers(len(families)))]
+
     def nearest_pitch(self, notes: list[NsynthNoteV2], pitch: int) -> NsynthNoteV2:
         return min(notes, key=lambda note: (abs(note.pitch - pitch), abs(note.velocity - 96)))
 
@@ -199,8 +223,17 @@ class NsynthNoteStoreV2:
             self._decoded.popitem(last=False)
         return audio.copy()
 
-    def random_note(self, split: SplitName, rng: np.random.Generator) -> NsynthNoteV2:
-        notes = self.index.notes(split)
+    def random_note(
+        self,
+        split: SplitName,
+        rng: np.random.Generator,
+        family: str | None = None,
+    ) -> NsynthNoteV2:
+        notes = (
+            self._by_split_family[split].get(family, [])
+            if family is not None
+            else self.index.notes(split)
+        )
         if not notes:
             raise ValueError(f"No NSynth notes cached for split {split!r}")
         return notes[int(rng.integers(len(notes)))]
@@ -287,9 +320,10 @@ class SourceTrackingRendererV2:
         seed: int,
         frame_count: int,
         peak_warmup_frames: int,
+        phase_offset_samples: int = 0,
     ) -> dict[str, np.ndarray]:
         audio, events = self._render_audio_events(stage, split, seed)
-        frame_idx = self._sample_active_frame_from_events(events, len(audio))
+        frame_idx = self._sample_training_frame_from_events(events, len(audio), seed)
         target = self._label_at_frame(events, len(audio), frame_idx)
         return {
             "frames": self.extractor.extract_context(
@@ -297,7 +331,9 @@ class SourceTrackingRendererV2:
                 end_frame=frame_idx,
                 frame_count=frame_count,
                 peak_warmup_frames=peak_warmup_frames,
+                phase_offset_samples=phase_offset_samples,
             ),
+            "frame_idx": np.asarray(frame_idx, dtype=np.int64),
             **target,
         }
 
@@ -310,7 +346,7 @@ class SourceTrackingRendererV2:
         peak_warmup_frames: int,
     ) -> dict[str, np.ndarray]:
         audio, events = self._render_audio_events(stage, split, seed)
-        frame_idx = self._sample_active_frame_from_events(events, len(audio))
+        frame_idx = self._sample_training_frame_from_events(events, len(audio), seed)
         target = self._label_at_frame(events, len(audio), frame_idx)
         return {
             "audio_context": self._audio_context_for_frame(
@@ -319,6 +355,7 @@ class SourceTrackingRendererV2:
                 frame_count=frame_count,
                 peak_warmup_frames=peak_warmup_frames,
             ),
+            "frame_idx": np.asarray(frame_idx, dtype=np.int64),
             **target,
         }
 
@@ -348,10 +385,47 @@ class SourceTrackingRendererV2:
             self._render_hard_case(split, rng, audio, events)
         else:
             raise ValueError(f"Unknown curriculum stage {stage!r}")
+        audio = self._augment_mixture(audio, rng)
         peak = float(np.max(np.abs(audio)))
         if peak > 1e-6:
             audio = (audio / peak * 0.8).astype(np.float32)
         return audio, events
+
+    def _augment_mixture(
+        self, audio: np.ndarray, rng: np.random.Generator
+    ) -> np.ndarray:
+        augmented = audio.astype(np.float32, copy=True)
+        if rng.random() < 0.8:
+            augmented = self._apply_spectral_tilt(augmented, rng)
+        if rng.random() < 0.5:
+            augmented = self._apply_short_reverb(augmented, rng)
+        peak = float(np.max(np.abs(augmented)))
+        if peak > 1e-6 and rng.random() < 0.7:
+            noise_db = float(rng.uniform(-42.0, -26.0))
+            noise_scale = peak * (10.0 ** (noise_db / 20.0))
+            augmented = augmented + rng.normal(
+                0.0, noise_scale, size=augmented.shape
+            ).astype(np.float32)
+        return augmented.astype(np.float32)
+
+    @staticmethod
+    def _apply_spectral_tilt(
+        audio: np.ndarray, rng: np.random.Generator
+    ) -> np.ndarray:
+        emphasis = float(rng.uniform(-0.35, 0.35))
+        shifted = np.concatenate((audio[:1], audio[:-1]))
+        tilted = audio + emphasis * (audio - shifted)
+        return np.clip(tilted, -2.0, 2.0).astype(np.float32)
+
+    def _apply_short_reverb(
+        self, audio: np.ndarray, rng: np.random.Generator
+    ) -> np.ndarray:
+        delay = int(rng.integers(self.config.sample_rate // 80, self.config.sample_rate // 16))
+        decay = float(rng.uniform(0.08, 0.28))
+        wet = audio.astype(np.float32, copy=True)
+        if delay < len(wet):
+            wet[delay:] += audio[:-delay] * decay
+        return wet.astype(np.float32)
 
     def _render_single_note(
         self,
@@ -360,7 +434,8 @@ class SourceTrackingRendererV2:
         audio: np.ndarray,
         events: list[SourceEventLabelV2],
     ) -> None:
-        note = self.note_store.random_note(split, rng)
+        family = self.note_store.sample_family(split, rng)
+        note = self.note_store.random_note(split, rng, family=family)
         start_s = float(rng.uniform(0.25, 1.25))
         self._mix_note(audio, note, 0, start_s, events)
 
@@ -372,8 +447,14 @@ class SourceTrackingRendererV2:
         events: list[SourceEventLabelV2],
         source_count: int,
     ) -> None:
+        family_order = [
+            self.note_store.sample_family(split, rng)
+            for _ in range(min(source_count, self.config.max_sources))
+        ]
         for source_id in range(min(source_count, self.config.max_sources)):
-            notes = self.note_store.sample_instrument_notes(split, rng)
+            notes = self.note_store.sample_instrument_notes(
+                split, rng, family=family_order[source_id]
+            )
             offset = float(source_id) * 0.17
             period = float(rng.uniform(0.45, 0.95))
             t = 0.5 + offset
@@ -476,6 +557,10 @@ class SourceTrackingRendererV2:
         active = np.zeros(shape, dtype=np.float32)
         onset = np.zeros(shape, dtype=np.float32)
         offset = np.zeros(shape, dtype=np.float32)
+        onset_delta = np.zeros(shape, dtype=np.float32)
+        offset_delta = np.zeros(shape, dtype=np.float32)
+        onset_timing_mask = np.zeros(shape, dtype=np.float32)
+        offset_timing_mask = np.zeros(shape, dtype=np.float32)
         family = np.full(shape, -1, dtype=np.int32)
         source_id = np.full(shape, -1, dtype=np.int32)
         frame_times = np.arange(n_frames, dtype=np.float32) * (
@@ -490,12 +575,31 @@ class SourceTrackingRendererV2:
             active[start:end, event.source_id] = 1.0
             family[start:end, event.source_id] = event.family_index
             source_id[start:end, event.source_id] = event.source_id
-            onset[start, event.source_id] = 1.0
-            offset[end - 1, event.source_id] = 1.0
+            onset_start = max(0, start - self.config.onset_label_radius_frames)
+            onset_end = min(n_frames, start + self.config.onset_label_radius_frames + 1)
+            offset_center = end - 1
+            offset_start = max(0, offset_center - self.config.offset_label_radius_frames)
+            offset_end = min(
+                n_frames, offset_center + self.config.offset_label_radius_frames + 1
+            )
+            onset[onset_start:onset_end, event.source_id] = 1.0
+            offset[offset_start:offset_end, event.source_id] = 1.0
+            onset_frames = np.arange(onset_start, onset_end, dtype=np.float32)
+            onset_delta[onset_start:onset_end, event.source_id] = onset_frames - start
+            onset_timing_mask[onset_start:onset_end, event.source_id] = 1.0
+            offset_frames = np.arange(offset_start, offset_end, dtype=np.float32)
+            offset_delta[offset_start:offset_end, event.source_id] = (
+                offset_frames - offset_center
+            )
+            offset_timing_mask[offset_start:offset_end, event.source_id] = 1.0
         return SourceLabelFramesV2(
             active=active,
             onset=onset,
             offset=offset,
+            onset_delta=onset_delta,
+            offset_delta=offset_delta,
+            onset_timing_mask=onset_timing_mask,
+            offset_timing_mask=offset_timing_mask,
             family=family,
             source_id=source_id,
             frame_times=frame_times,
@@ -519,6 +623,41 @@ class SourceTrackingRendererV2:
             return n_frames - 1
         return int(active_frames[len(active_frames) // 2])
 
+    def _sample_training_frame_from_events(
+        self,
+        events: list[SourceEventLabelV2],
+        n_samples: int,
+        seed: int,
+    ) -> int:
+        n_frames = int(np.ceil(n_samples / self.config.hop))
+        spans = [
+            self._event_frame_span(event, n_frames)
+            for event in events
+            if event.source_id < self.config.max_sources
+        ]
+        spans = [(start, end) for start, end in spans if end > start]
+        if not spans:
+            return n_frames - 1
+        rng = np.random.default_rng(seed + 9_973)
+        start, end = spans[int(rng.integers(len(spans)))]
+        probe = float(rng.random())
+        negative_radius = self.config.boundary_negative_radius_frames
+        if probe < 0.15:
+            lo = max(0, start - negative_radius)
+            hi = max(lo + 1, start - self.config.onset_label_radius_frames)
+            return int(rng.integers(lo, hi))
+        if probe < 0.35:
+            return int(start)
+        if probe < 0.65:
+            return int(rng.integers(start, end))
+        if probe < 0.85:
+            return int(end - 1)
+        lo = min(n_frames - 1, end + self.config.offset_label_radius_frames + 1)
+        hi = min(n_frames, end + negative_radius)
+        if hi <= lo:
+            return int(end - 1)
+        return int(rng.integers(lo, hi))
+
     def _label_at_frame(
         self,
         events: list[SourceEventLabelV2],
@@ -529,6 +668,10 @@ class SourceTrackingRendererV2:
         activity = np.zeros(self.config.max_sources, dtype=np.float32)
         onset = np.zeros(self.config.max_sources, dtype=np.float32)
         offset = np.zeros(self.config.max_sources, dtype=np.float32)
+        onset_delta = np.zeros(self.config.max_sources, dtype=np.float32)
+        offset_delta = np.zeros(self.config.max_sources, dtype=np.float32)
+        onset_timing_mask = np.zeros(self.config.max_sources, dtype=np.float32)
+        offset_timing_mask = np.zeros(self.config.max_sources, dtype=np.float32)
         family = np.full(self.config.max_sources, -1, dtype=np.int32)
         for event in events:
             if event.source_id >= self.config.max_sources:
@@ -537,15 +680,24 @@ class SourceTrackingRendererV2:
             if start <= frame_idx < end:
                 activity[event.source_id] = 1.0
                 family[event.source_id] = event.family_index
-            if frame_idx == start:
+            if abs(frame_idx - start) <= self.config.onset_label_radius_frames:
                 onset[event.source_id] = 1.0
-            if frame_idx == end - 1:
+                onset_delta[event.source_id] = float(frame_idx - start)
+                onset_timing_mask[event.source_id] = 1.0
+            offset_center = end - 1
+            if abs(frame_idx - offset_center) <= self.config.offset_label_radius_frames:
                 offset[event.source_id] = 1.0
+                offset_delta[event.source_id] = float(frame_idx - offset_center)
+                offset_timing_mask[event.source_id] = 1.0
         return {
             "activity": activity,
             "family": family,
             "onset": onset,
             "offset": offset,
+            "onset_delta": onset_delta,
+            "offset_delta": offset_delta,
+            "onset_timing_mask": onset_timing_mask,
+            "offset_timing_mask": offset_timing_mask,
         }
 
     def _event_frame_span(

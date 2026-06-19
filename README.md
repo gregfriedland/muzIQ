@@ -34,7 +34,7 @@ They do not store the full NSynth corpus or rendered training examples.
 ## Train
 
 ```bash
-uv run python -m muziq_nn.training.train \
+scripts/train.sh \
   --curriculum all \
   --max-hours 8 \
   --generate-on-the-fly
@@ -47,10 +47,11 @@ For preemptible GPU pods, enable checkpoint upload so numbered model artifacts
 are copied during training:
 
 ```bash
-uv run python -m muziq_nn.training.train \
+scripts/train.sh --require-g4 \
   --curriculum all \
   --max-hours 8 \
   --generate-on-the-fly \
+  --device cuda \
   --checkpoint-upload-uri gs://rezo-flyte/scratch/serializable/muziq-nn \
   --checkpoint-upload-run-id "$(date -u +%Y%m%d)-example" \
   --checkpoint-interval-batches 100
@@ -64,17 +65,24 @@ phase, stage, epoch, batch, loss, and timestamp, plus a `latest.json` pointer.
 ## Web Source Grid
 
 The web app visualizes realtime source-slot predictions from a trained
-checkpoint. It can embed a Spotify track for playback context, but inference
-runs on uploaded audio files or browser-captured tab/system audio. The app does
-not download or decode Spotify streams directly.
+checkpoint. The preview is intentionally limited to the Mac `BlackHole 2ch`
+system-output capture path so the browser is only a display surface.
 
 ```bash
 uv sync --extra dev --extra web
-export MUZIQ_NN_CHECKPOINT=/Users/gregfriedland/src/external/muziq/runs/k8s_downloads/20260614-g4spot-889993c-50ep-oomfix-scratch2/checkpoint.pt
-uv run muziq-web --host 127.0.0.1 --port 8765
+scripts/web-detached.sh
 ```
 
-Open `http://127.0.0.1:8765`, load a Spotify track URL if desired, then choose
-either an audio file or browser audio capture. The backend expects 16 kHz
-float32 mono chunks over `/ws/infer` and returns source activity, family,
-onset/offset, confidence, and stable visual position for each source slot.
+The script writes `runs/web/preview-8765.pid` and
+`runs/web/preview-8765.log`. Pass a checkpoint path as the first argument, or
+set `MUZIQ_NN_CHECKPOINT`; otherwise it uses the newest
+`runs/k8s_downloads/*/checkpoint.pt`.
+
+Open `http://127.0.0.1:8765` and click `Start BlackHole`. To analyze Mac
+speaker output, install `BlackHole 2ch`, create a macOS Multi-Output Device
+that includes both your speakers/headphones and `BlackHole 2ch`, then set that
+Multi-Output Device as the system output.
+The backend captures `BlackHole 2ch` through FFmpeg/AVFoundation, downmixes it
+to the 16 kHz mono input expected by the model, and streams source activity,
+family, onset/offset, confidence, input level, processing latency, and visual
+position back to the grid.
