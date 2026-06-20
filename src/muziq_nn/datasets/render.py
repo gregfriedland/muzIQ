@@ -325,6 +325,7 @@ class SourceTrackingRendererV2:
         audio, events = self._render_audio_events(stage, split, seed)
         frame_idx = self._sample_training_frame_from_events(events, len(audio), seed)
         target = self._label_at_frame(events, len(audio), frame_idx)
+        context = self._label_context_for_frame(events, len(audio), frame_idx, frame_count)
         return {
             "frames": self.extractor.extract_context(
                 audio,
@@ -334,6 +335,7 @@ class SourceTrackingRendererV2:
                 phase_offset_samples=phase_offset_samples,
             ),
             "frame_idx": np.asarray(frame_idx, dtype=np.int64),
+            **context,
             **target,
         }
 
@@ -344,18 +346,22 @@ class SourceTrackingRendererV2:
         seed: int,
         frame_count: int,
         peak_warmup_frames: int,
+        phase_offset_samples: int = 0,
     ) -> dict[str, np.ndarray]:
         audio, events = self._render_audio_events(stage, split, seed)
         frame_idx = self._sample_training_frame_from_events(events, len(audio), seed)
         target = self._label_at_frame(events, len(audio), frame_idx)
+        context = self._label_context_for_frame(events, len(audio), frame_idx, frame_count)
         return {
             "audio_context": self._audio_context_for_frame(
                 audio,
                 end_frame=frame_idx,
                 frame_count=frame_count,
                 peak_warmup_frames=peak_warmup_frames,
+                phase_offset_samples=phase_offset_samples,
             ),
             "frame_idx": np.asarray(frame_idx, dtype=np.int64),
+            **context,
             **target,
         }
 
@@ -700,6 +706,81 @@ class SourceTrackingRendererV2:
             "offset_timing_mask": offset_timing_mask,
         }
 
+    def _label_context_for_frame(
+        self,
+        events: list[SourceEventLabelV2],
+        n_samples: int,
+        frame_idx: int,
+        frame_count: int,
+    ) -> dict[str, np.ndarray]:
+        labels = self._labels_from_events(events, n_samples)
+        start = max(0, frame_idx - frame_count + 1)
+        stop = frame_idx + 1
+        pad = frame_count - (stop - start)
+        shape = (frame_count, self.config.max_sources)
+
+        def window(array: np.ndarray, fill: float = 0.0) -> np.ndarray:
+            out = np.full(shape, fill, dtype=array.dtype)
+            out[pad:] = array[start:stop]
+            return out
+
+        active = window(labels.active)
+        onset = window(labels.onset)
+        offset = window(labels.offset)
+        onset_delta = window(labels.onset_delta)
+        offset_delta = window(labels.offset_delta)
+        onset_timing_mask = window(labels.onset_timing_mask)
+        offset_timing_mask = window(labels.offset_timing_mask)
+        family = window(labels.family, fill=-1)
+        event_state = self._event_state_context(active, onset, offset)
+        return {
+            "context_activity": active,
+            "context_family": family,
+            "context_onset": onset,
+            "context_offset": offset,
+            "context_onset_delta": onset_delta,
+            "context_offset_delta": offset_delta,
+            "context_onset_timing_mask": onset_timing_mask,
+            "context_offset_timing_mask": offset_timing_mask,
+            "event_state": event_state,
+        }
+
+    @staticmethod
+    def _event_state_context(
+        active: np.ndarray,
+        onset: np.ndarray,
+        offset: np.ndarray,
+    ) -> np.ndarray:
+        frame_count, source_count = active.shape
+        state = np.zeros((frame_count, source_count, 5), dtype=np.float32)
+        previous_onset = np.vstack(
+            [np.zeros((1, source_count), dtype=np.float32), onset[:-1]]
+        )
+        previous_offset = np.vstack(
+            [np.zeros((1, source_count), dtype=np.float32), offset[:-1]]
+        )
+        previous_active = np.vstack(
+            [np.zeros((1, source_count), dtype=np.float32), active[:-1]]
+        )
+        state[..., 0] = previous_onset
+        state[..., 1] = previous_offset
+        state[..., 2] = previous_active
+        for source_idx in range(source_count):
+            since_onset = frame_count
+            since_offset = frame_count
+            for frame_idx in range(frame_count):
+                if previous_onset[frame_idx, source_idx] > 0.5:
+                    since_onset = 0
+                else:
+                    since_onset += 1
+                if previous_offset[frame_idx, source_idx] > 0.5:
+                    since_offset = 0
+                else:
+                    since_offset += 1
+                state[frame_idx, source_idx, 3] = min(since_onset, frame_count) / frame_count
+                state[frame_idx, source_idx, 4] = min(since_offset, frame_count) / frame_count
+        return state
+
     def _event_frame_span(
         self,
         event: SourceEventLabelV2,
@@ -720,10 +801,14 @@ class SourceTrackingRendererV2:
         end_frame: int,
         frame_count: int,
         peak_warmup_frames: int,
+        phase_offset_samples: int = 0,
     ) -> np.ndarray:
+        phase_offset_samples = int(
+            np.clip(phase_offset_samples, 0, max(0, self.config.hop - 1))
+        )
         raw_frame_count = max(1, frame_count + max(0, peak_warmup_frames))
         segment_len = self.config.win + (raw_frame_count - 1) * self.config.hop
-        end_sample = (end_frame + 1) * self.config.hop
+        end_sample = (end_frame + 1) * self.config.hop + phase_offset_samples
         start_sample = end_sample - segment_len
         context = np.zeros(segment_len, dtype=np.float32)
         src_start = max(0, start_sample)

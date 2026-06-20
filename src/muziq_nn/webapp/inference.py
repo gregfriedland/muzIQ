@@ -19,6 +19,7 @@ from muziq_nn.datasets.render import (
 )
 from muziq_nn.models.attention import (
     DualPathTransformerSourceTrackerV2,
+    SourceTrackingEventStateBuilderV2,
     SourceTrackingModelConfigV2,
 )
 
@@ -97,12 +98,18 @@ class SourceTrackingCheckpointLoaderV2:
                 (self.has_count_head or not name.startswith("head.count."))
                 and not name.startswith("head.onset_delta.")
                 and not name.startswith("head.offset_delta.")
+                and not name.startswith("event_decoder.")
             )
         ]
-        if missing or result.unexpected_keys:
+        unexpected = [
+            name
+            for name in result.unexpected_keys
+            if not name.startswith("head.onset.") and not name.startswith("head.offset.")
+        ]
+        if missing or unexpected:
             raise RuntimeError(
                 "checkpoint state dict did not match model: "
-                f"missing={missing}, unexpected={result.unexpected_keys}"
+                f"missing={missing}, unexpected={unexpected}"
             )
         model.eval()
         return model
@@ -150,6 +157,27 @@ class SourceTrackingCheckpointLoaderV2:
             if len(parts) > 2 and parts[2].isdigit():
                 layer_ids.add(int(parts[2]))
         return max(layer_ids) + 1 if layer_ids else 2
+
+    def predict_sequence(
+        self,
+        frames: torch.Tensor,
+        *,
+        onset_threshold: float = 0.5,
+        offset_threshold: float = 0.5,
+    ) -> dict[str, torch.Tensor]:
+        first = self.model(frames)
+        onset = first.get("onset_logits_sequence")
+        offset = first.get("offset_logits_sequence")
+        if onset is None or offset is None:
+            return first
+        event_state = SourceTrackingEventStateBuilderV2.from_logits(
+            onset,
+            offset,
+            onset_threshold=onset_threshold,
+            offset_threshold=offset_threshold,
+            event_state_dim=self.config.event_state_dim,
+        )
+        return self.model(frames, event_state=event_state)
 
 
 class RealtimeSourceTrackerV2:
@@ -208,7 +236,7 @@ class RealtimeSourceTrackerV2:
     def _predict_frames(self, frames: np.ndarray) -> SourceTrackingInferenceResultV2:
         tensor = torch.from_numpy(frames).unsqueeze(0).float().to(self.loaded.device)
         with torch.inference_mode():
-            outputs = self.loaded.model(tensor)
+            outputs = self.loaded.predict_sequence(tensor)
         activity = torch.sigmoid(outputs["activity_logits"])[0].detach().cpu().numpy()
         family_probs = torch.softmax(outputs["family_logits"], dim=-1)[0].detach().cpu()
         onset = torch.sigmoid(outputs["onset_logits"])[0].detach().cpu().numpy()

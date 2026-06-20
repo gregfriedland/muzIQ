@@ -34,6 +34,7 @@ from muziq_nn.datasets.render import (
 from muziq_nn.datasets.schema import SplitName
 from muziq_nn.models.attention import (
     DualPathTransformerSourceTrackerV2,
+    SourceTrackingEventStateBuilderV2,
     SourceTrackingLossV2,
     SourceTrackingModelConfigV2,
 )
@@ -180,16 +181,36 @@ class TrainingConfigV2:
     onset_pos_weight: float = 10.0
     offset_pos_weight: float = 10.0
     boundary_loss_weight: float = 0.5
+    onset_loss_weight: float | None = None
+    offset_loss_weight: float | None = None
+    onset_focal_gamma: float = 0.0
+    offset_focal_gamma: float = 0.0
     boundary_timing_loss_weight: float = 0.25
+    boundary_f1_loss_weight: float = 0.0
+    boundary_f1_fp_weight: float = 1.0
+    boundary_f1_fn_weight: float = 1.0
+    hard_boundary_negative_loss_weight: float = 0.0
+    hard_boundary_negative_fraction: float = 0.1
+    onset_peak_loss_weight: float = 0.25
+    onset_event_recall_loss_weight: float = 1.0
+    onset_false_peak_loss_weight: float = 0.5
+    onset_peak_radius_frames: int = 2
+    onset_false_peak_fraction: float = 0.02
     model_dim: int = 128
     model_heads: int = 4
     model_layers: int = 2
+    event_decoder_layers: int = 1
+    event_decoder_heads: int = 4
+    event_teacher_forcing_start: float = 0.9
+    event_teacher_forcing_end: float = 0.25
     identity_dim: int = 16
     frame_cache_examples_per_stage: int = 0
     frame_cache_build_batch_size: int = 512
     frame_cache_dtype: str = "float16"
     frame_cache_phase_jitter_samples: int = 0
     frame_phase_noise_std: float = 0.0
+    anneal_noise_phase_jitter_samples: int = 0
+    anneal_noise_feature_std: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -228,6 +249,15 @@ class TrainingBatchBuilderV2:
         offset_delta = []
         onset_timing_mask = []
         offset_timing_mask = []
+        context_activity = []
+        context_family = []
+        context_onset = []
+        context_offset = []
+        context_onset_delta = []
+        context_offset_delta = []
+        context_onset_timing_mask = []
+        context_offset_timing_mask = []
+        event_state = []
         for item in slices:
             activity.append(item["activity"])
             family.append(np.maximum(item["family"], 0))
@@ -237,6 +267,15 @@ class TrainingBatchBuilderV2:
             offset_delta.append(item["offset_delta"])
             onset_timing_mask.append(item["onset_timing_mask"])
             offset_timing_mask.append(item["offset_timing_mask"])
+            context_activity.append(item["context_activity"])
+            context_family.append(np.maximum(item["context_family"], 0))
+            context_onset.append(item["context_onset"])
+            context_offset.append(item["context_offset"])
+            context_onset_delta.append(item["context_onset_delta"])
+            context_offset_delta.append(item["context_offset_delta"])
+            context_onset_timing_mask.append(item["context_onset_timing_mask"])
+            context_offset_timing_mask.append(item["context_offset_timing_mask"])
+            event_state.append(item["event_state"])
         return {
             "frames": self._build_frame_tensor(slices),
             "activity": self._to_device(np.asarray(activity, dtype=np.float32)),
@@ -251,6 +290,25 @@ class TrainingBatchBuilderV2:
             "offset_timing_mask": self._to_device(
                 np.asarray(offset_timing_mask, dtype=np.float32)
             ),
+            "context_activity": self._to_device(
+                np.asarray(context_activity, dtype=np.float32)
+            ),
+            "context_family": self._to_device(np.asarray(context_family, dtype=np.int64)),
+            "context_onset": self._to_device(np.asarray(context_onset, dtype=np.float32)),
+            "context_offset": self._to_device(np.asarray(context_offset, dtype=np.float32)),
+            "context_onset_delta": self._to_device(
+                np.asarray(context_onset_delta, dtype=np.float32)
+            ),
+            "context_offset_delta": self._to_device(
+                np.asarray(context_offset_delta, dtype=np.float32)
+            ),
+            "context_onset_timing_mask": self._to_device(
+                np.asarray(context_onset_timing_mask, dtype=np.float32)
+            ),
+            "context_offset_timing_mask": self._to_device(
+                np.asarray(context_offset_timing_mask, dtype=np.float32)
+            ),
+            "event_state": self._to_device(np.asarray(event_state, dtype=np.float32)),
         }
 
     def _build_frame_tensor(self, slices) -> torch.Tensor:
@@ -369,6 +427,20 @@ class CachedFramePoolV2:
             (examples, SourceTrackingAudioConfigV2.max_sources),
             dtype=np.float32,
         )
+        context_shape = (
+            examples,
+            frame_count,
+            SourceTrackingAudioConfigV2.max_sources,
+        )
+        self.context_activity = np.empty(context_shape, dtype=np.float32)
+        self.context_family = np.empty(context_shape, dtype=np.int64)
+        self.context_onset = np.empty(context_shape, dtype=np.float32)
+        self.context_offset = np.empty(context_shape, dtype=np.float32)
+        self.context_onset_delta = np.empty(context_shape, dtype=np.float32)
+        self.context_offset_delta = np.empty(context_shape, dtype=np.float32)
+        self.context_onset_timing_mask = np.empty(context_shape, dtype=np.float32)
+        self.context_offset_timing_mask = np.empty(context_shape, dtype=np.float32)
+        self.event_state = np.empty((*context_shape, 5), dtype=np.float32)
 
     def write(self, start: int, batch: dict[str, torch.Tensor]) -> None:
         stop = start + int(batch["frames"].shape[0])
@@ -387,6 +459,25 @@ class CachedFramePoolV2:
         self.offset_timing_mask[start:stop] = (
             batch["offset_timing_mask"].detach().cpu().numpy()
         )
+        self.context_activity[start:stop] = (
+            batch["context_activity"].detach().cpu().numpy()
+        )
+        self.context_family[start:stop] = batch["context_family"].detach().cpu().numpy()
+        self.context_onset[start:stop] = batch["context_onset"].detach().cpu().numpy()
+        self.context_offset[start:stop] = batch["context_offset"].detach().cpu().numpy()
+        self.context_onset_delta[start:stop] = (
+            batch["context_onset_delta"].detach().cpu().numpy()
+        )
+        self.context_offset_delta[start:stop] = (
+            batch["context_offset_delta"].detach().cpu().numpy()
+        )
+        self.context_onset_timing_mask[start:stop] = (
+            batch["context_onset_timing_mask"].detach().cpu().numpy()
+        )
+        self.context_offset_timing_mask[start:stop] = (
+            batch["context_offset_timing_mask"].detach().cpu().numpy()
+        )
+        self.event_state[start:stop] = batch["event_state"].detach().cpu().numpy()
 
     def write_slices(
         self,
@@ -429,6 +520,34 @@ class CachedFramePoolV2:
         self.offset_timing_mask[start:stop] = np.asarray(
             [item["offset_timing_mask"] for item in slices], dtype=np.float32
         )
+        self.context_activity[start:stop] = np.asarray(
+            [item["context_activity"] for item in slices], dtype=np.float32
+        )
+        self.context_family[start:stop] = np.asarray(
+            [np.maximum(item["context_family"], 0) for item in slices],
+            dtype=np.int64,
+        )
+        self.context_onset[start:stop] = np.asarray(
+            [item["context_onset"] for item in slices], dtype=np.float32
+        )
+        self.context_offset[start:stop] = np.asarray(
+            [item["context_offset"] for item in slices], dtype=np.float32
+        )
+        self.context_onset_delta[start:stop] = np.asarray(
+            [item["context_onset_delta"] for item in slices], dtype=np.float32
+        )
+        self.context_offset_delta[start:stop] = np.asarray(
+            [item["context_offset_delta"] for item in slices], dtype=np.float32
+        )
+        self.context_onset_timing_mask[start:stop] = np.asarray(
+            [item["context_onset_timing_mask"] for item in slices], dtype=np.float32
+        )
+        self.context_offset_timing_mask[start:stop] = np.asarray(
+            [item["context_offset_timing_mask"] for item in slices], dtype=np.float32
+        )
+        self.event_state[start:stop] = np.asarray(
+            [item["event_state"] for item in slices], dtype=np.float32
+        )
 
     def batch(
         self,
@@ -464,6 +583,33 @@ class CachedFramePoolV2:
             ).float(),
             "offset_timing_mask": self._to_device(
                 self.offset_timing_mask[indices], device, pin_memory
+            ).float(),
+            "context_activity": self._to_device(
+                self.context_activity[indices], device, pin_memory
+            ).float(),
+            "context_family": self._to_device(
+                self.context_family[indices], device, pin_memory
+            ).long(),
+            "context_onset": self._to_device(
+                self.context_onset[indices], device, pin_memory
+            ).float(),
+            "context_offset": self._to_device(
+                self.context_offset[indices], device, pin_memory
+            ).float(),
+            "context_onset_delta": self._to_device(
+                self.context_onset_delta[indices], device, pin_memory
+            ).float(),
+            "context_offset_delta": self._to_device(
+                self.context_offset_delta[indices], device, pin_memory
+            ).float(),
+            "context_onset_timing_mask": self._to_device(
+                self.context_onset_timing_mask[indices], device, pin_memory
+            ).float(),
+            "context_offset_timing_mask": self._to_device(
+                self.context_offset_timing_mask[indices], device, pin_memory
+            ).float(),
+            "event_state": self._to_device(
+                self.event_state[indices], device, pin_memory
             ).float(),
         }
 
@@ -531,6 +677,7 @@ class TrainingRenderWorkerV2:
                 seed,
                 frame_count=frame_count,
                 peak_warmup_frames=peak_warmup_frames,
+                phase_offset_samples=phase_offset_samples,
             )
         return renderer.render_training_slice(
             stage,
@@ -711,6 +858,9 @@ class CheckpointUploadWorkerV2:
                     uploaded[relative_path] = self.uploader.upload(
                         local_path, relative_path
                     )
+                for local_path, _ in task.files:
+                    if local_path.name != "latest.json":
+                        local_path.unlink(missing_ok=True)
                 self.progress.emit(
                     "checkpoint_uploaded",
                     {
@@ -737,10 +887,17 @@ class CheckpointUploadWorkerV2:
 class SourceTrackingTrainerV2:
     """Train the compact attention model from generated examples."""
 
-    FRAME_CACHE_STAGE_TO_BASE = {
-        "single_note_frames_cached": "single_note_all",
-        "single_instrument_melody_frames_cached": "single_instrument_melody",
-    }
+    FRAME_CACHE_STAGE_TO_BASE: dict[str, str] = {}
+    ANNEALED_NOISE_STAGES = {"single_note_all", "single_instrument_melody"}
+    BOUNDARY_COUNT_METRIC_SUFFIXES = (
+        "_true_positive_count",
+        "_false_positive_count",
+        "_false_negative_count",
+        "_true_negative_count",
+        "_target_positive_count",
+        "_target_negative_count",
+        "_predicted_positive_count",
+    )
 
     def __init__(self, config: TrainingConfigV2):
         self.config = config
@@ -755,6 +912,8 @@ class SourceTrackingTrainerV2:
             model_dim=config.model_dim,
             heads=config.model_heads,
             layers=config.model_layers,
+            event_decoder_layers=config.event_decoder_layers,
+            event_decoder_heads=config.event_decoder_heads,
             identity_dim=config.identity_dim,
         )
         self.model = DualPathTransformerSourceTrackerV2(self.model_config).to(self.device)
@@ -768,7 +927,23 @@ class SourceTrackingTrainerV2:
             onset_pos_weight=config.onset_pos_weight,
             offset_pos_weight=config.offset_pos_weight,
             boundary_loss_weight=config.boundary_loss_weight,
+            onset_loss_weight=config.onset_loss_weight,
+            offset_loss_weight=config.offset_loss_weight,
+            onset_focal_gamma=config.onset_focal_gamma,
+            offset_focal_gamma=config.offset_focal_gamma,
             boundary_timing_loss_weight=config.boundary_timing_loss_weight,
+            boundary_f1_loss_weight=config.boundary_f1_loss_weight,
+            boundary_f1_fp_weight=config.boundary_f1_fp_weight,
+            boundary_f1_fn_weight=config.boundary_f1_fn_weight,
+            hard_boundary_negative_loss_weight=(
+                config.hard_boundary_negative_loss_weight
+            ),
+            hard_boundary_negative_fraction=config.hard_boundary_negative_fraction,
+            onset_peak_loss_weight=config.onset_peak_loss_weight,
+            onset_event_recall_loss_weight=config.onset_event_recall_loss_weight,
+            onset_false_peak_loss_weight=config.onset_false_peak_loss_weight,
+            onset_peak_radius_frames=config.onset_peak_radius_frames,
+            onset_false_peak_fraction=config.onset_false_peak_fraction,
         )
         self.batch_builder = TrainingBatchBuilderV2(
             self.device,
@@ -819,6 +994,12 @@ class SourceTrackingTrainerV2:
                     self.config.frame_cache_phase_jitter_samples
                 ),
                 "frame_phase_noise_std": self.config.frame_phase_noise_std,
+                "anneal_noise_phase_jitter_samples": (
+                    self.config.anneal_noise_phase_jitter_samples
+                ),
+                "anneal_noise_feature_std": self.config.anneal_noise_feature_std,
+                "event_teacher_forcing_start": self.config.event_teacher_forcing_start,
+                "event_teacher_forcing_end": self.config.event_teacher_forcing_end,
                 "metric_activity_threshold": self.config.metric_activity_threshold,
                 "loss_weights": {
                     "activity_pos_weight": self.config.activity_pos_weight,
@@ -828,9 +1009,31 @@ class SourceTrackingTrainerV2:
                     "onset_pos_weight": self.config.onset_pos_weight,
                     "offset_pos_weight": self.config.offset_pos_weight,
                     "boundary_loss_weight": self.config.boundary_loss_weight,
+                    "onset_loss_weight": self.config.onset_loss_weight,
+                    "offset_loss_weight": self.config.offset_loss_weight,
+                    "onset_focal_gamma": self.config.onset_focal_gamma,
+                    "offset_focal_gamma": self.config.offset_focal_gamma,
                     "boundary_timing_loss_weight": (
                         self.config.boundary_timing_loss_weight
                     ),
+                    "boundary_f1_loss_weight": self.config.boundary_f1_loss_weight,
+                    "boundary_f1_fp_weight": self.config.boundary_f1_fp_weight,
+                    "boundary_f1_fn_weight": self.config.boundary_f1_fn_weight,
+                    "hard_boundary_negative_loss_weight": (
+                        self.config.hard_boundary_negative_loss_weight
+                    ),
+                    "hard_boundary_negative_fraction": (
+                        self.config.hard_boundary_negative_fraction
+                    ),
+                    "onset_peak_loss_weight": self.config.onset_peak_loss_weight,
+                    "onset_event_recall_loss_weight": (
+                        self.config.onset_event_recall_loss_weight
+                    ),
+                    "onset_false_peak_loss_weight": (
+                        self.config.onset_false_peak_loss_weight
+                    ),
+                    "onset_peak_radius_frames": self.config.onset_peak_radius_frames,
+                    "onset_false_peak_fraction": self.config.onset_false_peak_fraction,
                 },
                 "model_config": asdict(self.model_config),
                 "warm_start_load_report": self.warm_start_load_report,
@@ -1126,6 +1329,7 @@ class SourceTrackingTrainerV2:
                     else self._iter_training_batches(
                         stage.name,
                         epoch,
+                        stage.epochs,
                         batch_start,
                         batches_per_epoch,
                     )
@@ -1133,7 +1337,14 @@ class SourceTrackingTrainerV2:
                 for batch_idx, batch, batch_timing in batch_iter:
                     compute_start = time.perf_counter()
                     with self._autocast_context():
-                        outputs = self.model(batch["frames"])
+                        teacher_forcing_rate = self._event_teacher_forcing_rate(
+                            epoch,
+                            stage.epochs,
+                        )
+                        outputs = self._model_forward(
+                            batch,
+                            teacher_forcing_rate=teacher_forcing_rate,
+                        )
                         loss = self.loss_fn(outputs, batch)
                     batch_metrics.append(self._batch_metrics(outputs, batch))
                     optimizer.zero_grad(set_to_none=True)
@@ -1151,6 +1362,10 @@ class SourceTrackingTrainerV2:
                             "batches_per_epoch": batches_per_epoch,
                             "last_loss": round(loss_value, 6),
                             "mean_loss": round(float(np.mean(losses)), 6),
+                            "event_teacher_forcing_rate": round(
+                                teacher_forcing_rate,
+                                6,
+                            ),
                         },
                     )
                     self.progress.emit(
@@ -1220,17 +1435,76 @@ class SourceTrackingTrainerV2:
             self._shutdown_render_executor()
             self._emit_memory_usage("memory_usage", stage=stage.name, phase="stage_done")
 
+    def _model_forward(
+        self,
+        batch: dict[str, torch.Tensor],
+        *,
+        teacher_forcing_rate: float,
+    ) -> dict[str, torch.Tensor]:
+        event_state = batch.get("event_state")
+        if event_state is None:
+            return self.model(batch["frames"])
+        if teacher_forcing_rate >= 0.999:
+            return self.model(batch["frames"], event_state=event_state)
+        with torch.no_grad():
+            first = self.model(batch["frames"], event_state=event_state)
+            sampled_state = self._scheduled_event_state(
+                event_state,
+                first,
+                teacher_forcing_rate,
+            )
+        return self.model(batch["frames"], event_state=sampled_state)
+
+    def _event_teacher_forcing_rate(self, epoch: int, epochs: int) -> float:
+        start = min(1.0, max(0.0, self.config.event_teacher_forcing_start))
+        end = min(1.0, max(0.0, self.config.event_teacher_forcing_end))
+        if epochs <= 1:
+            return end
+        progress = min(1.0, max(0.0, epoch / float(epochs - 1)))
+        return start + (end - start) * progress
+
+    @staticmethod
+    def _scheduled_event_state(
+        true_state: torch.Tensor,
+        outputs: dict[str, torch.Tensor],
+        teacher_forcing_rate: float,
+    ) -> torch.Tensor:
+        onset = outputs.get("onset_logits_sequence")
+        offset = outputs.get("offset_logits_sequence")
+        if onset is None or offset is None:
+            return true_state
+        predicted = SourceTrackingEventStateBuilderV2.from_logits(
+            onset,
+            offset,
+            event_state_dim=true_state.shape[-1],
+        )
+        keep_true = (
+            torch.rand(
+                true_state.shape[:-1],
+                device=true_state.device,
+                dtype=true_state.dtype,
+            )
+            < teacher_forcing_rate
+        ).unsqueeze(-1)
+        return torch.where(keep_true, true_state, predicted)
+
     def _iter_training_batches(
         self,
         stage_name: str,
         epoch: int,
+        stage_epochs: int,
         batch_start: int,
         batches_per_epoch: int,
     ):
         if self.config.prefetch_batches <= 0:
             for batch_idx in range(batch_start, batches_per_epoch):
                 start = time.perf_counter()
-                batch = self._build_training_batch(stage_name, epoch, batch_idx)
+                batch = self._build_training_batch(
+                    stage_name,
+                    epoch,
+                    stage_epochs,
+                    batch_idx,
+                )
                 yield batch_idx, batch, time.perf_counter() - start
             return
         batch_indices = iter(range(batch_start, batches_per_epoch))
@@ -1252,6 +1526,7 @@ class SourceTrackingTrainerV2:
                             self._build_training_batch,
                             stage_name,
                             epoch,
+                            stage_epochs,
                             next_batch_idx,
                         ),
                     )
@@ -1295,12 +1570,59 @@ class SourceTrackingTrainerV2:
         self,
         stage_name: str,
         epoch: int,
+        stage_epochs: int,
         batch_idx: int,
     ) -> dict[str, torch.Tensor]:
         seeds = self._batch_seeds(epoch, batch_idx)
-        return self.batch_builder.build_slices(
-            self._render_slices(stage_name, "train", seeds)
+        phase_jitter_samples = self._annealed_phase_jitter_samples(
+            stage_name,
+            epoch,
+            stage_epochs,
         )
+        batch = self.batch_builder.build_slices(
+            self._render_slices(
+                stage_name,
+                "train",
+                seeds,
+                phase_jitter_samples=phase_jitter_samples,
+            )
+        )
+        noise_std = self._annealed_feature_noise_std(stage_name, epoch, stage_epochs)
+        if noise_std > 0.0:
+            batch["frames"] = torch.clamp(
+                batch["frames"] + torch.randn_like(batch["frames"]) * noise_std,
+                0.0,
+                1.0,
+            )
+        return batch
+
+    def _annealed_phase_jitter_samples(
+        self,
+        stage_name: str,
+        epoch: int,
+        stage_epochs: int,
+    ) -> int:
+        if stage_name not in self.ANNEALED_NOISE_STAGES:
+            return 0
+        maximum = max(0, int(self.config.anneal_noise_phase_jitter_samples))
+        return int(round(maximum * self._stage_epoch_progress(epoch, stage_epochs)))
+
+    def _annealed_feature_noise_std(
+        self,
+        stage_name: str,
+        epoch: int,
+        stage_epochs: int,
+    ) -> float:
+        if stage_name not in self.ANNEALED_NOISE_STAGES:
+            return 0.0
+        maximum = max(0.0, float(self.config.anneal_noise_feature_std))
+        return maximum * self._stage_epoch_progress(epoch, stage_epochs)
+
+    @staticmethod
+    def _stage_epoch_progress(epoch: int, stage_epochs: int) -> float:
+        if stage_epochs <= 1:
+            return 1.0
+        return min(1.0, max(0.0, epoch / float(stage_epochs - 1)))
 
     def _build_frame_cache(self, stage: CurriculumStageV2) -> CachedFramePoolV2:
         base_stage = self._base_stage_for_training(stage.name)
@@ -1466,14 +1788,24 @@ class SourceTrackingTrainerV2:
                 batch.get("offset_timing_mask"),
                 "offset",
             )
+            onset_classification_metrics = self._boundary_classification_counts(
+                "onset",
+                onset_target,
+                onset_pred,
+            )
+            offset_classification_metrics = self._boundary_classification_counts(
+                "offset",
+                offset_target,
+                offset_pred,
+            )
             return {
                 "source_count_accuracy": float((true_count == pred_count).float().mean().cpu()),
                 "mean_predicted_active_count": float(pred_count.float().mean().cpu()),
                 "family_accuracy": float(family_ok.float().mean().cpu())
                 if family_ok.numel()
                 else 1.0,
-                "onset_recall": self._positive_recall(onset_target, onset_pred),
-                "offset_recall": self._positive_recall(offset_target, offset_pred),
+                **onset_classification_metrics,
+                **offset_classification_metrics,
                 **onset_delta_metrics,
                 **offset_delta_metrics,
             }
@@ -1506,21 +1838,93 @@ class SourceTrackingTrainerV2:
         }
 
     @staticmethod
-    def _positive_recall(target: torch.Tensor, predicted: torch.Tensor) -> float:
-        positives = target > 0.5
-        if not positives.any():
-            return float("nan")
-        return float(predicted[positives].float().mean().cpu())
+    def _boundary_classification_counts(
+        prefix: str,
+        target: torch.Tensor,
+        predicted: torch.Tensor,
+    ) -> dict[str, float]:
+        target_positive = target > 0.5
+        predicted_positive = predicted > 0.5
+        true_positive = target_positive & predicted_positive
+        false_positive = (~target_positive) & predicted_positive
+        false_negative = target_positive & (~predicted_positive)
+        true_negative = (~target_positive) & (~predicted_positive)
+        return {
+            f"{prefix}_true_positive_count": float(true_positive.sum().cpu()),
+            f"{prefix}_false_positive_count": float(false_positive.sum().cpu()),
+            f"{prefix}_false_negative_count": float(false_negative.sum().cpu()),
+            f"{prefix}_true_negative_count": float(true_negative.sum().cpu()),
+            f"{prefix}_target_positive_count": float(target_positive.sum().cpu()),
+            f"{prefix}_target_negative_count": float((~target_positive).sum().cpu()),
+            f"{prefix}_predicted_positive_count": float(predicted_positive.sum().cpu()),
+        }
 
     @staticmethod
     def _mean_batch_metrics(rows: list[dict[str, float]]) -> dict[str, float | None]:
         if not rows:
             return {}
         metrics: dict[str, float | None] = {}
+        count_keys = {
+            key
+            for row in rows
+            for key in row
+            if key.endswith(SourceTrackingTrainerV2.BOUNDARY_COUNT_METRIC_SUFFIXES)
+        }
         for key in rows[0]:
-            values = [row[key] for row in rows if not np.isnan(row[key])]
+            if key in count_keys:
+                metrics[key] = float(sum(row[key] for row in rows if key in row))
+                continue
+            values = [
+                row[key]
+                for row in rows
+                if key in row and row[key] is not None and not np.isnan(row[key])
+            ]
             metrics[key] = float(np.mean(values)) if values else None
+        for prefix in ("onset", "offset"):
+            SourceTrackingTrainerV2._add_boundary_classification_rates(metrics, prefix)
         return metrics
+
+    @staticmethod
+    def _add_boundary_classification_rates(
+        metrics: dict[str, float | None],
+        prefix: str,
+    ) -> None:
+        true_positive = metrics.get(f"{prefix}_true_positive_count")
+        false_positive = metrics.get(f"{prefix}_false_positive_count")
+        false_negative = metrics.get(f"{prefix}_false_negative_count")
+        true_negative = metrics.get(f"{prefix}_true_negative_count")
+        if (
+            true_positive is None
+            or false_positive is None
+            or false_negative is None
+            or true_negative is None
+        ):
+            return
+        precision_denominator = true_positive + false_positive
+        recall_denominator = true_positive + false_negative
+        false_positive_rate_denominator = false_positive + true_negative
+        precision = (
+            true_positive / precision_denominator
+            if precision_denominator > 0
+            else None
+        )
+        recall = (
+            true_positive / recall_denominator
+            if recall_denominator > 0
+            else None
+        )
+        if precision is not None and recall is not None and precision + recall > 0:
+            f1 = 2 * precision * recall / (precision + recall)
+        else:
+            f1 = None
+        metrics[f"{prefix}_precision"] = precision
+        metrics[f"{prefix}_recall"] = recall
+        metrics[f"{prefix}_f1"] = f1
+        metrics[f"{prefix}_false_positive_rate"] = (
+            false_positive / false_positive_rate_denominator
+            if false_positive_rate_denominator > 0
+            else None
+        )
 
     def _autocast_context(self):
         if self.config.mixed_precision and self.device.type == "cuda":
@@ -1776,6 +2180,7 @@ class SourceTrackingTrainerV2:
                 seed,
                 frame_count=self.config.training_slice_frames,
                 peak_warmup_frames=self.config.training_slice_peak_warmup_frames,
+                phase_offset_samples=phase_offset_samples,
             )
         return renderer.render_training_slice(
             stage,
@@ -2084,9 +2489,79 @@ class TrainingCliV2:
             default=TrainingConfigV2.boundary_loss_weight,
         )
         parser.add_argument(
+            "--onset-loss-weight",
+            type=float,
+            default=TrainingConfigV2.onset_loss_weight,
+        )
+        parser.add_argument(
+            "--offset-loss-weight",
+            type=float,
+            default=TrainingConfigV2.offset_loss_weight,
+        )
+        parser.add_argument(
+            "--onset-focal-gamma",
+            type=float,
+            default=TrainingConfigV2.onset_focal_gamma,
+        )
+        parser.add_argument(
+            "--offset-focal-gamma",
+            type=float,
+            default=TrainingConfigV2.offset_focal_gamma,
+        )
+        parser.add_argument(
             "--boundary-timing-loss-weight",
             type=float,
             default=TrainingConfigV2.boundary_timing_loss_weight,
+        )
+        parser.add_argument(
+            "--boundary-f1-loss-weight",
+            type=float,
+            default=TrainingConfigV2.boundary_f1_loss_weight,
+        )
+        parser.add_argument(
+            "--boundary-f1-fp-weight",
+            type=float,
+            default=TrainingConfigV2.boundary_f1_fp_weight,
+        )
+        parser.add_argument(
+            "--boundary-f1-fn-weight",
+            type=float,
+            default=TrainingConfigV2.boundary_f1_fn_weight,
+        )
+        parser.add_argument(
+            "--hard-boundary-negative-loss-weight",
+            type=float,
+            default=TrainingConfigV2.hard_boundary_negative_loss_weight,
+        )
+        parser.add_argument(
+            "--hard-boundary-negative-fraction",
+            type=float,
+            default=TrainingConfigV2.hard_boundary_negative_fraction,
+        )
+        parser.add_argument(
+            "--onset-peak-loss-weight",
+            type=float,
+            default=TrainingConfigV2.onset_peak_loss_weight,
+        )
+        parser.add_argument(
+            "--onset-event-recall-loss-weight",
+            type=float,
+            default=TrainingConfigV2.onset_event_recall_loss_weight,
+        )
+        parser.add_argument(
+            "--onset-false-peak-loss-weight",
+            type=float,
+            default=TrainingConfigV2.onset_false_peak_loss_weight,
+        )
+        parser.add_argument(
+            "--onset-peak-radius-frames",
+            type=int,
+            default=TrainingConfigV2.onset_peak_radius_frames,
+        )
+        parser.add_argument(
+            "--onset-false-peak-fraction",
+            type=float,
+            default=TrainingConfigV2.onset_false_peak_fraction,
         )
         parser.add_argument(
             "--model-dim",
@@ -2102,6 +2577,26 @@ class TrainingCliV2:
             "--model-layers",
             type=int,
             default=TrainingConfigV2.model_layers,
+        )
+        parser.add_argument(
+            "--event-decoder-layers",
+            type=int,
+            default=TrainingConfigV2.event_decoder_layers,
+        )
+        parser.add_argument(
+            "--event-decoder-heads",
+            type=int,
+            default=TrainingConfigV2.event_decoder_heads,
+        )
+        parser.add_argument(
+            "--event-teacher-forcing-start",
+            type=float,
+            default=TrainingConfigV2.event_teacher_forcing_start,
+        )
+        parser.add_argument(
+            "--event-teacher-forcing-end",
+            type=float,
+            default=TrainingConfigV2.event_teacher_forcing_end,
         )
         parser.add_argument(
             "--identity-dim",
@@ -2135,6 +2630,18 @@ class TrainingCliV2:
             type=float,
             default=TrainingConfigV2.frame_phase_noise_std,
             help="Gaussian feature noise std added to cached frames at train time.",
+        )
+        parser.add_argument(
+            "--anneal-noise-phase-jitter-samples",
+            type=int,
+            default=TrainingConfigV2.anneal_noise_phase_jitter_samples,
+            help="Max STFT phase jitter gradually added across stage 1 and 2.",
+        )
+        parser.add_argument(
+            "--anneal-noise-feature-std",
+            type=float,
+            default=TrainingConfigV2.anneal_noise_feature_std,
+            help="Max Gaussian feature noise gradually added across stage 1 and 2.",
         )
         parser.set_defaults(
             resume_optimizer_state=TrainingConfigV2.resume_optimizer_state

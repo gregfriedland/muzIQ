@@ -18,6 +18,9 @@ class SourceTrackingModelConfigV2:
     heads: int = 4
     layers: int = 2
     identity_dim: int = 16
+    event_state_dim: int = 5
+    event_decoder_layers: int = 1
+    event_decoder_heads: int = 4
 
 
 class SourceTrackingHeadV2(nn.Module):
@@ -37,8 +40,6 @@ class SourceTrackingHeadV2(nn.Module):
         self.norm = nn.LayerNorm(config.model_dim)
         self.activity = nn.Linear(config.model_dim, 1)
         self.family = nn.Linear(config.model_dim, config.n_families)
-        self.onset = nn.Linear(config.model_dim, 1)
-        self.offset = nn.Linear(config.model_dim, 1)
         self.onset_delta = nn.Linear(config.model_dim, 1)
         self.offset_delta = nn.Linear(config.model_dim, 1)
         self.identity = nn.Linear(config.model_dim, config.identity_dim)
@@ -52,13 +53,135 @@ class SourceTrackingHeadV2(nn.Module):
         return {
             "activity_logits": self.activity(slots).squeeze(-1),
             "family_logits": self.family(slots),
-            "onset_logits": self.onset(slots).squeeze(-1),
-            "offset_logits": self.offset(slots).squeeze(-1),
             "onset_delta": self.onset_delta(slots).squeeze(-1),
             "offset_delta": self.offset_delta(slots).squeeze(-1),
             "identity": F.normalize(self.identity(slots), dim=-1),
             "count_logits": self.count(slots.mean(dim=1)),
         }
+
+
+class SourceTrackingEventDecoderV2(nn.Module):
+    """Causal onset/offset decoder conditioned on prior event state."""
+
+    def __init__(self, config: SourceTrackingModelConfigV2):
+        super().__init__()
+        self.config = config
+        self.source_embedding = nn.Parameter(
+            torch.randn(config.max_sources, config.model_dim) * 0.02
+        )
+        self.event_state = nn.Linear(config.event_state_dim, config.model_dim)
+        layer = nn.TransformerEncoderLayer(
+            d_model=config.model_dim,
+            nhead=config.event_decoder_heads,
+            dim_feedforward=config.model_dim * 2,
+            dropout=0.1,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.decoder = nn.TransformerEncoder(layer, num_layers=config.event_decoder_layers)
+        self.norm = nn.LayerNorm(config.model_dim)
+        self.onset = nn.Linear(config.model_dim, 1)
+        self.offset = nn.Linear(config.model_dim, 1)
+
+    def forward(
+        self,
+        encoded: torch.Tensor,
+        event_state: torch.Tensor | None,
+    ) -> dict[str, torch.Tensor]:
+        batch, frames, dim = encoded.shape
+        sources = self.config.max_sources
+        if event_state is None:
+            event_state = encoded.new_zeros(
+                batch,
+                frames,
+                sources,
+                self.config.event_state_dim,
+            )
+        elif event_state.shape[1] != frames:
+            event_state = event_state[:, -frames:]
+        event_features = self.event_state(event_state.to(dtype=encoded.dtype))
+        source_features = self.source_embedding.view(1, 1, sources, dim)
+        sequence = encoded.unsqueeze(2) + event_features + source_features
+        sequence = sequence.permute(0, 2, 1, 3).reshape(batch * sources, frames, dim)
+        mask = torch.triu(
+            torch.ones(frames, frames, device=encoded.device, dtype=torch.bool),
+            diagonal=1,
+        )
+        decoded = self.decoder(sequence, mask=mask)
+        decoded = self.norm(decoded).view(batch, sources, frames, dim).permute(0, 2, 1, 3)
+        onset_sequence = self.onset(decoded).squeeze(-1)
+        offset_sequence = self.offset(decoded).squeeze(-1)
+        return {
+            "onset_logits_sequence": onset_sequence,
+            "offset_logits_sequence": offset_sequence,
+            "onset_logits": onset_sequence[:, -1, :],
+            "offset_logits": offset_sequence[:, -1, :],
+        }
+
+
+class SourceTrackingEventStateBuilderV2:
+    """Build causal event-state features from predicted boundary logits."""
+
+    @staticmethod
+    def from_logits(
+        onset_logits_sequence: torch.Tensor,
+        offset_logits_sequence: torch.Tensor,
+        *,
+        onset_threshold: float = 0.5,
+        offset_threshold: float = 0.5,
+        event_state_dim: int = 5,
+    ) -> torch.Tensor:
+        batch, frames, sources = onset_logits_sequence.shape
+        state = onset_logits_sequence.new_zeros(
+            (batch, frames, sources, event_state_dim)
+        )
+        if event_state_dim <= 0:
+            return state
+
+        onset_events = torch.sigmoid(onset_logits_sequence) >= onset_threshold
+        offset_events = torch.sigmoid(offset_logits_sequence) >= offset_threshold
+
+        if frames > 1:
+            state[:, 1:, :, 0] = onset_events[:, :-1, :].float()
+            if event_state_dim > 1:
+                state[:, 1:, :, 1] = offset_events[:, :-1, :].float()
+
+        active = torch.zeros((batch, sources), dtype=torch.bool, device=state.device)
+        last_onset = torch.full(
+            (batch, sources), -1, dtype=torch.long, device=state.device
+        )
+        last_offset = torch.full(
+            (batch, sources), -1, dtype=torch.long, device=state.device
+        )
+        denom = max(1, frames - 1)
+        for frame_idx in range(frames):
+            if event_state_dim > 2:
+                state[:, frame_idx, :, 2] = active.float()
+            if event_state_dim > 3:
+                state[:, frame_idx, :, 3] = SourceTrackingEventStateBuilderV2._age(
+                    last_onset, frame_idx, denom
+                )
+            if event_state_dim > 4:
+                state[:, frame_idx, :, 4] = SourceTrackingEventStateBuilderV2._age(
+                    last_offset, frame_idx, denom
+                )
+            onset_now = onset_events[:, frame_idx, :]
+            offset_now = offset_events[:, frame_idx, :]
+            last_onset = torch.where(
+                onset_now, torch.full_like(last_onset, frame_idx), last_onset
+            )
+            last_offset = torch.where(
+                offset_now, torch.full_like(last_offset, frame_idx), last_offset
+            )
+            active = (active | onset_now) & ~offset_now
+        return state
+
+    @staticmethod
+    def _age(last_event: torch.Tensor, frame_idx: int, denom: int) -> torch.Tensor:
+        frame = torch.full_like(last_event, frame_idx)
+        age = (frame - last_event).float() / float(denom)
+        return torch.where(last_event >= 0, torch.clamp(age, 0.0, 1.0), torch.ones_like(age))
 
 
 class DualPathTransformerSourceTrackerV2(nn.Module):
@@ -80,10 +203,17 @@ class DualPathTransformerSourceTrackerV2(nn.Module):
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=c.layers)
         self.head = SourceTrackingHeadV2(c)
+        self.event_decoder = SourceTrackingEventDecoderV2(c)
 
-    def forward(self, frames: torch.Tensor) -> dict[str, torch.Tensor]:
+    def forward(
+        self,
+        frames: torch.Tensor,
+        event_state: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
         encoded = self.encoder(self.input(frames))
-        return self.head(encoded)
+        outputs = self.head(encoded)
+        outputs.update(self.event_decoder(encoded, event_state))
+        return outputs
 
 
 class SourceTrackingLossV2(nn.Module):
@@ -98,7 +228,21 @@ class SourceTrackingLossV2(nn.Module):
         onset_pos_weight: float = 10.0,
         offset_pos_weight: float = 10.0,
         boundary_loss_weight: float = 0.5,
+        onset_loss_weight: float | None = None,
+        offset_loss_weight: float | None = None,
+        onset_focal_gamma: float = 0.0,
+        offset_focal_gamma: float = 0.0,
         boundary_timing_loss_weight: float = 0.25,
+        boundary_f1_loss_weight: float = 0.0,
+        boundary_f1_fp_weight: float = 1.0,
+        boundary_f1_fn_weight: float = 1.0,
+        hard_boundary_negative_loss_weight: float = 0.0,
+        hard_boundary_negative_fraction: float = 0.1,
+        onset_peak_loss_weight: float = 0.0,
+        onset_event_recall_loss_weight: float = 0.0,
+        onset_false_peak_loss_weight: float = 0.0,
+        onset_peak_radius_frames: int = 2,
+        onset_false_peak_fraction: float = 0.02,
     ):
         super().__init__()
         self.activity_pos_weight = activity_pos_weight
@@ -108,7 +252,25 @@ class SourceTrackingLossV2(nn.Module):
         self.onset_pos_weight = onset_pos_weight
         self.offset_pos_weight = offset_pos_weight
         self.boundary_loss_weight = boundary_loss_weight
+        self.onset_loss_weight = (
+            boundary_loss_weight if onset_loss_weight is None else onset_loss_weight
+        )
+        self.offset_loss_weight = (
+            boundary_loss_weight if offset_loss_weight is None else offset_loss_weight
+        )
+        self.onset_focal_gamma = onset_focal_gamma
+        self.offset_focal_gamma = offset_focal_gamma
         self.boundary_timing_loss_weight = boundary_timing_loss_weight
+        self.boundary_f1_loss_weight = boundary_f1_loss_weight
+        self.boundary_f1_fp_weight = boundary_f1_fp_weight
+        self.boundary_f1_fn_weight = boundary_f1_fn_weight
+        self.hard_boundary_negative_loss_weight = hard_boundary_negative_loss_weight
+        self.hard_boundary_negative_fraction = hard_boundary_negative_fraction
+        self.onset_peak_loss_weight = onset_peak_loss_weight
+        self.onset_event_recall_loss_weight = onset_event_recall_loss_weight
+        self.onset_false_peak_loss_weight = onset_false_peak_loss_weight
+        self.onset_peak_radius_frames = onset_peak_radius_frames
+        self.onset_false_peak_fraction = onset_false_peak_fraction
 
     def forward(
         self,
@@ -134,15 +296,17 @@ class SourceTrackingLossV2(nn.Module):
         )
         activity_loss = (activity_slot_loss * activity_weight).mean()
         count_loss = self._count_loss(outputs, activity)
-        onset_loss = F.binary_cross_entropy_with_logits(
+        onset_loss = self._binary_boundary_loss(
             outputs["onset_logits"],
             targets["onset"].float(),
             pos_weight=self._pos_weight(outputs["onset_logits"], self.onset_pos_weight),
+            focal_gamma=self.onset_focal_gamma,
         )
-        offset_loss = F.binary_cross_entropy_with_logits(
+        offset_loss = self._binary_boundary_loss(
             outputs["offset_logits"],
             targets["offset"].float(),
             pos_weight=self._pos_weight(outputs["offset_logits"], self.offset_pos_weight),
+            focal_gamma=self.offset_focal_gamma,
         )
         zero_timing_loss = activity_loss * 0.0
         onset_timing_loss = (
@@ -163,16 +327,188 @@ class SourceTrackingLossV2(nn.Module):
             if self._has_timing_tensors(outputs, targets, "offset")
             else zero_timing_loss
         )
+        boundary_f1_loss = self._boundary_f1_loss(outputs, targets)
+        hard_boundary_negative_loss = self._hard_boundary_negative_loss(outputs, targets)
+        onset_peak_loss = self._onset_peak_shape_loss(outputs, targets)
+        onset_event_recall_loss = self._onset_event_recall_loss(outputs, targets)
+        onset_false_peak_loss = self._onset_false_peak_loss(outputs, targets)
         family_loss = self._family_loss(outputs["family_logits"], targets["family"], activity)
         return (
             activity_loss
             + self.count_loss_weight * count_loss
             + self.family_loss_weight * family_loss
-            + self.boundary_loss_weight * (onset_loss + offset_loss)
+            + self.onset_loss_weight * onset_loss
+            + self.offset_loss_weight * offset_loss
             + self.boundary_timing_loss_weight * (
                 onset_timing_loss + offset_timing_loss
             )
+            + self.boundary_f1_loss_weight * boundary_f1_loss
+            + self.hard_boundary_negative_loss_weight * hard_boundary_negative_loss
+            + self.onset_peak_loss_weight * onset_peak_loss
+            + self.onset_event_recall_loss_weight * onset_event_recall_loss
+            + self.onset_false_peak_loss_weight * onset_false_peak_loss
         )
+
+    def _onset_peak_shape_loss(
+        self,
+        outputs: dict[str, torch.Tensor],
+        targets: dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        logits = outputs.get("onset_logits_sequence")
+        target = targets.get("context_onset")
+        delta = targets.get("context_onset_delta")
+        mask = targets.get("context_onset_timing_mask")
+        if logits is None or target is None:
+            return outputs["onset_logits"].sum() * 0.0
+        if delta is None or mask is None:
+            peak_target = target.float()
+        else:
+            radius = max(1, int(self.onset_peak_radius_frames))
+            peak_target = torch.clamp(
+                1.0 - delta.float().abs() / float(radius + 1),
+                min=0.0,
+            ) * mask.float()
+        return F.binary_cross_entropy_with_logits(logits, peak_target)
+
+    def _onset_event_recall_loss(
+        self,
+        outputs: dict[str, torch.Tensor],
+        targets: dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        logits = outputs.get("onset_logits_sequence")
+        mask = targets.get("context_onset_timing_mask")
+        if logits is None or mask is None:
+            return outputs["onset_logits"].sum() * 0.0
+        probability = torch.sigmoid(logits)
+        radius = max(0, int(self.onset_peak_radius_frames))
+        center = self._onset_center_mask(targets)
+        if not center.any():
+            return probability.sum() * 0.0
+        window_max = self._temporal_max(probability, radius)
+        return (1.0 - window_max[center]).mean()
+
+    def _onset_false_peak_loss(
+        self,
+        outputs: dict[str, torch.Tensor],
+        targets: dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        logits = outputs.get("onset_logits_sequence")
+        if logits is None:
+            return outputs["onset_logits"].sum() * 0.0
+        probability = torch.sigmoid(logits)
+        local_max = probability >= self._temporal_max(probability, 1).detach()
+        exclusion = targets.get("context_onset_timing_mask")
+        if exclusion is None:
+            exclusion = torch.zeros_like(probability)
+        candidates = probability[(exclusion <= 0.5) & local_max]
+        if candidates.numel() == 0:
+            return probability.sum() * 0.0
+        fraction = min(1.0, max(0.0, float(self.onset_false_peak_fraction)))
+        k = max(1, int(round(candidates.numel() * fraction)))
+        return torch.topk(candidates, k=k).values.mean()
+
+    @staticmethod
+    def _temporal_max(values: torch.Tensor, radius: int) -> torch.Tensor:
+        if radius <= 0:
+            return values
+        batch, frames, sources = values.shape
+        flat = values.permute(0, 2, 1).reshape(batch * sources, 1, frames)
+        pooled = F.max_pool1d(flat, kernel_size=2 * radius + 1, stride=1, padding=radius)
+        return pooled.reshape(batch, sources, frames).permute(0, 2, 1)
+
+    @staticmethod
+    def _onset_center_mask(targets: dict[str, torch.Tensor]) -> torch.Tensor:
+        mask = targets.get("context_onset_timing_mask")
+        delta = targets.get("context_onset_delta")
+        if mask is None:
+            return torch.zeros((), dtype=torch.bool)
+        if delta is None:
+            return mask.float() > 0.5
+        return (mask.float() > 0.5) & (delta.float().abs() < 0.5)
+
+    @staticmethod
+    def _binary_boundary_loss(
+        logits: torch.Tensor,
+        target: torch.Tensor,
+        *,
+        pos_weight: torch.Tensor,
+        focal_gamma: float,
+    ) -> torch.Tensor:
+        bce = F.binary_cross_entropy_with_logits(
+            logits,
+            target,
+            pos_weight=pos_weight,
+            reduction="none",
+        )
+        gamma = max(0.0, float(focal_gamma))
+        if gamma <= 0.0:
+            return bce.mean()
+        probability = torch.sigmoid(logits)
+        p_t = torch.where(target > 0.5, probability, 1.0 - probability)
+        return (((1.0 - p_t).clamp_min(0.0) ** gamma) * bce).mean()
+
+    def _boundary_f1_loss(
+        self,
+        outputs: dict[str, torch.Tensor],
+        targets: dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        onset = self._soft_tversky_loss(
+            outputs["onset_logits"],
+            targets["onset"].float(),
+        )
+        offset = self._soft_tversky_loss(
+            outputs["offset_logits"],
+            targets["offset"].float(),
+        )
+        return onset + offset
+
+    def _hard_boundary_negative_loss(
+        self,
+        outputs: dict[str, torch.Tensor],
+        targets: dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        onset = self._hard_negative_loss(
+            outputs["onset_logits"],
+            targets["onset"].float(),
+        )
+        offset = self._hard_negative_loss(
+            outputs["offset_logits"],
+            targets["offset"].float(),
+        )
+        return onset + offset
+
+    def _hard_negative_loss(
+        self,
+        logits: torch.Tensor,
+        target: torch.Tensor,
+    ) -> torch.Tensor:
+        negative_logits = logits[target < 0.5]
+        if negative_logits.numel() == 0:
+            return logits.sum() * 0.0
+        fraction = min(1.0, max(0.0, self.hard_boundary_negative_fraction))
+        if fraction <= 0.0:
+            return logits.sum() * 0.0
+        k = max(1, int(round(negative_logits.numel() * fraction)))
+        hard_logits = torch.topk(negative_logits, k=k).values
+        return F.softplus(hard_logits).mean()
+
+    def _soft_tversky_loss(
+        self,
+        logits: torch.Tensor,
+        target: torch.Tensor,
+    ) -> torch.Tensor:
+        probability = torch.sigmoid(logits)
+        axes = tuple(range(1, probability.ndim))
+        true_positive = (probability * target).sum(dim=axes)
+        false_positive = (probability * (1.0 - target)).sum(dim=axes)
+        false_negative = ((1.0 - probability) * target).sum(dim=axes)
+        score = (true_positive + 1e-6) / (
+            true_positive
+            + self.boundary_f1_fp_weight * false_positive
+            + self.boundary_f1_fn_weight * false_negative
+            + 1e-6
+        )
+        return (1.0 - score).mean()
 
     @staticmethod
     def _timing_loss(

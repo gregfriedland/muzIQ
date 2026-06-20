@@ -207,6 +207,8 @@ if [[ -f "$preview_wav" ]]; then
       --data-root "$data_root" \
       --wav "$preview_wav" \
       --calibration-input "$calibration" \
+      --device "$device" \
+      --sample-stride-ms 5 \
       --output-json "$preview_metrics"
   else
     echo "60s preview metrics already exist: $preview_metrics"

@@ -7,8 +7,10 @@ const ROW_COLORS = [
 ];
 const BLACKHOLE_CAPTURE_DEVICE = "BlackHole 2ch";
 const SIGNAL_ACTIVE_RMS = 0.006;
-const SOURCE_ONSET_THRESHOLD = 0.0002;
-const SOURCE_OFFSET_THRESHOLD = 0.00018;
+const SOURCE_ONSET_THRESHOLD = 0.35;
+const SOURCE_OFFSET_THRESHOLD = 0.35;
+const SOURCE_ONSET_REFRACTORY_MS = 200;
+const SOURCE_OFFSET_REFRACTORY_MS = 200;
 
 class SourceGridApp {
   constructor() {
@@ -32,6 +34,7 @@ class SourceGridApp {
     this.ws = null;
     this.noteActive = false;
     this.activeRowKey = null;
+    this.slotStates = new Map();
     this.lastSignalAt = 0;
     this.bind();
     this.resize();
@@ -113,6 +116,7 @@ class SourceGridApp {
       }
       this.noteActive = false;
       this.activeRowKey = null;
+      this.slotStates.clear();
       this.clearRowsAfterSilence(now);
       return;
     }
@@ -123,39 +127,65 @@ class SourceGridApp {
     }
 
     for (const source of payload.sources) {
-      this.updateSourceRow(source, feature, now);
+      this.updateSlotState(source, now);
     }
     this.noteActive = this.instrumentRows.some((row) => row.activeNote);
     this.activeRowKey = this.instrumentRows.find((row) => row.activeNote)?.key || null;
     this.clearRowsAfterSilence(now);
   }
 
-  updateSourceRow(source, feature, now) {
+  updateSlotState(source, now) {
+    const key = sourceKey(source);
+    let state = this.slotStates.get(key);
+    if (!state) {
+      state = {
+        previous: null,
+        current: null,
+        lastOnsetPeakAt: Number.NEGATIVE_INFINITY,
+        lastOffsetPeakAt: Number.NEGATIVE_INFINITY,
+      };
+      this.slotStates.set(key, state);
+    }
+    const previous = state.previous;
+    const current = state.current;
+    if (current && isLocalPeak(previous, current, source, "onset", SOURCE_ONSET_THRESHOLD)) {
+      if (now - state.lastOnsetPeakAt >= SOURCE_ONSET_REFRACTORY_MS) {
+        this.startSourceNote(current, now);
+        state.lastOnsetPeakAt = now;
+      }
+    }
+    if (current && isLocalPeak(previous, current, source, "offset", SOURCE_OFFSET_THRESHOLD)) {
+      if (now - state.lastOffsetPeakAt >= SOURCE_OFFSET_REFRACTORY_MS) {
+        this.stopSourceNote(current);
+        state.lastOffsetPeakAt = now;
+      }
+    }
+    state.previous = current;
+    state.current = source;
+  }
+
+  startSourceNote(source, now) {
     const key = sourceKey(source);
     let row = this.instrumentRows.find((candidate) => candidate.key === key);
     if (!row) {
-      if (source.onset < SOURCE_ONSET_THRESHOLD) {
-        return;
-      }
       row = {
         key,
         slot: source.slot,
         color: ROW_COLORS[source.slot % ROW_COLORS.length],
         lastSeenAt: now,
-        lastOnset: 0,
-        lastOffset: 0,
+        lastNoteStartAt: Number.NEGATIVE_INFINITY,
         activeNote: null,
       };
       this.instrumentRows.push(row);
     }
-    if (shouldStopNote(row, source)) {
+    this.showNote(row, source, now);
+  }
+
+  stopSourceNote(source) {
+    const row = this.instrumentRows.find((candidate) => candidate.key === sourceKey(source));
+    if (row) {
       this.stopRowNote(row);
     }
-    if (shouldStartNote(row, source)) {
-      this.showNote(row, source, now);
-    }
-    row.lastOnset = source.onset;
-    row.lastOffset = source.offset;
   }
 
   showNote(row, source, now) {
@@ -164,6 +194,7 @@ class SourceGridApp {
       position: clampUnit(source.position),
       activity: Math.max(source.onset, 0.35),
     };
+    row.lastNoteStartAt = now;
     this.noteActive = true;
     this.activeRowKey = row.key;
   }
@@ -182,6 +213,7 @@ class SourceGridApp {
     this.instrumentRows = [];
     this.noteActive = false;
     this.activeRowKey = null;
+    this.slotStates.clear();
     this.sourceCount.textContent = "0";
     this.renderCards();
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
@@ -211,6 +243,7 @@ class SourceGridApp {
     this.instrumentRows = [];
     this.noteActive = false;
     this.activeRowKey = null;
+    this.slotStates = new Map();
     this.lastSignalAt = 0;
     this.sourceCount.textContent = "0";
     this.frameCount.textContent = "0";
@@ -300,12 +333,13 @@ function sourceKey(source) {
   return `slot:${source.slot}`;
 }
 
-function shouldStartNote(row, source) {
-  return source.onset >= SOURCE_ONSET_THRESHOLD && row.lastOnset < SOURCE_ONSET_THRESHOLD;
-}
-
-function shouldStopNote(row, source) {
-  return row.activeNote && source.offset >= SOURCE_OFFSET_THRESHOLD && row.lastOffset < SOURCE_OFFSET_THRESHOLD;
+function isLocalPeak(previous, current, next, field, threshold) {
+  if (!current || typeof current[field] !== "number" || current[field] < threshold) {
+    return false;
+  }
+  const previousScore = previous && typeof previous[field] === "number" ? previous[field] : Number.NEGATIVE_INFINITY;
+  const nextScore = next && typeof next[field] === "number" ? next[field] : Number.NEGATIVE_INFINITY;
+  return current[field] >= previousScore && current[field] > nextScore;
 }
 
 function clampUnit(value) {

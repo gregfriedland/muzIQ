@@ -14,7 +14,7 @@ from muziq_nn.datasets.render import (
     SourceTrackingAudioConfigV2,
     SourceTrackingRendererV2,
 )
-from muziq_nn.training.train import TrainingBatchBuilderV2
+from muziq_nn.training.train import TrainingBatchBuilderV2, TrainingRenderWorkerV2
 
 
 class TestRendererV2:
@@ -137,6 +137,86 @@ class TestRendererV2:
         torch.testing.assert_close(audio_batch["family"], frame_batch["family"])
         torch.testing.assert_close(audio_batch["onset"], frame_batch["onset"])
         torch.testing.assert_close(audio_batch["offset"], frame_batch["offset"])
+
+    def test_audio_training_slice_honors_phase_offset_after_batching(
+        self, tmp_path
+    ):
+        TinyCorpusBuilderV2(tmp_path).build()
+        renderer = SourceTrackingRendererV2(
+            NsynthNoteStoreV2(NsynthIndexV2(tmp_path)),
+            MidiScheduleStoreV2(MidiIndexV2(tmp_path)),
+        )
+        builder = TrainingBatchBuilderV2(torch.device("cpu"), frame_count=256)
+        phase_offset_samples = SourceTrackingAudioConfigV2.hop // 2
+
+        frame_slice = renderer.render_training_slice(
+            "single_instrument_melody",
+            "train",
+            seed=6,
+            frame_count=256,
+            peak_warmup_frames=512,
+            phase_offset_samples=phase_offset_samples,
+        )
+        audio_slice = renderer.render_training_audio_slice(
+            "single_instrument_melody",
+            "train",
+            seed=6,
+            frame_count=256,
+            peak_warmup_frames=512,
+            phase_offset_samples=phase_offset_samples,
+        )
+
+        frame_batch = builder.build_slices([frame_slice])
+        audio_batch = builder.build_slices([audio_slice])
+
+        torch.testing.assert_close(
+            audio_batch["frames"],
+            frame_batch["frames"],
+            rtol=5e-4,
+            atol=5e-4,
+        )
+
+    def test_audio_training_worker_honors_phase_offset_after_batching(
+        self, tmp_path
+    ):
+        TinyCorpusBuilderV2(tmp_path).build()
+        renderer = SourceTrackingRendererV2(
+            NsynthNoteStoreV2(NsynthIndexV2(tmp_path)),
+            MidiScheduleStoreV2(MidiIndexV2(tmp_path)),
+        )
+        builder = TrainingBatchBuilderV2(torch.device("cpu"), frame_count=256)
+        phase_offset_samples = SourceTrackingAudioConfigV2.hop // 2
+
+        frame_slice = renderer.render_training_slice(
+            "single_instrument_melody",
+            "train",
+            seed=6,
+            frame_count=256,
+            peak_warmup_frames=512,
+            phase_offset_samples=phase_offset_samples,
+        )
+        audio_slice = TrainingRenderWorkerV2.render_slice(
+            (
+                str(tmp_path),
+                "single_instrument_melody",
+                "train",
+                6,
+                256,
+                512,
+                True,
+                phase_offset_samples,
+            )
+        )
+
+        frame_batch = builder.build_slices([frame_slice])
+        audio_batch = builder.build_slices([audio_slice])
+
+        torch.testing.assert_close(
+            audio_batch["frames"],
+            frame_batch["frames"],
+            rtol=5e-4,
+            atol=5e-4,
+        )
 
     def test_training_slice_samples_boundary_frames(self, tmp_path):
         TinyCorpusBuilderV2(tmp_path).build()

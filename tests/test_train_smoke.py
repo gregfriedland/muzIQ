@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
+import pytest
 import torch
 from conftest import TinyCorpusBuilderV2
 
@@ -70,7 +72,7 @@ class TestTrainSmokeV2:
             "single_instrument_melody",
         ]
 
-    def test_stage_filter_selects_optional_cached_frame_stages(self, tmp_path):
+    def test_stage_filter_rejects_removed_cached_frame_stages(self, tmp_path):
         TinyCorpusBuilderV2(tmp_path / "data").build()
         trainer = SourceTrackingTrainerV2(
             TrainingConfigV2(
@@ -80,13 +82,8 @@ class TestTrainSmokeV2:
                 device="cpu",
             )
         )
-        stages = trainer._filter_stages(CurriculumPlanV2().stages)
-
-        assert [stage.name for stage in stages] == [
-            "single_note_frames_cached",
-            "single_instrument_melody_frames_cached",
-        ]
-        assert [stage.train_examples_per_epoch for stage in stages] == [5, 5]
+        with pytest.raises(ValueError, match="Unknown training stage"):
+            trainer._filter_stages(CurriculumPlanV2().stages)
 
     def test_cli_parses_loss_weights_and_stage_filter(self):
         config = TrainingCliV2.parse(
@@ -97,12 +94,48 @@ class TestTrainSmokeV2:
                 "6",
                 "--count-loss-weight",
                 "3",
+                "--onset-loss-weight",
+                "0.5",
+                "--offset-loss-weight",
+                "0.05",
+                "--onset-focal-gamma",
+                "2",
+                "--offset-focal-gamma",
+                "1",
+                "--event-decoder-layers",
+                "2",
+                "--event-teacher-forcing-start",
+                "0.8",
+                "--event-teacher-forcing-end",
+                "0",
+                "--onset-peak-loss-weight",
+                "0.25",
+                "--onset-event-recall-loss-weight",
+                "1.5",
+                "--onset-false-peak-loss-weight",
+                "0.4",
+                "--anneal-noise-phase-jitter-samples",
+                "79",
+                "--anneal-noise-feature-std",
+                "0.01",
             ]
         )
 
         assert config.stage_filter == "single_note_all,single_instrument_melody"
         assert config.inactive_slot_weight == 6
         assert config.count_loss_weight == 3
+        assert config.onset_loss_weight == 0.5
+        assert config.offset_loss_weight == 0.05
+        assert config.onset_focal_gamma == 2
+        assert config.offset_focal_gamma == 1
+        assert config.event_decoder_layers == 2
+        assert config.event_teacher_forcing_start == 0.8
+        assert config.event_teacher_forcing_end == 0
+        assert config.onset_peak_loss_weight == 0.25
+        assert config.onset_event_recall_loss_weight == 1.5
+        assert config.onset_false_peak_loss_weight == 0.4
+        assert config.anneal_noise_phase_jitter_samples == 79
+        assert config.anneal_noise_feature_std == 0.01
 
     def test_one_train_step_writes_metrics_and_checkpoint(self, tmp_path):
         TinyCorpusBuilderV2(tmp_path / "data").build()
@@ -171,7 +204,7 @@ class TestTrainSmokeV2:
         assert payload["history"]
         assert payload["config"]["prefetch_batches"] == 1
 
-    def test_cached_frame_train_step_runs(self, tmp_path):
+    def test_annealed_noise_train_step_runs(self, tmp_path):
         TinyCorpusBuilderV2(tmp_path / "data").build()
         config = TrainingConfigV2(
             data_root=str(tmp_path / "data"),
@@ -179,19 +212,66 @@ class TestTrainSmokeV2:
             calibration_examples=2,
             batch_size=2,
             epochs_per_stage=1,
-            stage_filter="single_note_frames_cached",
-            frame_cache_examples_per_stage=4,
-            frame_cache_phase_jitter_samples=12,
-            frame_phase_noise_std=0.01,
+            stage_filter="single_note_all",
+            smoke_examples=0,
+            curriculum_scale=0.0002,
+            anneal_noise_phase_jitter_samples=12,
+            anneal_noise_feature_std=0.01,
             device="cpu",
         )
 
         payload = SourceTrackingTrainerV2(config).run()
 
         assert payload["history"]
-        assert payload["history"][0]["stage"] == "single_note_frames_cached"
-        assert payload["history"][0]["examples"] == 4
-        assert payload["config"]["frame_cache_phase_jitter_samples"] == 12
+        assert payload["history"][0]["stage"] == "single_note_all"
+        assert payload["config"]["anneal_noise_phase_jitter_samples"] == 12
+        assert payload["config"]["anneal_noise_feature_std"] == 0.01
+
+    def test_boundary_classification_metrics_aggregate_counts(self):
+        first = {
+            "onset_true_positive_count": 1.0,
+            "onset_false_positive_count": 1.0,
+            "onset_false_negative_count": 1.0,
+            "onset_true_negative_count": 1.0,
+            "onset_target_positive_count": 2.0,
+            "onset_target_negative_count": 2.0,
+            "onset_predicted_positive_count": 2.0,
+            "offset_true_positive_count": 0.0,
+            "offset_false_positive_count": 0.0,
+            "offset_false_negative_count": 1.0,
+            "offset_true_negative_count": 3.0,
+            "offset_target_positive_count": 1.0,
+            "offset_target_negative_count": 3.0,
+            "offset_predicted_positive_count": 0.0,
+            "source_count_accuracy": 1.0,
+        }
+        second = {
+            **first,
+            "onset_true_positive_count": 2.0,
+            "onset_false_positive_count": 0.0,
+            "onset_false_negative_count": 0.0,
+            "onset_true_negative_count": 2.0,
+            "offset_true_positive_count": 1.0,
+            "offset_false_positive_count": 1.0,
+            "offset_false_negative_count": 0.0,
+            "offset_true_negative_count": 2.0,
+            "source_count_accuracy": 0.0,
+        }
+
+        metrics = SourceTrackingTrainerV2._mean_batch_metrics([first, second])
+
+        assert metrics["source_count_accuracy"] == 0.5
+        assert metrics["onset_true_positive_count"] == 3.0
+        assert metrics["onset_false_positive_count"] == 1.0
+        assert metrics["onset_false_negative_count"] == 1.0
+        assert metrics["onset_precision"] == 0.75
+        assert metrics["onset_recall"] == 0.75
+        assert metrics["onset_f1"] == 0.75
+        assert metrics["onset_false_positive_rate"] == 0.25
+        assert metrics["offset_precision"] == 0.5
+        assert metrics["offset_recall"] == 0.5
+        assert metrics["offset_f1"] == 0.5
+        assert metrics["offset_false_positive_rate"] == pytest.approx(1 / 6)
 
     def test_process_render_pool_train_step_runs(self, tmp_path):
         TinyCorpusBuilderV2(tmp_path / "data").build()
@@ -276,6 +356,10 @@ class TestTrainSmokeV2:
         checkpoint_payload = torch.load(uploaded_checkpoint, map_location="cpu")
         assert checkpoint_payload["optimizer_state_dict"] is not None
         assert payload["artifacts"]["checkpoint_upload_uri"].endswith("/unit-run")
+        run_dir = Path(payload["artifacts"]["run_dir"])
+        assert not list((run_dir / "checkpoints").glob("checkpoint_*.pt"))
+        assert not list((run_dir / "checkpoints").glob("checkpoint_*.json"))
+        assert (run_dir / "checkpoints" / "latest.json").exists()
 
     def test_resume_cursor_from_warm_start_metadata(self, tmp_path):
         TinyCorpusBuilderV2(tmp_path / "data").build()

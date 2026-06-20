@@ -318,7 +318,11 @@ class NsynthHeldoutEvaluatorV2:
             )
             tensor = torch.from_numpy(batch).to(self.checkpoint.device)
             with torch.inference_mode():
-                outputs = self.checkpoint.model(tensor)
+                outputs = self.checkpoint.predict_sequence(
+                    tensor,
+                    onset_threshold=self.config.onset_threshold,
+                    offset_threshold=self.config.offset_threshold,
+                )
             activity = torch.sigmoid(outputs["activity_logits"]).cpu().numpy()
             family_probs = torch.softmax(outputs["family_logits"], dim=-1).cpu().numpy()
             onset = torch.sigmoid(outputs["onset_logits"]).cpu().numpy()
@@ -567,40 +571,66 @@ class NsynthHeldoutEvaluatorV2:
         if not rows:
             return {"threshold": self._default_threshold(kind), "f1": 0.0, "positives": 0}
         score_key = f"{kind}_score"
-        candidates = sorted(
-            {self._default_threshold(kind), 0.05, 0.1, 0.2, 0.35, 0.5, 0.65, 0.8}
-            | {float(row[score_key]) for row in rows}
+        scores = np.asarray([float(row[score_key]) for row in rows], dtype=np.float64)
+        positives_mask = np.asarray([row["probe"] == kind for row in rows], dtype=bool)
+        candidates = np.unique(
+            np.concatenate(
+                (
+                    np.asarray(
+                        [
+                            self._default_threshold(kind),
+                            0.05,
+                            0.1,
+                            0.2,
+                            0.35,
+                            0.5,
+                            0.65,
+                            0.8,
+                        ],
+                        dtype=np.float64,
+                    ),
+                    scores,
+                )
+            )
         )
-        best = {"threshold": self._default_threshold(kind), "f1": -1.0, "positives": 0}
-        for threshold in candidates:
-            tp = fp = fn = positives = 0
-            for row in rows:
-                positive = row["probe"] == kind
-                predicted = float(row[score_key]) >= threshold
-                if positive:
-                    positives += 1
-                if positive and predicted:
-                    tp += 1
-                elif positive and not predicted:
-                    fn += 1
-                elif not positive and predicted:
-                    fp += 1
-            precision = tp / (tp + fp) if tp + fp else 0.0
-            recall = tp / (tp + fn) if tp + fn else 0.0
-            f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
-            if (f1, recall, threshold) > (
-                float(best["f1"]),
-                float(best.get("recall", 0.0)),
-                float(best["threshold"]),
-            ):
-                best = {
-                    "threshold": float(threshold),
-                    "precision": float(precision),
-                    "recall": float(recall),
-                    "f1": float(f1),
-                    "positives": positives,
-                }
-        return best
+        order = np.argsort(scores, kind="mergesort")
+        sorted_scores = scores[order]
+        positive_prefix = np.concatenate(
+            ([0], np.cumsum(positives_mask[order].astype(np.int64)))
+        )
+        below_threshold = np.searchsorted(sorted_scores, candidates, side="left")
+        predicted = scores.size - below_threshold
+        positives = int(positive_prefix[-1])
+        tp = positives - positive_prefix[below_threshold]
+        fp = predicted - tp
+        fn = positives - tp
+        with np.errstate(divide="ignore", invalid="ignore"):
+            precision = np.divide(
+                tp,
+                tp + fp,
+                out=np.zeros_like(tp, dtype=np.float64),
+                where=(tp + fp) > 0,
+            )
+            recall = np.divide(
+                tp,
+                tp + fn,
+                out=np.zeros_like(tp, dtype=np.float64),
+                where=(tp + fn) > 0,
+            )
+            f1 = np.divide(
+                2 * precision * recall,
+                precision + recall,
+                out=np.zeros_like(precision, dtype=np.float64),
+                where=(precision + recall) > 0,
+            )
+        best_idx = int(np.lexsort((candidates, recall, f1))[-1])
+        return {
+            "threshold": float(candidates[best_idx]),
+            "precision": float(precision[best_idx]),
+            "recall": float(recall[best_idx]),
+            "f1": float(f1[best_idx]),
+            "positives": positives,
+        }
 
     def _threshold(self, family: str, kind: Literal["onset", "offset"]) -> float:
         by_family = self.calibration.get("by_family") if self.calibration else None
