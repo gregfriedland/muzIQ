@@ -9,7 +9,9 @@ from conftest import TinyCorpusBuilderV2
 
 from muziq_nn.training.train import (
     CurriculumPlanV2,
+    CurriculumStageV2,
     SourceTrackingTrainerV2,
+    TrainingBatchBuilderV2,
     TrainingCliV2,
     TrainingConfigV2,
 )
@@ -36,6 +38,19 @@ class TestTrainSmokeV2:
         stages = CurriculumPlanV2().scale_epochs(2).with_epochs_per_stage(50).stages
 
         assert [stage.epochs for stage in stages] == [50, 50, 50, 50, 50]
+
+    def test_cosine_learning_rate_decay_reaches_min_fraction(self):
+        trainer = object.__new__(SourceTrackingTrainerV2)
+        trainer.config = TrainingConfigV2(
+            learning_rate_scale=0.1,
+            learning_rate_decay="cosine",
+            learning_rate_min_fraction=0.1,
+            learning_rate_decay_epochs=10,
+        )
+        stage = CurriculumStageV2("single_note_all", 30_000, 10, 1e-3)
+
+        assert trainer._learning_rate_for_step(stage, 0, 0, 10) == pytest.approx(1e-4)
+        assert trainer._learning_rate_for_step(stage, 9, 9, 10) == pytest.approx(1e-5)
 
     def test_midi_render_workers_override_only_midi_stage(self, tmp_path):
         TinyCorpusBuilderV2(tmp_path / "data").build()
@@ -108,12 +123,87 @@ class TestTrainSmokeV2:
                 "0.8",
                 "--event-teacher-forcing-end",
                 "0",
+                "--event-state-onset-threshold",
+                "0.25",
+                "--event-state-offset-threshold",
+                "0.03",
+                "--event-state-soft-events",
+                "--validation-examples-per-epoch",
+                "4",
+                "--validation-interval-epochs",
+                "2",
+                "--validation-teacher-forcing-rate",
+                "0.25",
+                "--onset-label-radius-frames",
+                "0",
+                "--offset-label-radius-frames",
+                "8",
+                "--boundary-negative-radius-frames",
+                "32",
+                "--onset-hard-negative-sample-prob",
+                "0.25",
+                "--early-stopping-metric",
+                "onset_average_precision",
+                "--early-stopping-patience",
+                "10",
+                "--early-stopping-min-delta",
+                "0.001",
+                "--learning-rate-scale",
+                "0.1",
+                "--learning-rate-decay",
+                "cosine",
+                "--learning-rate-min-fraction",
+                "0.1",
+                "--learning-rate-decay-epochs",
+                "40",
+                "--hard-boundary-negative-loss-weight",
+                "0.75",
+                "--hard-boundary-negative-fraction",
+                "0.05",
+                "--onset-pairwise-ranking-loss-weight",
+                "0.2",
+                "--onset-pairwise-ranking-margin",
+                "0.25",
+                "--onset-softmax-loss-weight",
+                "0.5",
+                "--onset-sequence-loss-weight",
+                "0.25",
+                "--onset-sequence-pairwise-ranking-loss-weight",
+                "0.1",
                 "--onset-peak-loss-weight",
                 "0.25",
                 "--onset-event-recall-loss-weight",
                 "1.5",
                 "--onset-false-peak-loss-weight",
                 "0.4",
+                "--first-pass-boundary-loss-weight",
+                "0.5",
+                "--free-run-onset-sequence-loss-weight",
+                "0.4",
+                "--free-run-onset-sequence-pairwise-ranking-loss-weight",
+                "0.6",
+                "--first-pass-distillation-loss-weight",
+                "0.7",
+                "--first-pass-sequence-distillation-loss-weight",
+                "0.8",
+                "--first-pass-distillation-offset-weight",
+                "0.2",
+                "--first-pass-event-age-loss-weight",
+                "0.9",
+                "--first-pass-event-age-offset-weight",
+                "0.3",
+                "--first-pass-event-age-recent-weight",
+                "500",
+                "--freeze-for-first-pass-event-age",
+                "--freeze-for-free-run-onset-sequence",
+                "--freeze-for-free-run-event-decoder",
+                "--event-state-use-predicted-age",
+                "--event-state-noise-std",
+                "0.1",
+                "--event-state-dropout-prob",
+                "0.2",
+                "--input-novelty-features",
+                "flux",
                 "--anneal-noise-phase-jitter-samples",
                 "79",
                 "--anneal-noise-feature-std",
@@ -131,11 +221,287 @@ class TestTrainSmokeV2:
         assert config.event_decoder_layers == 2
         assert config.event_teacher_forcing_start == 0.8
         assert config.event_teacher_forcing_end == 0
+        assert config.event_state_onset_threshold == 0.25
+        assert config.event_state_offset_threshold == 0.03
+        assert config.event_state_soft_events is True
+        assert config.validation_examples_per_epoch == 4
+        assert config.validation_interval_epochs == 2
+        assert config.validation_teacher_forcing_rate == 0.25
+        assert config.onset_label_radius_frames == 0
+        assert config.offset_label_radius_frames == 8
+        assert config.boundary_negative_radius_frames == 32
+        assert config.onset_hard_negative_sample_prob == 0.25
+        assert config.early_stopping_metric == "onset_average_precision"
+        assert config.early_stopping_patience == 10
+        assert config.early_stopping_min_delta == 0.001
+        assert config.learning_rate_scale == 0.1
+        assert config.learning_rate_decay == "cosine"
+        assert config.learning_rate_min_fraction == 0.1
+        assert config.learning_rate_decay_epochs == 40
+        assert config.hard_boundary_negative_loss_weight == 0.75
+        assert config.hard_boundary_negative_fraction == 0.05
+        assert config.onset_pairwise_ranking_loss_weight == 0.2
+        assert config.onset_pairwise_ranking_margin == 0.25
+        assert config.onset_softmax_loss_weight == 0.5
+        assert config.onset_sequence_loss_weight == 0.25
+        assert config.onset_sequence_pairwise_ranking_loss_weight == 0.1
         assert config.onset_peak_loss_weight == 0.25
         assert config.onset_event_recall_loss_weight == 1.5
         assert config.onset_false_peak_loss_weight == 0.4
+        assert config.first_pass_boundary_loss_weight == 0.5
+        assert config.free_run_onset_sequence_loss_weight == 0.4
+        assert config.free_run_onset_sequence_pairwise_ranking_loss_weight == 0.6
+        assert config.first_pass_distillation_loss_weight == 0.7
+        assert config.first_pass_sequence_distillation_loss_weight == 0.8
+        assert config.first_pass_distillation_offset_weight == 0.2
+        assert config.first_pass_event_age_loss_weight == 0.9
+        assert config.first_pass_event_age_offset_weight == 0.3
+        assert config.first_pass_event_age_recent_weight == 500
+        assert config.freeze_for_first_pass_event_age is True
+        assert config.freeze_for_free_run_onset_sequence is True
+        assert config.freeze_for_free_run_event_decoder is True
+        assert config.event_state_use_predicted_age is True
+        assert config.event_state_noise_std == 0.1
+        assert config.event_state_dropout_prob == 0.2
+        assert config.input_novelty_features == "flux"
         assert config.anneal_noise_phase_jitter_samples == 79
         assert config.anneal_noise_feature_std == 0.01
+
+    def test_flux_input_features_append_bandwise_positive_deltas(self):
+        builder = object.__new__(TrainingBatchBuilderV2)
+        builder.input_novelty_features = "flux"
+        frames = torch.tensor(
+            [
+                [
+                    [0.1, 0.3],
+                    [0.4, 0.2],
+                    [0.2, 0.5],
+                ]
+            ],
+            dtype=torch.float32,
+        )
+
+        augmented = builder._augment_frame_features(frames)
+
+        assert augmented.shape == (1, 3, 4)
+        assert torch.equal(augmented[..., :2], frames)
+        assert torch.allclose(
+            augmented[..., 2:],
+            torch.tensor([[[0.0, 0.0], [0.3, 0.0], [0.0, 0.3]]]),
+        )
+
+    def test_partial_warm_start_expands_input_weight_for_flux_features(self, tmp_path):
+        TinyCorpusBuilderV2(tmp_path / "data").build()
+        base = SourceTrackingTrainerV2(
+            TrainingConfigV2(data_root=str(tmp_path / "data"), device="cpu")
+        )
+        checkpoint = tmp_path / "checkpoint.pt"
+        torch.save({"state_dict": base.model.state_dict()}, checkpoint)
+
+        expanded = SourceTrackingTrainerV2(
+            TrainingConfigV2(
+                data_root=str(tmp_path / "data"),
+                device="cpu",
+                warm_start_checkpoint=str(checkpoint),
+                partial_warm_start=True,
+                input_novelty_features="flux",
+            )
+        )
+
+        assert expanded.model.input.weight.shape[1] == 80
+        assert expanded.warm_start_load_report["adapted_tensors"] == ["input.weight"]
+        assert torch.equal(
+            expanded.model.input.weight[:, :40],
+            base.model.input.weight,
+        )
+
+    def test_freeze_for_first_pass_event_age_trains_only_age_heads(self, tmp_path):
+        TinyCorpusBuilderV2(tmp_path / "data").build()
+        trainer = SourceTrackingTrainerV2(
+            TrainingConfigV2(
+                data_root=str(tmp_path / "data"),
+                device="cpu",
+                batch_size=1,
+                freeze_for_first_pass_event_age=True,
+            )
+        )
+
+        trainable = trainer._configure_trainable_parameters()
+        trainable_names = {
+            name for name, parameter in trainer.model.named_parameters()
+            if parameter.requires_grad
+        }
+
+        assert len(trainable) == 4
+        assert trainable_names == {
+            "event_decoder.onset_age.weight",
+            "event_decoder.onset_age.bias",
+            "event_decoder.offset_age.weight",
+            "event_decoder.offset_age.bias",
+        }
+
+    def test_freeze_for_free_run_onset_sequence_trains_only_onset_head(self, tmp_path):
+        TinyCorpusBuilderV2(tmp_path / "data").build()
+        trainer = SourceTrackingTrainerV2(
+            TrainingConfigV2(
+                data_root=str(tmp_path / "data"),
+                device="cpu",
+                batch_size=1,
+                freeze_for_free_run_onset_sequence=True,
+            )
+        )
+
+        trainable = trainer._configure_trainable_parameters()
+        trainable_names = {
+            name for name, parameter in trainer.model.named_parameters()
+            if parameter.requires_grad
+        }
+
+        assert len(trainable) == 2
+        assert trainable_names == {
+            "event_decoder.onset.weight",
+            "event_decoder.onset.bias",
+        }
+
+    def test_freeze_for_free_run_event_decoder_trains_only_decoder(self, tmp_path):
+        TinyCorpusBuilderV2(tmp_path / "data").build()
+        trainer = SourceTrackingTrainerV2(
+            TrainingConfigV2(
+                data_root=str(tmp_path / "data"),
+                device="cpu",
+                batch_size=1,
+                freeze_for_free_run_event_decoder=True,
+            )
+        )
+
+        trainer._configure_trainable_parameters()
+        trainable_names = {
+            name for name, parameter in trainer.model.named_parameters()
+            if parameter.requires_grad
+        }
+
+        assert trainable_names
+        assert all(name.startswith("event_decoder.") for name in trainable_names)
+
+    def test_first_pass_outputs_are_kept_only_for_auxiliary_losses(self, tmp_path):
+        TinyCorpusBuilderV2(tmp_path / "data").build()
+        base = SourceTrackingTrainerV2(
+            TrainingConfigV2(
+                data_root=str(tmp_path / "data"),
+                device="cpu",
+                batch_size=1,
+                first_pass_boundary_loss_weight=0.0,
+            )
+        )
+        auxiliary = SourceTrackingTrainerV2(
+            TrainingConfigV2(
+                data_root=str(tmp_path / "data"),
+                device="cpu",
+                batch_size=1,
+                first_pass_boundary_loss_weight=0.5,
+            )
+        )
+        free_run_sequence = SourceTrackingTrainerV2(
+            TrainingConfigV2(
+                data_root=str(tmp_path / "data"),
+                device="cpu",
+                batch_size=1,
+                free_run_onset_sequence_loss_weight=0.25,
+            )
+        )
+        distillation = SourceTrackingTrainerV2(
+            TrainingConfigV2(
+                data_root=str(tmp_path / "data"),
+                device="cpu",
+                batch_size=1,
+                first_pass_distillation_loss_weight=0.25,
+            )
+        )
+        event_age = SourceTrackingTrainerV2(
+            TrainingConfigV2(
+                data_root=str(tmp_path / "data"),
+                device="cpu",
+                batch_size=1,
+                first_pass_event_age_loss_weight=0.25,
+            )
+        )
+        batch = base._build_validation_batch("single_note_all", 0, 1)
+
+        assert "_first_pass_outputs" not in base._model_forward(
+            batch,
+            teacher_forcing_rate=0.0,
+        )
+        assert "_first_pass_outputs" in auxiliary._model_forward(
+            batch,
+            teacher_forcing_rate=0.0,
+        )
+        assert "_first_pass_outputs" in free_run_sequence._model_forward(
+            batch,
+            teacher_forcing_rate=0.0,
+        )
+        distillation_outputs = distillation._model_forward(
+            batch,
+            teacher_forcing_rate=0.0,
+        )
+        assert "_first_pass_outputs" in distillation_outputs
+        assert "_first_pass_teacher_outputs" in distillation_outputs
+        assert "_first_pass_outputs" in event_age._model_forward(
+            batch,
+            teacher_forcing_rate=0.0,
+        )
+
+    def test_label_radius_config_reaches_renderer(self, tmp_path):
+        TinyCorpusBuilderV2(tmp_path / "data").build()
+        trainer = SourceTrackingTrainerV2(
+            TrainingConfigV2(
+                data_root=str(tmp_path / "data"),
+                device="cpu",
+                onset_label_radius_frames=0,
+                offset_label_radius_frames=8,
+                boundary_negative_radius_frames=32,
+                onset_hard_negative_sample_prob=0.25,
+            )
+        )
+
+        assert trainer.renderer.config.onset_label_radius_frames == 0
+        assert trainer.renderer.config.offset_label_radius_frames == 8
+        assert trainer.renderer.config.boundary_negative_radius_frames == 32
+        assert trainer.renderer.config.onset_hard_negative_sample_prob == 0.25
+
+    def test_hard_negative_sampler_does_not_change_validation_batches(
+        self,
+        tmp_path,
+    ):
+        TinyCorpusBuilderV2(tmp_path / "data").build()
+        base = SourceTrackingTrainerV2(
+            TrainingConfigV2(
+                data_root=str(tmp_path / "data"),
+                device="cpu",
+                batch_size=4,
+                onset_hard_negative_sample_prob=0.0,
+            )
+        )
+        hard_negative = SourceTrackingTrainerV2(
+            TrainingConfigV2(
+                data_root=str(tmp_path / "data"),
+                device="cpu",
+                batch_size=4,
+                onset_hard_negative_sample_prob=0.25,
+            )
+        )
+
+        base_batch = base._build_validation_batch("single_note_all", 0, 4)
+        hard_negative_batch = hard_negative._build_validation_batch(
+            "single_note_all",
+            0,
+            4,
+        )
+
+        assert torch.equal(base_batch["onset"], hard_negative_batch["onset"])
+        assert torch.equal(
+            base_batch["context_onset"],
+            hard_negative_batch["context_onset"],
+        )
 
     def test_one_train_step_writes_metrics_and_checkpoint(self, tmp_path):
         TinyCorpusBuilderV2(tmp_path / "data").build()
@@ -151,6 +517,8 @@ class TestTrainSmokeV2:
         payload = SourceTrackingTrainerV2(config).run()
 
         assert payload["history"]
+        assert payload["history"][0]["metric_scope"] == "train_batch"
+        assert payload["history"][0]["split"] == "train"
         assert payload["artifacts"]["checkpoint_path"].endswith("checkpoint.pt")
         assert payload["artifacts"]["metrics_path"].endswith("metrics.json")
         assert list((tmp_path / "runs").glob("*/metrics.json"))
@@ -226,6 +594,250 @@ class TestTrainSmokeV2:
         assert payload["history"][0]["stage"] == "single_note_all"
         assert payload["config"]["anneal_noise_phase_jitter_samples"] == 12
         assert payload["config"]["anneal_noise_feature_std"] == 0.01
+
+    def test_validation_epoch_metrics_use_inference_style_validation(self, tmp_path):
+        TinyCorpusBuilderV2(tmp_path / "data").build()
+        config = TrainingConfigV2(
+            data_root=str(tmp_path / "data"),
+            run_root=str(tmp_path / "runs"),
+            calibration_examples=2,
+            batch_size=2,
+            epochs_per_stage=1,
+            stage_filter="single_note_all",
+            smoke_examples=0,
+            curriculum_scale=0.0002,
+            validation_examples_per_epoch=2,
+            validation_interval_epochs=1,
+            device="cpu",
+        )
+
+        payload = SourceTrackingTrainerV2(config).run()
+
+        validation = payload["history"][0]["validation"]
+        assert validation["metric_scope"] == "validation"
+        assert validation["metric_definition"] == "pointwise_inference_style_validation"
+        assert validation["split"] == "validation"
+        assert validation["event_teacher_forcing_rate"] == 0.0
+        assert validation["examples"] == 2
+        assert validation["metric_threshold"] == config.metric_activity_threshold
+        assert "onset_average_precision" in validation
+        assert "onset_best_f1" in validation
+        assert "onset_best_threshold" in validation
+
+    def test_validation_teacher_forcing_rate_can_be_overridden(self, tmp_path):
+        TinyCorpusBuilderV2(tmp_path / "data").build()
+        config = TrainingConfigV2(
+            data_root=str(tmp_path / "data"),
+            run_root=str(tmp_path / "runs"),
+            calibration_examples=2,
+            batch_size=2,
+            epochs_per_stage=1,
+            stage_filter="single_note_all",
+            smoke_examples=0,
+            curriculum_scale=0.0002,
+            validation_examples_per_epoch=2,
+            validation_interval_epochs=1,
+            validation_teacher_forcing_rate=0.25,
+            device="cpu",
+        )
+
+        payload = SourceTrackingTrainerV2(config).run()
+
+        validation = payload["history"][0]["validation"]
+        assert validation["event_teacher_forcing_rate"] == 0.25
+
+    def test_validation_split_can_use_train_for_diagnostics(self, tmp_path):
+        TinyCorpusBuilderV2(tmp_path / "data").build()
+        config = TrainingConfigV2(
+            data_root=str(tmp_path / "data"),
+            run_root=str(tmp_path / "runs"),
+            calibration_examples=2,
+            batch_size=2,
+            epochs_per_stage=1,
+            stage_filter="single_note_all",
+            smoke_examples=0,
+            curriculum_scale=0.0002,
+            validation_examples_per_epoch=2,
+            validation_interval_epochs=1,
+            validation_split="train",
+            device="cpu",
+        )
+
+        payload = SourceTrackingTrainerV2(config).run()
+
+        validation = payload["history"][0]["validation"]
+        assert validation["split"] == "train"
+
+    def test_validation_seeds_are_fixed_across_epochs(self):
+        trainer = object.__new__(SourceTrackingTrainerV2)
+        trainer.config = TrainingConfigV2(batch_size=4, seed=123, device="cpu")
+
+        first_epoch = trainer._validation_seeds(batch_idx=2, batch_size=3)
+        later_epoch = trainer._validation_seeds(batch_idx=2, batch_size=3)
+
+        assert first_epoch == later_epoch
+        assert first_epoch == [900_000_131, 900_000_132, 900_000_133]
+
+    def test_threshold_free_boundary_metrics(self):
+        metrics = SourceTrackingTrainerV2._threshold_free_boundary_metrics(
+            torch.tensor([0.9, 0.8, 0.7, 0.1]),
+            torch.tensor([1.0, 0.0, 1.0, 0.0]),
+            "onset",
+        )
+
+        assert metrics["onset_average_precision"] == pytest.approx(
+            (1.0 + 2.0 / 3.0) / 2.0
+        )
+        assert metrics["onset_best_f1"] == pytest.approx(0.8)
+        assert metrics["onset_best_precision"] == pytest.approx(2.0 / 3.0)
+        assert metrics["onset_best_recall"] == pytest.approx(1.0)
+        assert metrics["onset_best_threshold"] == pytest.approx(0.7)
+
+    def test_slot_invariant_boundary_metrics_ignore_source_slot_permutation(self):
+        scores = torch.tensor(
+            [
+                [0.1, 0.9],
+                [0.8, 0.2],
+                [0.2, 0.1],
+            ]
+        )
+        targets = torch.tensor(
+            [
+                [1.0, 0.0],
+                [0.0, 1.0],
+                [0.0, 0.0],
+            ]
+        )
+
+        per_slot = SourceTrackingTrainerV2._threshold_free_boundary_metrics(
+            scores.reshape(-1),
+            targets.reshape(-1),
+            "onset",
+        )
+        slot_invariant = SourceTrackingTrainerV2._slot_invariant_boundary_metrics(
+            scores,
+            targets,
+            "onset_slot_invariant",
+        )
+
+        assert per_slot["onset_average_precision"] < 1.0
+        assert slot_invariant["onset_slot_invariant_average_precision"] == pytest.approx(
+            1.0
+        )
+
+    def test_early_stopping_state_tracks_validation_metric_patience(self):
+        trainer = object.__new__(SourceTrackingTrainerV2)
+        trainer.config = TrainingConfigV2(
+            early_stopping_metric="onset_average_precision",
+            early_stopping_patience=2,
+            early_stopping_min_delta=0.01,
+            device="cpu",
+        )
+
+        assert trainer._early_stopping_state(
+            {"onset_average_precision": 0.2},
+            None,
+            0,
+        ) == (0.2, 0, True)
+        assert trainer._early_stopping_state(
+            {"onset_average_precision": 0.205},
+            0.2,
+            0,
+        ) == (0.2, 1, False)
+        assert trainer._should_stop_early(1) is False
+        assert trainer._should_stop_early(2) is True
+
+    def test_zero_teacher_forcing_uses_inference_style_first_pass(self):
+        class SpyModel:
+            def __init__(self):
+                self.calls = []
+
+            def __call__(self, frames, event_state=None):
+                self.calls.append(event_state)
+                batch, frames_count = frames.shape[:2]
+                sources = 2
+                logits = torch.full((batch, frames_count, sources), -10.0)
+                return {
+                    "onset_logits_sequence": logits,
+                    "offset_logits_sequence": logits,
+                }
+
+        trainer = object.__new__(SourceTrackingTrainerV2)
+        trainer.model = SpyModel()
+        trainer.config = TrainingConfigV2()
+        batch = {
+            "frames": torch.zeros(1, 4, 40),
+            "event_state": torch.ones(1, 4, 2, 5),
+        }
+
+        outputs = trainer._model_forward(batch, teacher_forcing_rate=0.0)
+
+        assert outputs["onset_logits_sequence"].shape == (1, 4, 2)
+        assert trainer.model.calls[0] is None
+        assert trainer.model.calls[1] is not batch["event_state"]
+
+    def test_predicted_event_age_can_override_generated_state(self):
+        trainer = object.__new__(SourceTrackingTrainerV2)
+        trainer.config = TrainingConfigV2(event_state_use_predicted_age=True)
+        true_state = torch.zeros(1, 3, 2, 5)
+        outputs = {
+            "onset_logits_sequence": torch.full((1, 3, 2), -10.0),
+            "offset_logits_sequence": torch.full((1, 3, 2), -10.0),
+            "onset_age_logits_sequence": torch.zeros(1, 3, 2),
+            "offset_age_logits_sequence": torch.full(
+                (1, 3, 2),
+                torch.logit(torch.tensor(0.25)),
+            ),
+        }
+
+        state = trainer._scheduled_event_state(
+            true_state,
+            outputs,
+            teacher_forcing_rate=0.0,
+        )
+
+        torch.testing.assert_close(state[..., 3], torch.full((1, 3, 2), 0.5))
+        torch.testing.assert_close(state[..., 4], torch.full((1, 3, 2), 0.25))
+
+    def test_event_state_corruption_is_training_only(self):
+        trainer = object.__new__(SourceTrackingTrainerV2)
+        trainer.config = TrainingConfigV2(
+            event_state_noise_std=0.0,
+            event_state_dropout_prob=1.0,
+        )
+        trainer.model = torch.nn.Linear(1, 1)
+        event_state = torch.ones(1, 2, 3, 5)
+
+        trainer.model.train()
+        corrupted = trainer._corrupt_event_state(event_state)
+        trainer.model.eval()
+        unchanged = trainer._corrupt_event_state(event_state)
+
+        assert torch.count_nonzero(corrupted) == 0
+        torch.testing.assert_close(unchanged, event_state)
+
+    def test_full_teacher_forcing_uses_truth_state_once(self):
+        class SpyModel:
+            def __init__(self):
+                self.calls = []
+
+            def __call__(self, frames, event_state=None):
+                self.calls.append(event_state)
+                return {
+                    "onset_logits_sequence": torch.zeros(1, 4, 2),
+                    "offset_logits_sequence": torch.zeros(1, 4, 2),
+                }
+
+        trainer = object.__new__(SourceTrackingTrainerV2)
+        trainer.model = SpyModel()
+        batch = {
+            "frames": torch.zeros(1, 4, 40),
+            "event_state": torch.ones(1, 4, 2, 5),
+        }
+
+        trainer._model_forward(batch, teacher_forcing_rate=1.0)
+
+        assert trainer.model.calls == [batch["event_state"]]
 
     def test_boundary_classification_metrics_aggregate_counts(self):
         first = {

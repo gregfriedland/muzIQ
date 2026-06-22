@@ -12,6 +12,8 @@ batch_size="1024"
 single_notes_per_family="24"
 melodies_per_instrument="1"
 max_melody_instruments="0"
+sequence_calibration_max_instruments="8"
+sequence_calibration_melodies_per_instrument="1"
 activity_threshold="0.35"
 onset_threshold="0.35"
 offset_threshold="0.35"
@@ -40,6 +42,12 @@ Options:
   --single-notes-per-family N       Validation/test single-note sample count. Default: 24.
   --melodies-per-instrument N       Validation/test melody sample count. Default: 1.
   --max-melody-instruments N        Cap melody instruments, 0 means all. Default: 0.
+  --sequence-calibration-max-instruments N
+                                   Cap validation instruments for continuous sequence
+                                   threshold calibration. Default: 8.
+  --sequence-calibration-melodies-per-instrument N
+                                   Validation melodies per instrument for continuous
+                                   sequence threshold calibration. Default: 1.
   --activity-threshold X            Activity threshold. Default: 0.35.
   --onset-threshold X               Fallback onset threshold. Default: 0.35.
   --offset-threshold X              Fallback offset threshold. Default: 0.35.
@@ -86,6 +94,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --max-melody-instruments)
       max_melody_instruments="$2"
+      shift 2
+      ;;
+    --sequence-calibration-max-instruments)
+      sequence_calibration_max_instruments="$2"
+      shift 2
+      ;;
+    --sequence-calibration-melodies-per-instrument)
+      sequence_calibration_melodies_per_instrument="$2"
       shift 2
       ;;
     --activity-threshold)
@@ -188,6 +204,55 @@ if [[ "$force" -eq 1 || ! -f "$calibration" || ! -f "$validation_metrics" ]]; th
     --calibration-output "$calibration"
 else
   echo "validation calibration already exists: $calibration"
+fi
+
+sequence_calibration_needed=1
+if [[ -f "$calibration" ]]; then
+  sequence_calibration_needed="$(
+    run_python - "$calibration" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+try:
+    calibration = json.loads(path.read_text(encoding="utf-8"))
+except Exception:
+    print(1)
+    raise SystemExit
+sequence = calibration.get("sequence")
+if isinstance(sequence, dict) and isinstance(sequence.get("global"), dict):
+    global_entry = sequence["global"]
+    onset = global_entry.get("onset")
+    offset = global_entry.get("offset")
+    if (
+        isinstance(onset, dict)
+        and "threshold" in onset
+        and isinstance(offset, dict)
+        and "threshold" in offset
+    ):
+        print(0)
+        raise SystemExit
+print(1)
+PY
+  )"
+fi
+
+if [[ "$force" -eq 1 || "$sequence_calibration_needed" -eq 1 ]]; then
+  run_python scripts/evaluate-boundary-timing-sequence.py \
+    --checkpoint "$checkpoint" \
+    --data-root "$data_root" \
+    --calibration-input "$calibration" \
+    --calibration-output "$calibration" \
+    --calibrate-sequence-thresholds \
+    --calibration-split validation \
+    --calibration-melodies-per-instrument "$sequence_calibration_melodies_per_instrument" \
+    --calibration-max-instruments "$sequence_calibration_max_instruments" \
+    --seconds 60 \
+    --device "$device" \
+    --sample-stride-ms 5
+else
+  echo "sequence calibration already exists in: $calibration"
 fi
 
 if [[ "$force" -eq 1 || ! -f "$test_metrics" ]]; then

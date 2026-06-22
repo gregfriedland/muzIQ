@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
+import math
 import queue
 import shutil
 import subprocess
@@ -164,10 +165,15 @@ class TrainingConfigV2:
     checkpoint_upload_uri: str | None = None
     checkpoint_upload_run_id: str | None = None
     checkpoint_interval_batches: int = 100
+    validation_examples_per_epoch: int = 0
+    validation_interval_epochs: int = 1
+    validation_teacher_forcing_rate: float = 0.0
+    validation_split: SplitName = "validation"
     resume_from_warm_start_metadata: bool = False
     resume_optimizer_state: bool = True
     training_slice_frames: int = 256
     training_slice_peak_warmup_frames: int = 512
+    input_novelty_features: str = "none"
     gpu_frame_extraction: bool = False
     pin_memory: bool = False
     prefetch_batches: int = 0
@@ -191,11 +197,30 @@ class TrainingConfigV2:
     boundary_f1_fn_weight: float = 1.0
     hard_boundary_negative_loss_weight: float = 0.0
     hard_boundary_negative_fraction: float = 0.1
+    onset_pairwise_ranking_loss_weight: float = 0.0
+    onset_pairwise_ranking_margin: float = 0.5
+    onset_pairwise_ranking_max_positives: int = 512
+    onset_pairwise_ranking_max_negatives: int = 2048
+    onset_softmax_loss_weight: float = 0.0
+    onset_sequence_loss_weight: float = 0.0
+    onset_sequence_pairwise_ranking_loss_weight: float = 0.0
     onset_peak_loss_weight: float = 0.25
     onset_event_recall_loss_weight: float = 1.0
     onset_false_peak_loss_weight: float = 0.5
     onset_peak_radius_frames: int = 2
     onset_false_peak_fraction: float = 0.02
+    first_pass_boundary_loss_weight: float = 0.0
+    free_run_onset_sequence_loss_weight: float = 0.0
+    free_run_onset_sequence_pairwise_ranking_loss_weight: float = 0.0
+    first_pass_distillation_loss_weight: float = 0.0
+    first_pass_sequence_distillation_loss_weight: float = 0.0
+    first_pass_distillation_offset_weight: float = 0.25
+    first_pass_event_age_loss_weight: float = 0.0
+    first_pass_event_age_offset_weight: float = 0.25
+    first_pass_event_age_recent_weight: float = 0.0
+    freeze_for_first_pass_event_age: bool = False
+    freeze_for_free_run_onset_sequence: bool = False
+    freeze_for_free_run_event_decoder: bool = False
     model_dim: int = 128
     model_heads: int = 4
     model_layers: int = 2
@@ -203,6 +228,12 @@ class TrainingConfigV2:
     event_decoder_heads: int = 4
     event_teacher_forcing_start: float = 0.9
     event_teacher_forcing_end: float = 0.25
+    event_state_onset_threshold: float = 0.5
+    event_state_offset_threshold: float = 0.5
+    event_state_soft_events: bool = False
+    event_state_use_predicted_age: bool = False
+    event_state_noise_std: float = 0.0
+    event_state_dropout_prob: float = 0.0
     identity_dim: int = 16
     frame_cache_examples_per_stage: int = 0
     frame_cache_build_batch_size: int = 512
@@ -211,6 +242,21 @@ class TrainingConfigV2:
     frame_phase_noise_std: float = 0.0
     anneal_noise_phase_jitter_samples: int = 0
     anneal_noise_feature_std: float = 0.0
+    onset_label_radius_frames: int = SourceTrackingAudioConfigV2.onset_label_radius_frames
+    offset_label_radius_frames: int = SourceTrackingAudioConfigV2.offset_label_radius_frames
+    boundary_negative_radius_frames: int = (
+        SourceTrackingAudioConfigV2.boundary_negative_radius_frames
+    )
+    onset_hard_negative_sample_prob: float = (
+        SourceTrackingAudioConfigV2.onset_hard_negative_sample_prob
+    )
+    early_stopping_metric: str = ""
+    early_stopping_patience: int = 0
+    early_stopping_min_delta: float = 0.0
+    learning_rate_scale: float = 1.0
+    learning_rate_decay: str = "none"
+    learning_rate_min_fraction: float = 1.0
+    learning_rate_decay_epochs: int = 0
 
 
 @dataclass(frozen=True)
@@ -229,10 +275,12 @@ class TrainingBatchBuilderV2:
         device: torch.device,
         frame_count: int = 256,
         pin_memory: bool = False,
+        input_novelty_features: str = "none",
     ):
         self.device = device
         self.frame_count = frame_count
         self.pin_memory = pin_memory and device.type == "cuda"
+        self.input_novelty_features = input_novelty_features
         extractor = AudioFrameExtractorV2()
         self.frame_window = torch.from_numpy(extractor._window).to(device)
         self.frame_fold = torch.from_numpy(extractor._fold.T).to(device)
@@ -322,7 +370,7 @@ class TrainingBatchBuilderV2:
         for idx, frame in enumerate(frames):
             clipped = frame[-self.frame_count :]
             padded[idx, -clipped.shape[0] :] = clipped
-        return self._to_device(padded)
+        return self._augment_frame_features(self._to_device(padded))
 
     def _build_frame_tensor_from_audio(self, slices) -> torch.Tensor:
         audio = np.stack([item["audio_context"] for item in slices]).astype(np.float32)
@@ -334,7 +382,27 @@ class TrainingBatchBuilderV2:
         )
         mag = torch.fft.rfft(windows * self.frame_window, dim=-1).abs()
         raw_bands = torch.matmul(mag.float(), self.frame_fold)
-        return self._normalize_bands(raw_bands)[:, -self.frame_count :, :]
+        frames = self._normalize_bands(raw_bands)[:, -self.frame_count :, :]
+        return self._augment_frame_features(frames)
+
+    @classmethod
+    def feature_dim(cls, input_novelty_features: str = "none") -> int:
+        if input_novelty_features == "none":
+            return SourceTrackingAudioConfigV2.bands
+        if input_novelty_features == "flux":
+            return SourceTrackingAudioConfigV2.bands * 2
+        raise ValueError(f"Unknown input_novelty_features={input_novelty_features!r}")
+
+    def _augment_frame_features(self, frames: torch.Tensor) -> torch.Tensor:
+        if self.input_novelty_features == "none":
+            return frames
+        if self.input_novelty_features != "flux":
+            raise ValueError(
+                f"Unknown input_novelty_features={self.input_novelty_features!r}"
+            )
+        previous = torch.cat([frames[:, :1, :], frames[:, :-1, :]], dim=1)
+        flux = torch.relu(frames - previous)
+        return torch.cat([frames, flux], dim=-1)
 
     def _to_device(self, array: np.ndarray) -> torch.Tensor:
         tensor = torch.from_numpy(array)
@@ -387,12 +455,17 @@ class CachedFramePoolV2:
         examples: int,
         frame_count: int,
         frame_dtype: str,
+        input_novelty_features: str = "none",
     ):
         dtype = np.float16 if frame_dtype == "float16" else np.float32
         if frame_dtype not in {"float16", "float32"}:
             raise ValueError("frame_cache_dtype must be float16 or float32")
         self.frames = np.empty(
-            (examples, frame_count, SourceTrackingAudioConfigV2.bands),
+            (
+                examples,
+                frame_count,
+                TrainingBatchBuilderV2.feature_dim(input_novelty_features),
+            ),
             dtype=dtype,
         )
         self.activity = np.empty(
@@ -651,11 +724,24 @@ class TrainingProgressLoggerV2:
 class TrainingRenderWorkerV2:
     """Render batch slices in worker processes with one renderer per process."""
 
-    _renderers: dict[tuple[str, bool], SourceTrackingRendererV2] = {}
+    _renderers: dict[tuple[str, bool, int, int, int, float], SourceTrackingRendererV2] = {}
 
     @staticmethod
     def render_slice(
-        task: tuple[str, str, SplitName, int, int, int, bool, int],
+        task: tuple[
+            str,
+            str,
+            SplitName,
+            int,
+            int,
+            int,
+            bool,
+            int,
+            int,
+            int,
+            int,
+            float,
+        ],
     ) -> dict[str, np.ndarray]:
         (
             data_root,
@@ -666,9 +752,18 @@ class TrainingRenderWorkerV2:
             peak_warmup_frames,
             gpu_frame_extraction,
             phase_offset_samples,
+            onset_label_radius_frames,
+            offset_label_radius_frames,
+            boundary_negative_radius_frames,
+            onset_hard_negative_sample_prob,
         ) = task
         renderer = TrainingRenderWorkerV2._renderer(
-            data_root, include_midi=stage == "midi_complex"
+            data_root,
+            include_midi=stage == "midi_complex",
+            onset_label_radius_frames=onset_label_radius_frames,
+            offset_label_radius_frames=offset_label_radius_frames,
+            boundary_negative_radius_frames=boundary_negative_radius_frames,
+            onset_hard_negative_sample_prob=onset_hard_negative_sample_prob,
         )
         if gpu_frame_extraction:
             return renderer.render_training_audio_slice(
@@ -689,16 +784,41 @@ class TrainingRenderWorkerV2:
         )
 
     @staticmethod
-    def _renderer(data_root: str, include_midi: bool) -> SourceTrackingRendererV2:
-        cache_key = (data_root, include_midi)
+    def _renderer(
+        data_root: str,
+        include_midi: bool,
+        onset_label_radius_frames: int,
+        offset_label_radius_frames: int,
+        boundary_negative_radius_frames: int,
+        onset_hard_negative_sample_prob: float,
+    ) -> SourceTrackingRendererV2:
+        cache_key = (
+            data_root,
+            include_midi,
+            onset_label_radius_frames,
+            offset_label_radius_frames,
+            boundary_negative_radius_frames,
+            onset_hard_negative_sample_prob,
+        )
         renderer = TrainingRenderWorkerV2._renderers.get(cache_key)
         if renderer is not None:
             return renderer
         nsynth = NsynthIndexV2(Path(data_root))
         midi_store = MidiScheduleStoreV2(MidiIndexV2(Path(data_root))) if include_midi else None
+        audio_config = type(
+            "TrainingAudioConfigV2",
+            (SourceTrackingAudioConfigV2,),
+            {
+                "onset_label_radius_frames": onset_label_radius_frames,
+                "offset_label_radius_frames": offset_label_radius_frames,
+                "boundary_negative_radius_frames": boundary_negative_radius_frames,
+                "onset_hard_negative_sample_prob": onset_hard_negative_sample_prob,
+            },
+        )
         renderer = SourceTrackingRendererV2(
             NsynthNoteStoreV2(nsynth),
             midi_store,
+            config=audio_config,
         )
         TrainingRenderWorkerV2._renderers[cache_key] = renderer
         return renderer
@@ -909,6 +1029,7 @@ class SourceTrackingTrainerV2:
         self.optimizer_resume_stage: str | None = None
         self.warm_start_load_report: dict[str, object] | None = None
         self.model_config = SourceTrackingModelConfigV2(
+            n_bands=TrainingBatchBuilderV2.feature_dim(config.input_novelty_features),
             model_dim=config.model_dim,
             heads=config.model_heads,
             layers=config.model_layers,
@@ -939,6 +1060,21 @@ class SourceTrackingTrainerV2:
                 config.hard_boundary_negative_loss_weight
             ),
             hard_boundary_negative_fraction=config.hard_boundary_negative_fraction,
+            onset_pairwise_ranking_loss_weight=(
+                config.onset_pairwise_ranking_loss_weight
+            ),
+            onset_pairwise_ranking_margin=config.onset_pairwise_ranking_margin,
+            onset_pairwise_ranking_max_positives=(
+                config.onset_pairwise_ranking_max_positives
+            ),
+            onset_pairwise_ranking_max_negatives=(
+                config.onset_pairwise_ranking_max_negatives
+            ),
+            onset_softmax_loss_weight=config.onset_softmax_loss_weight,
+            onset_sequence_loss_weight=config.onset_sequence_loss_weight,
+            onset_sequence_pairwise_ranking_loss_weight=(
+                config.onset_sequence_pairwise_ranking_loss_weight
+            ),
             onset_peak_loss_weight=config.onset_peak_loss_weight,
             onset_event_recall_loss_weight=config.onset_event_recall_loss_weight,
             onset_false_peak_loss_weight=config.onset_false_peak_loss_weight,
@@ -949,6 +1085,7 @@ class SourceTrackingTrainerV2:
             self.device,
             frame_count=config.training_slice_frames,
             pin_memory=config.pin_memory,
+            input_novelty_features=config.input_novelty_features,
         )
         self.progress = TrainingProgressLoggerV2(config.progress_interval_s)
         self.render_executor: ProcessPoolExecutor | None = None
@@ -972,6 +1109,13 @@ class SourceTrackingTrainerV2:
                 "epochs_per_stage": self.config.epochs_per_stage,
                 "checkpoint_upload_uri": self.config.checkpoint_upload_uri,
                 "checkpoint_interval_batches": self.config.checkpoint_interval_batches,
+                "validation_examples_per_epoch": (
+                    self.config.validation_examples_per_epoch
+                ),
+                "validation_interval_epochs": self.config.validation_interval_epochs,
+                "validation_teacher_forcing_rate": (
+                    self.config.validation_teacher_forcing_rate
+                ),
                 "resume_from_warm_start_metadata": (
                     self.config.resume_from_warm_start_metadata
                 ),
@@ -980,6 +1124,7 @@ class SourceTrackingTrainerV2:
                 "training_slice_peak_warmup_frames": (
                     self.config.training_slice_peak_warmup_frames
                 ),
+                "input_novelty_features": self.config.input_novelty_features,
                 "gpu_frame_extraction": self.config.gpu_frame_extraction,
                 "pin_memory": self.config.pin_memory,
                 "prefetch_batches": self.config.prefetch_batches,
@@ -998,8 +1143,46 @@ class SourceTrackingTrainerV2:
                     self.config.anneal_noise_phase_jitter_samples
                 ),
                 "anneal_noise_feature_std": self.config.anneal_noise_feature_std,
+                "onset_label_radius_frames": self.config.onset_label_radius_frames,
+                "offset_label_radius_frames": self.config.offset_label_radius_frames,
+                "boundary_negative_radius_frames": (
+                    self.config.boundary_negative_radius_frames
+                ),
+                "onset_hard_negative_sample_prob": (
+                    self.config.onset_hard_negative_sample_prob
+                ),
                 "event_teacher_forcing_start": self.config.event_teacher_forcing_start,
                 "event_teacher_forcing_end": self.config.event_teacher_forcing_end,
+                "event_state_onset_threshold": (
+                    self.config.event_state_onset_threshold
+                ),
+                "event_state_offset_threshold": (
+                    self.config.event_state_offset_threshold
+                ),
+                "event_state_soft_events": self.config.event_state_soft_events,
+                "event_state_use_predicted_age": (
+                    self.config.event_state_use_predicted_age
+                ),
+                "event_state_noise_std": self.config.event_state_noise_std,
+                "event_state_dropout_prob": self.config.event_state_dropout_prob,
+                "freeze_for_first_pass_event_age": (
+                    self.config.freeze_for_first_pass_event_age
+                ),
+                "freeze_for_free_run_onset_sequence": (
+                    self.config.freeze_for_free_run_onset_sequence
+                ),
+                "freeze_for_free_run_event_decoder": (
+                    self.config.freeze_for_free_run_event_decoder
+                ),
+                "early_stopping_metric": self.config.early_stopping_metric,
+                "early_stopping_patience": self.config.early_stopping_patience,
+                "early_stopping_min_delta": self.config.early_stopping_min_delta,
+                "learning_rate_scale": self.config.learning_rate_scale,
+                "learning_rate_decay": self.config.learning_rate_decay,
+                "learning_rate_min_fraction": (
+                    self.config.learning_rate_min_fraction
+                ),
+                "learning_rate_decay_epochs": self.config.learning_rate_decay_epochs,
                 "metric_activity_threshold": self.config.metric_activity_threshold,
                 "loss_weights": {
                     "activity_pos_weight": self.config.activity_pos_weight,
@@ -1025,6 +1208,27 @@ class SourceTrackingTrainerV2:
                     "hard_boundary_negative_fraction": (
                         self.config.hard_boundary_negative_fraction
                     ),
+                    "onset_pairwise_ranking_loss_weight": (
+                        self.config.onset_pairwise_ranking_loss_weight
+                    ),
+                    "onset_pairwise_ranking_margin": (
+                        self.config.onset_pairwise_ranking_margin
+                    ),
+                    "onset_pairwise_ranking_max_positives": (
+                        self.config.onset_pairwise_ranking_max_positives
+                    ),
+                    "onset_pairwise_ranking_max_negatives": (
+                        self.config.onset_pairwise_ranking_max_negatives
+                    ),
+                    "onset_softmax_loss_weight": (
+                        self.config.onset_softmax_loss_weight
+                    ),
+                    "onset_sequence_loss_weight": (
+                        self.config.onset_sequence_loss_weight
+                    ),
+                    "onset_sequence_pairwise_ranking_loss_weight": (
+                        self.config.onset_sequence_pairwise_ranking_loss_weight
+                    ),
                     "onset_peak_loss_weight": self.config.onset_peak_loss_weight,
                     "onset_event_recall_loss_weight": (
                         self.config.onset_event_recall_loss_weight
@@ -1034,6 +1238,33 @@ class SourceTrackingTrainerV2:
                     ),
                     "onset_peak_radius_frames": self.config.onset_peak_radius_frames,
                     "onset_false_peak_fraction": self.config.onset_false_peak_fraction,
+                    "first_pass_boundary_loss_weight": (
+                        self.config.first_pass_boundary_loss_weight
+                    ),
+                    "free_run_onset_sequence_loss_weight": (
+                        self.config.free_run_onset_sequence_loss_weight
+                    ),
+                    "free_run_onset_sequence_pairwise_ranking_loss_weight": (
+                        self.config.free_run_onset_sequence_pairwise_ranking_loss_weight
+                    ),
+                    "first_pass_distillation_loss_weight": (
+                        self.config.first_pass_distillation_loss_weight
+                    ),
+                    "first_pass_sequence_distillation_loss_weight": (
+                        self.config.first_pass_sequence_distillation_loss_weight
+                    ),
+                    "first_pass_distillation_offset_weight": (
+                        self.config.first_pass_distillation_offset_weight
+                    ),
+                    "first_pass_event_age_loss_weight": (
+                        self.config.first_pass_event_age_loss_weight
+                    ),
+                    "first_pass_event_age_offset_weight": (
+                        self.config.first_pass_event_age_offset_weight
+                    ),
+                    "first_pass_event_age_recent_weight": (
+                        self.config.first_pass_event_age_recent_weight
+                    ),
                 },
                 "model_config": asdict(self.model_config),
                 "warm_start_load_report": self.warm_start_load_report,
@@ -1291,7 +1522,10 @@ class SourceTrackingTrainerV2:
             self._shutdown_render_executor()
         else:
             self._start_render_executor(stage.name)
-        optimizer = torch.optim.AdamW(self.model.parameters(), lr=stage.learning_rate)
+        optimizer = torch.optim.AdamW(
+            self._configure_trainable_parameters(),
+            lr=stage.learning_rate,
+        )
         self._restore_optimizer_state_if_needed(optimizer, stage.name)
         self.current_optimizer = optimizer
         rows = []
@@ -1311,11 +1545,16 @@ class SourceTrackingTrainerV2:
             force=True,
         )
         self._emit_memory_usage("memory_usage", stage=stage.name, phase="stage_start")
+        best_validation_metric: float | None = None
+        best_validation_epoch: int | None = None
+        stale_validation_events = 0
+        use_free_run_sequence_loss = self._uses_free_run_onset_sequence_loss()
         try:
             for epoch in range(first_epoch - 1, stage.epochs):
                 losses = []
                 batch_metrics = []
                 epoch_start = time.monotonic()
+                should_stop_after_checkpoint = False
                 batch_start = first_batch if epoch == first_epoch - 1 else 0
                 batch_iter = (
                     self._iter_cached_frame_batches(
@@ -1335,6 +1574,13 @@ class SourceTrackingTrainerV2:
                     )
                 )
                 for batch_idx, batch, batch_timing in batch_iter:
+                    learning_rate = self._learning_rate_for_step(
+                        stage,
+                        epoch,
+                        batch_idx,
+                        batches_per_epoch,
+                    )
+                    self._set_optimizer_learning_rate(optimizer, learning_rate)
                     compute_start = time.perf_counter()
                     with self._autocast_context():
                         teacher_forcing_rate = self._event_teacher_forcing_rate(
@@ -1346,6 +1592,70 @@ class SourceTrackingTrainerV2:
                             teacher_forcing_rate=teacher_forcing_rate,
                         )
                         loss = self.loss_fn(outputs, batch)
+                        first_pass_outputs = outputs.get("_first_pass_outputs")
+                        if (
+                            first_pass_outputs is not None
+                            and self.config.first_pass_boundary_loss_weight > 0.0
+                        ):
+                            loss = loss + (
+                                self.config.first_pass_boundary_loss_weight
+                                * self.loss_fn.first_pass_boundary_loss(
+                                    first_pass_outputs,
+                                    batch,
+                                )
+                            )
+                        if (
+                            first_pass_outputs is not None
+                            and use_free_run_sequence_loss
+                        ):
+                            loss = loss + self.loss_fn.onset_sequence_only_loss(
+                                first_pass_outputs,
+                                batch,
+                                sequence_loss_weight=(
+                                    self.config.free_run_onset_sequence_loss_weight
+                                ),
+                                sequence_pairwise_ranking_loss_weight=(
+                                    self.config.free_run_onset_sequence_pairwise_ranking_loss_weight
+                                ),
+                            )
+                        first_pass_teacher_outputs = outputs.get(
+                            "_first_pass_teacher_outputs"
+                        )
+                        if (
+                            first_pass_outputs is not None
+                            and first_pass_teacher_outputs is not None
+                            and self._uses_first_pass_distillation_loss()
+                        ):
+                            loss = loss + self.loss_fn.first_pass_distillation_loss(
+                                first_pass_outputs,
+                                first_pass_teacher_outputs,
+                                final_weight=(
+                                    self.config.first_pass_distillation_loss_weight
+                                ),
+                                sequence_weight=(
+                                    self.config.first_pass_sequence_distillation_loss_weight
+                                ),
+                                offset_weight=(
+                                    self.config.first_pass_distillation_offset_weight
+                                ),
+                            )
+                        if (
+                            first_pass_outputs is not None
+                            and self.config.first_pass_event_age_loss_weight > 0.0
+                        ):
+                            loss = loss + (
+                                self.config.first_pass_event_age_loss_weight
+                                * self.loss_fn.event_age_loss(
+                                    first_pass_outputs,
+                                    batch,
+                                    offset_weight=(
+                                        self.config.first_pass_event_age_offset_weight
+                                    ),
+                                    recent_weight=(
+                                        self.config.first_pass_event_age_recent_weight
+                                    ),
+                                )
+                            )
                     batch_metrics.append(self._batch_metrics(outputs, batch))
                     optimizer.zero_grad(set_to_none=True)
                     loss.backward()
@@ -1362,6 +1672,7 @@ class SourceTrackingTrainerV2:
                             "batches_per_epoch": batches_per_epoch,
                             "last_loss": round(loss_value, 6),
                             "mean_loss": round(float(np.mean(losses)), 6),
+                            "learning_rate": learning_rate,
                             "event_teacher_forcing_rate": round(
                                 teacher_forcing_rate,
                                 6,
@@ -1399,6 +1710,21 @@ class SourceTrackingTrainerV2:
                 row = {
                     "stage": stage.name,
                     "epoch": epoch + 1,
+                    "split": "train",
+                    "metric_scope": "train_batch",
+                    "metric_definition": (
+                        "pointwise_training_batch_scheduled_sampling"
+                    ),
+                    "event_teacher_forcing_rate": round(
+                        self._event_teacher_forcing_rate(epoch, stage.epochs),
+                        6,
+                    ),
+                    "learning_rate": self._learning_rate_for_step(
+                        stage,
+                        epoch,
+                        max(0, batches_per_epoch - 1),
+                        batches_per_epoch,
+                    ),
                     "loss": float(np.mean(losses)),
                     "examples": max(
                         0,
@@ -1409,6 +1735,27 @@ class SourceTrackingTrainerV2:
                     **self._mean_batch_metrics(batch_metrics),
                 }
                 self.progress.emit("training_epoch_done", row, force=True)
+                if self._should_run_validation_epoch(epoch, stage.epochs):
+                    validation_row = self._validation_epoch_metrics(
+                        stage.name,
+                        epoch,
+                    )
+                    row["validation"] = validation_row
+                    early_stop_state = self._early_stopping_state(
+                        validation_row,
+                        best_validation_metric,
+                        stale_validation_events,
+                    )
+                    if early_stop_state is not None:
+                        (
+                            best_validation_metric,
+                            stale_validation_events,
+                            improved,
+                        ) = early_stop_state
+                        if improved:
+                            best_validation_epoch = epoch + 1
+                        elif self._should_stop_early(stale_validation_events):
+                            should_stop_after_checkpoint = True
                 self._emit_memory_usage(
                     "memory_usage",
                     stage=stage.name,
@@ -1430,10 +1777,213 @@ class SourceTrackingTrainerV2:
                     force=True,
                 )
                 rows.append(row)
+                if should_stop_after_checkpoint:
+                    self.progress.emit(
+                        "early_stopping",
+                        {
+                            "stage": stage.name,
+                            "epoch": epoch + 1,
+                            "metric": self.config.early_stopping_metric,
+                            "best_epoch": best_validation_epoch,
+                            "best_metric": best_validation_metric,
+                            "stale_validation_events": stale_validation_events,
+                            "patience": self.config.early_stopping_patience,
+                            "patience_unit": "validation_events",
+                        },
+                        force=True,
+                    )
+                    break
             return rows
         finally:
             self._shutdown_render_executor()
             self._emit_memory_usage("memory_usage", stage=stage.name, phase="stage_done")
+
+    def _early_stopping_state(
+        self,
+        validation_row: dict[str, object],
+        best_metric: float | None,
+        stale_events: int,
+    ) -> tuple[float, int, bool] | None:
+        if self.config.early_stopping_patience <= 0:
+            return None
+        metric_name = self.config.early_stopping_metric
+        if not metric_name:
+            return None
+        metric = validation_row.get(metric_name)
+        try:
+            metric_value = float(metric)
+        except (TypeError, ValueError):
+            return None
+        if not np.isfinite(metric_value):
+            return None
+        if (
+            best_metric is None
+            or metric_value > best_metric + self.config.early_stopping_min_delta
+        ):
+            return metric_value, 0, True
+        return best_metric, stale_events + 1, False
+
+    def _should_stop_early(self, stale_validation_events: int) -> bool:
+        return (
+            self.config.early_stopping_patience > 0
+            and stale_validation_events >= self.config.early_stopping_patience
+        )
+
+    def _should_run_validation_epoch(self, epoch: int, stage_epochs: int) -> bool:
+        if self.config.validation_examples_per_epoch <= 0:
+            return False
+        interval = max(1, self.config.validation_interval_epochs)
+        return (epoch + 1) % interval == 0 or epoch + 1 == stage_epochs
+
+    def _validation_epoch_metrics(
+        self,
+        stage_name: str,
+        epoch: int,
+    ) -> dict[str, object]:
+        examples = max(1, self.config.validation_examples_per_epoch)
+        batches = max(1, int(np.ceil(examples / self.config.batch_size)))
+        losses = []
+        batch_metrics = []
+        boundary_scores: dict[str, list[torch.Tensor]] = {"onset": [], "offset": []}
+        boundary_targets: dict[str, list[torch.Tensor]] = {"onset": [], "offset": []}
+        sequence_scores: dict[str, list[torch.Tensor]] = {"onset": []}
+        sequence_targets: dict[str, list[torch.Tensor]] = {"onset": []}
+        age_scores: dict[str, list[torch.Tensor]] = {"onset": [], "offset": []}
+        age_targets: dict[str, list[torch.Tensor]] = {"onset": [], "offset": []}
+        validation_start = time.monotonic()
+        was_training = self.model.training
+        self.model.eval()
+        try:
+            with torch.inference_mode():
+                for batch_idx in range(batches):
+                    batch_size = min(
+                        self.config.batch_size,
+                        examples - batch_idx * self.config.batch_size,
+                    )
+                    batch = self._build_validation_batch(
+                        stage_name,
+                        batch_idx,
+                        batch_size,
+                    )
+                    with self._autocast_context():
+                        outputs = self._model_forward(
+                            batch,
+                            teacher_forcing_rate=(
+                                self.config.validation_teacher_forcing_rate
+                            ),
+                        )
+                        loss = self.loss_fn(outputs, batch)
+                    losses.append(float(loss.detach().cpu()))
+                    batch_metrics.append(self._batch_metrics(outputs, batch))
+                    for prefix in ("onset", "offset"):
+                        boundary_scores[prefix].append(
+                            torch.sigmoid(outputs[f"{prefix}_logits"])
+                            .detach()
+                            .float()
+                            .cpu()
+                        )
+                        boundary_targets[prefix].append(
+                            (batch[prefix] > 0.5).detach().float().cpu()
+                        )
+                    onset_sequence = outputs.get("onset_logits_sequence")
+                    if onset_sequence is not None:
+                        sequence_scores["onset"].append(
+                            torch.sigmoid(onset_sequence)
+                            .detach()
+                            .float()
+                            .cpu()
+                        )
+                        sequence_targets["onset"].append(
+                            (batch["context_onset"] > 0.5)
+                            .detach()
+                            .float()
+                            .cpu()
+                        )
+                    if self._uses_first_pass_age_metrics():
+                        with self._autocast_context():
+                            first_pass = self.model(batch["frames"])
+                        for prefix, channel in (("onset", 3), ("offset", 4)):
+                            age_logits = first_pass.get(f"{prefix}_age_logits_sequence")
+                            if age_logits is None:
+                                continue
+                            age_scores[prefix].append(
+                                torch.sigmoid(age_logits).detach().float().cpu()
+                            )
+                            age_targets[prefix].append(
+                                batch["event_state"][..., channel]
+                                .detach()
+                                .float()
+                                .cpu()
+                            )
+        finally:
+            if was_training:
+                self.model.train()
+        threshold_free_metrics = {}
+        for prefix in ("onset", "offset"):
+            if boundary_scores[prefix]:
+                scores = torch.cat(boundary_scores[prefix])
+                targets = torch.cat(boundary_targets[prefix])
+                threshold_free_metrics.update(
+                    self._threshold_free_boundary_metrics(
+                        scores.reshape(-1),
+                        targets.reshape(-1),
+                        prefix,
+                    )
+                )
+                threshold_free_metrics.update(
+                    self._slot_invariant_boundary_metrics(
+                        scores,
+                        targets,
+                        f"{prefix}_slot_invariant",
+                    )
+                )
+        if sequence_scores["onset"]:
+            scores = torch.cat(sequence_scores["onset"])
+            targets = torch.cat(sequence_targets["onset"])
+            threshold_free_metrics.update(
+                self._threshold_free_boundary_metrics(
+                    scores.reshape(-1),
+                    targets.reshape(-1),
+                    "onset_sequence",
+                )
+            )
+            threshold_free_metrics.update(
+                self._slot_invariant_boundary_metrics(
+                    scores,
+                    targets,
+                    "onset_sequence_slot_invariant",
+                )
+            )
+        for prefix in ("onset", "offset"):
+            if age_scores[prefix]:
+                scores = torch.cat(age_scores[prefix])
+                targets = torch.cat(age_targets[prefix])
+                threshold_free_metrics.update(
+                    self._age_regression_metrics(
+                        scores,
+                        targets,
+                        f"first_pass_{prefix}_age",
+                    )
+                )
+        row: dict[str, object] = {
+            "stage": stage_name,
+            "epoch": epoch + 1,
+            "split": self.config.validation_split,
+            "metric_scope": "validation",
+            "metric_definition": "pointwise_inference_style_validation",
+            "event_teacher_forcing_rate": round(
+                self.config.validation_teacher_forcing_rate,
+                6,
+            ),
+            "metric_threshold": self.config.metric_activity_threshold,
+            "loss": float(np.mean(losses)),
+            "examples": examples,
+            "elapsed_s": round(time.monotonic() - validation_start, 3),
+            **self._mean_batch_metrics(batch_metrics),
+            **threshold_free_metrics,
+        }
+        self.progress.emit("validation_epoch_done", row, force=True)
+        return row
 
     def _model_forward(
         self,
@@ -1445,15 +1995,61 @@ class SourceTrackingTrainerV2:
         if event_state is None:
             return self.model(batch["frames"])
         if teacher_forcing_rate >= 0.999:
-            return self.model(batch["frames"], event_state=event_state)
-        with torch.no_grad():
-            first = self.model(batch["frames"], event_state=event_state)
-            sampled_state = self._scheduled_event_state(
-                event_state,
-                first,
-                teacher_forcing_rate,
+            return self.model(
+                batch["frames"],
+                event_state=self._corrupt_event_state(event_state),
             )
-        return self.model(batch["frames"], event_state=sampled_state)
+        first = self.model(batch["frames"])
+        sampled_state = self._scheduled_event_state(
+            event_state,
+            first,
+            teacher_forcing_rate,
+        )
+        outputs = self.model(batch["frames"], event_state=sampled_state)
+        if (
+            torch.is_grad_enabled()
+            and self._uses_first_pass_auxiliary_outputs()
+        ):
+            outputs["_first_pass_outputs"] = first
+            if self._uses_first_pass_distillation_loss():
+                was_training = self.model.training
+                self.model.eval()
+                try:
+                    with torch.no_grad():
+                        outputs["_first_pass_teacher_outputs"] = self.model(
+                            batch["frames"],
+                            event_state=event_state,
+                        )
+                finally:
+                    if was_training:
+                        self.model.train()
+        return outputs
+
+    def _uses_first_pass_auxiliary_outputs(self) -> bool:
+        return (
+            self.config.first_pass_boundary_loss_weight > 0.0
+            or self._uses_free_run_onset_sequence_loss()
+            or self._uses_first_pass_distillation_loss()
+            or self.config.first_pass_event_age_loss_weight > 0.0
+        )
+
+    def _uses_free_run_onset_sequence_loss(self) -> bool:
+        return (
+            self.config.free_run_onset_sequence_loss_weight > 0.0
+            or self.config.free_run_onset_sequence_pairwise_ranking_loss_weight > 0.0
+        )
+
+    def _uses_first_pass_distillation_loss(self) -> bool:
+        return (
+            self.config.first_pass_distillation_loss_weight > 0.0
+            or self.config.first_pass_sequence_distillation_loss_weight > 0.0
+        )
+
+    def _uses_first_pass_age_metrics(self) -> bool:
+        return (
+            self.config.first_pass_event_age_loss_weight > 0.0
+            or self.config.event_state_use_predicted_age
+        )
 
     def _event_teacher_forcing_rate(self, epoch: int, epochs: int) -> float:
         start = min(1.0, max(0.0, self.config.event_teacher_forcing_start))
@@ -1463,8 +2059,80 @@ class SourceTrackingTrainerV2:
         progress = min(1.0, max(0.0, epoch / float(epochs - 1)))
         return start + (end - start) * progress
 
+    def _learning_rate_for_step(
+        self,
+        stage: CurriculumStageV2,
+        epoch: int,
+        batch_idx: int,
+        batches_per_epoch: int,
+    ) -> float:
+        scale = max(0.0, float(self.config.learning_rate_scale))
+        if self.config.learning_rate_decay == "none":
+            return stage.learning_rate * scale
+        if self.config.learning_rate_decay != "cosine":
+            raise ValueError(
+                f"unsupported learning rate decay: {self.config.learning_rate_decay}"
+            )
+        decay_epochs = (
+            self.config.learning_rate_decay_epochs
+            if self.config.learning_rate_decay_epochs > 0
+            else stage.epochs
+        )
+        total_steps = max(1, decay_epochs * batches_per_epoch - 1)
+        step = min(total_steps, max(0, epoch * batches_per_epoch + batch_idx))
+        progress = step / float(total_steps)
+        min_fraction = min(1.0, max(0.0, self.config.learning_rate_min_fraction))
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return (
+            stage.learning_rate
+            * scale
+            * (min_fraction + (1.0 - min_fraction) * cosine)
+        )
+
     @staticmethod
+    def _set_optimizer_learning_rate(
+        optimizer: torch.optim.Optimizer,
+        learning_rate: float,
+    ) -> None:
+        for group in optimizer.param_groups:
+            group["lr"] = learning_rate
+
+    def _configure_trainable_parameters(self) -> list[torch.nn.Parameter]:
+        if not (
+            self.config.freeze_for_first_pass_event_age
+            or self.config.freeze_for_free_run_onset_sequence
+            or self.config.freeze_for_free_run_event_decoder
+        ):
+            for parameter in self.model.parameters():
+                parameter.requires_grad = True
+            return list(self.model.parameters())
+
+        for parameter in self.model.parameters():
+            parameter.requires_grad = False
+
+        trainable_parameters: list[torch.nn.Parameter] = []
+        trainable_modules = []
+        if self.config.freeze_for_first_pass_event_age:
+            trainable_modules.extend(
+                [
+                    self.model.event_decoder.onset_age,
+                    self.model.event_decoder.offset_age,
+                ]
+            )
+        if self.config.freeze_for_free_run_onset_sequence:
+            trainable_modules.append(self.model.event_decoder.onset)
+        if self.config.freeze_for_free_run_event_decoder:
+            trainable_modules.append(self.model.event_decoder)
+        for module in trainable_modules:
+            for parameter in module.parameters():
+                parameter.requires_grad = True
+                trainable_parameters.append(parameter)
+        if not trainable_parameters:
+            raise RuntimeError("no frozen-mode parameters are trainable")
+        return trainable_parameters
+
     def _scheduled_event_state(
+        self,
         true_state: torch.Tensor,
         outputs: dict[str, torch.Tensor],
         teacher_forcing_rate: float,
@@ -1474,10 +2142,20 @@ class SourceTrackingTrainerV2:
         if onset is None or offset is None:
             return true_state
         predicted = SourceTrackingEventStateBuilderV2.from_logits(
-            onset,
-            offset,
+            onset.detach(),
+            offset.detach(),
+            onset_threshold=self.config.event_state_onset_threshold,
+            offset_threshold=self.config.event_state_offset_threshold,
+            soft_events=self.config.event_state_soft_events,
             event_state_dim=true_state.shape[-1],
         )
+        if self.config.event_state_use_predicted_age and true_state.shape[-1] > 3:
+            onset_age = outputs.get("onset_age_logits_sequence")
+            if onset_age is not None:
+                predicted[..., 3] = torch.sigmoid(onset_age.detach())
+            offset_age = outputs.get("offset_age_logits_sequence")
+            if offset_age is not None and true_state.shape[-1] > 4:
+                predicted[..., 4] = torch.sigmoid(offset_age.detach())
         keep_true = (
             torch.rand(
                 true_state.shape[:-1],
@@ -1486,7 +2164,38 @@ class SourceTrackingTrainerV2:
             )
             < teacher_forcing_rate
         ).unsqueeze(-1)
-        return torch.where(keep_true, true_state, predicted)
+        return self._corrupt_event_state(torch.where(keep_true, true_state, predicted))
+
+    def _corrupt_event_state(self, event_state: torch.Tensor) -> torch.Tensor:
+        if not getattr(self.model, "training", False):
+            return event_state
+        noise_std = max(0.0, float(self.config.event_state_noise_std))
+        dropout_prob = min(1.0, max(0.0, float(self.config.event_state_dropout_prob)))
+        if noise_std <= 0.0 and dropout_prob <= 0.0:
+            return event_state
+        corrupted = event_state
+        if noise_std > 0.0:
+            corrupted = corrupted + torch.randn_like(corrupted) * noise_std
+        if dropout_prob > 0.0:
+            keep = torch.rand_like(corrupted) >= dropout_prob
+            corrupted = corrupted * keep.to(dtype=corrupted.dtype)
+        return torch.clamp(corrupted, 0.0, 1.0)
+
+    def _build_validation_batch(
+        self,
+        stage_name: str,
+        batch_idx: int,
+        batch_size: int,
+    ) -> dict[str, torch.Tensor]:
+        seeds = self._validation_seeds(batch_idx, batch_size)
+        return self.batch_builder.build_slices(
+            self._render_slices(
+                self._base_stage_for_training(stage_name),
+                self.config.validation_split,
+                seeds,
+                phase_jitter_samples=0,
+            )
+        )
 
     def _iter_training_batches(
         self,
@@ -1631,6 +2340,7 @@ class SourceTrackingTrainerV2:
             examples,
             self.config.training_slice_frames,
             self.config.frame_cache_dtype,
+            input_novelty_features=self.config.input_novelty_features,
         )
         build_batch_size = max(1, self.config.frame_cache_build_batch_size)
         self.progress.emit(
@@ -1703,6 +2413,19 @@ class SourceTrackingTrainerV2:
             + batch_idx * self.config.batch_size
             + row
             for row in range(self.config.batch_size)
+        ]
+
+    def _validation_seeds(
+        self,
+        batch_idx: int,
+        batch_size: int,
+    ) -> list[int]:
+        return [
+            self.config.seed
+            + 900_000_000
+            + batch_idx * self.config.batch_size
+            + row
+            for row in range(batch_size)
         ]
 
     def _filter_stages(
@@ -1858,6 +2581,96 @@ class SourceTrackingTrainerV2:
             f"{prefix}_target_negative_count": float((~target_positive).sum().cpu()),
             f"{prefix}_predicted_positive_count": float(predicted_positive.sum().cpu()),
         }
+
+    @staticmethod
+    def _threshold_free_boundary_metrics(
+        scores: torch.Tensor,
+        target: torch.Tensor,
+        prefix: str,
+    ) -> dict[str, float | None]:
+        scores = scores.detach().flatten().float().cpu()
+        target_positive = target.detach().flatten().float().cpu() > 0.5
+        positive_count = int(target_positive.sum().item())
+        if positive_count == 0 or scores.numel() == 0:
+            return {
+                f"{prefix}_average_precision": None,
+                f"{prefix}_best_f1": None,
+                f"{prefix}_best_precision": None,
+                f"{prefix}_best_recall": None,
+                f"{prefix}_best_threshold": None,
+            }
+
+        order = torch.argsort(scores, descending=True)
+        sorted_scores = scores[order]
+        sorted_targets = target_positive[order]
+        cumulative_true_positive = sorted_targets.cumsum(dim=0).float()
+        rank = torch.arange(
+            1,
+            sorted_targets.numel() + 1,
+            dtype=torch.float32,
+            device=sorted_targets.device,
+        )
+        precision_at_rank = cumulative_true_positive / rank
+        average_precision = (
+            precision_at_rank[sorted_targets].sum() / float(positive_count)
+        )
+
+        distinct_score_end = torch.ones_like(sorted_targets, dtype=torch.bool)
+        distinct_score_end[:-1] = sorted_scores[:-1] != sorted_scores[1:]
+        cutoff_indices = torch.nonzero(distinct_score_end, as_tuple=False).flatten()
+        true_positive_at_cutoff = cumulative_true_positive[cutoff_indices]
+        predicted_positive_at_cutoff = cutoff_indices.float() + 1.0
+        precision = true_positive_at_cutoff / predicted_positive_at_cutoff
+        recall = true_positive_at_cutoff / float(positive_count)
+        denominator = precision + recall
+        f1 = torch.where(
+            denominator > 0,
+            2.0 * precision * recall / denominator,
+            torch.zeros_like(denominator),
+        )
+        best_index = int(torch.argmax(f1).item())
+        best_cutoff = int(cutoff_indices[best_index].item())
+        return {
+            f"{prefix}_average_precision": float(average_precision.item()),
+            f"{prefix}_best_f1": float(f1[best_index].item()),
+            f"{prefix}_best_precision": float(precision[best_index].item()),
+            f"{prefix}_best_recall": float(recall[best_index].item()),
+            f"{prefix}_best_threshold": float(sorted_scores[best_cutoff].item()),
+        }
+
+    @staticmethod
+    def _age_regression_metrics(
+        scores: torch.Tensor,
+        target: torch.Tensor,
+        prefix: str,
+    ) -> dict[str, float]:
+        scores = scores.detach().flatten().float().cpu()
+        target = target.detach().flatten().float().cpu()
+        delta = scores - target
+        return {
+            f"{prefix}_mae": float(delta.abs().mean().item()),
+            f"{prefix}_rmse": float(torch.sqrt((delta * delta).mean()).item()),
+        }
+
+    @staticmethod
+    def _slot_invariant_boundary_metrics(
+        scores: torch.Tensor,
+        target: torch.Tensor,
+        prefix: str,
+    ) -> dict[str, float | None]:
+        if scores.ndim < 2:
+            return SourceTrackingTrainerV2._threshold_free_boundary_metrics(
+                scores,
+                target,
+                prefix,
+            )
+        slot_scores = scores.detach().float().cpu().amax(dim=-1)
+        slot_target = (target.detach().float().cpu() > 0.5).any(dim=-1).float()
+        return SourceTrackingTrainerV2._threshold_free_boundary_metrics(
+            slot_scores.reshape(-1),
+            slot_target.reshape(-1),
+            prefix,
+        )
 
     @staticmethod
     def _mean_batch_metrics(rows: list[dict[str, float]]) -> dict[str, float | None]:
@@ -2158,6 +2971,10 @@ class SourceTrackingTrainerV2:
                 self.config.training_slice_peak_warmup_frames,
                 use_gpu_frame_extraction,
                 phase_offset,
+                self.config.onset_label_radius_frames,
+                self.config.offset_label_radius_frames,
+                self.config.boundary_negative_radius_frames,
+                self.config.onset_hard_negative_sample_prob,
             )
             for seed, phase_offset in zip(seeds, phase_offsets, strict=True)
         ]
@@ -2220,7 +3037,21 @@ class SourceTrackingTrainerV2:
             if include_midi
             else None
         )
-        return SourceTrackingRendererV2(note_store, midi_store)
+        audio_config = type(
+            "TrainingAudioConfigV2",
+            (SourceTrackingAudioConfigV2,),
+            {
+                "onset_label_radius_frames": self.config.onset_label_radius_frames,
+                "offset_label_radius_frames": self.config.offset_label_radius_frames,
+                "boundary_negative_radius_frames": (
+                    self.config.boundary_negative_radius_frames
+                ),
+                "onset_hard_negative_sample_prob": (
+                    self.config.onset_hard_negative_sample_prob
+                ),
+            },
+        )
+        return SourceTrackingRendererV2(note_store, midi_store, config=audio_config)
 
     def _resume_cursor(
         self, stages: tuple[CurriculumStageV2, ...]
@@ -2333,16 +3164,34 @@ class SourceTrackingTrainerV2:
 
     def _load_partial_state_dict(self, state_dict: dict[str, torch.Tensor]) -> None:
         model_state = self.model.state_dict()
+        adapted = {}
+        input_weight = state_dict.get("input.weight")
+        if (
+            isinstance(input_weight, torch.Tensor)
+            and "input.weight" in model_state
+            and input_weight.ndim == 2
+            and model_state["input.weight"].ndim == 2
+            and input_weight.shape[0] == model_state["input.weight"].shape[0]
+            and input_weight.shape[1] < model_state["input.weight"].shape[1]
+        ):
+            expanded = model_state["input.weight"].clone()
+            expanded[:, : input_weight.shape[1]] = input_weight.to(
+                dtype=expanded.dtype,
+                device=expanded.device,
+            )
+            adapted["input.weight"] = expanded
         matched = {
             name: value
             for name, value in state_dict.items()
             if name in model_state and model_state[name].shape == value.shape
         }
+        matched.update(adapted)
         skipped = sorted(set(state_dict) - set(matched))
         result = self.model.load_state_dict(matched, strict=False)
         self.warm_start_load_report = {
             "mode": "partial",
             "loaded_tensors": len(matched),
+            "adapted_tensors": sorted(adapted),
             "skipped_tensors": len(skipped),
             "missing_tensors": len(result.missing_keys),
             "unexpected_tensors": len(result.unexpected_keys),
@@ -2422,6 +3271,113 @@ class TrainingCliV2:
             type=int,
             default=TrainingConfigV2.checkpoint_interval_batches,
         )
+        parser.add_argument(
+            "--validation-examples-per-epoch",
+            type=int,
+            default=TrainingConfigV2.validation_examples_per_epoch,
+            help=(
+                "If >0, render this many held-out validation examples after "
+                "selected epochs and score them without teacher forcing."
+            ),
+        )
+        parser.add_argument(
+            "--validation-interval-epochs",
+            type=int,
+            default=TrainingConfigV2.validation_interval_epochs,
+            help="Run opt-in validation every N epochs, plus the final epoch.",
+        )
+        parser.add_argument(
+            "--validation-teacher-forcing-rate",
+            type=float,
+            default=TrainingConfigV2.validation_teacher_forcing_rate,
+            help=(
+                "Diagnostic validation teacher-forcing rate. Keep at 0 for "
+                "inference-style AP reporting."
+            ),
+        )
+        parser.add_argument(
+            "--validation-split",
+            choices=("train", "validation", "test"),
+            default=TrainingConfigV2.validation_split,
+            help=(
+                "Split used for opt-in validation rendering. Use train only for "
+                "same-instrument generalization diagnostics."
+            ),
+        )
+        parser.add_argument(
+            "--onset-label-radius-frames",
+            type=int,
+            default=TrainingConfigV2.onset_label_radius_frames,
+            help="Frames on either side of an onset center labeled positive.",
+        )
+        parser.add_argument(
+            "--offset-label-radius-frames",
+            type=int,
+            default=TrainingConfigV2.offset_label_radius_frames,
+            help="Frames on either side of an offset center labeled positive.",
+        )
+        parser.add_argument(
+            "--boundary-negative-radius-frames",
+            type=int,
+            default=TrainingConfigV2.boundary_negative_radius_frames,
+            help="Sampling radius for near-boundary negative training frames.",
+        )
+        parser.add_argument(
+            "--onset-hard-negative-sample-prob",
+            type=float,
+            default=TrainingConfigV2.onset_hard_negative_sample_prob,
+            help=(
+                "Probability of sampling a frame just outside the onset-positive "
+                "window before falling back to the default frame sampler."
+            ),
+        )
+        parser.add_argument(
+            "--early-stopping-metric",
+            default=TrainingConfigV2.early_stopping_metric,
+            help="Validation metric to maximize for early stopping.",
+        )
+        parser.add_argument(
+            "--early-stopping-patience",
+            type=int,
+            default=TrainingConfigV2.early_stopping_patience,
+            help="Stop after this many validation events without improvement.",
+        )
+        parser.add_argument(
+            "--early-stopping-min-delta",
+            type=float,
+            default=TrainingConfigV2.early_stopping_min_delta,
+            help="Minimum metric increase counted as early-stopping improvement.",
+        )
+        parser.add_argument(
+            "--learning-rate-scale",
+            type=float,
+            default=TrainingConfigV2.learning_rate_scale,
+            help="Multiply the curriculum stage learning rate by this factor.",
+        )
+        parser.add_argument(
+            "--learning-rate-decay",
+            choices=("none", "cosine"),
+            default=TrainingConfigV2.learning_rate_decay,
+            help="Optional within-stage learning-rate decay schedule.",
+        )
+        parser.add_argument(
+            "--learning-rate-min-fraction",
+            type=float,
+            default=TrainingConfigV2.learning_rate_min_fraction,
+            help=(
+                "Minimum fraction of each stage learning rate when using "
+                "a decay schedule."
+            ),
+        )
+        parser.add_argument(
+            "--learning-rate-decay-epochs",
+            type=int,
+            default=TrainingConfigV2.learning_rate_decay_epochs,
+            help=(
+                "Optional number of epochs over which to decay learning rate; "
+                "defaults to each stage length."
+            ),
+        )
         parser.add_argument("--resume-from-warm-start-metadata", action="store_true")
         parser.add_argument(
             "--no-resume-optimizer-state",
@@ -2438,6 +3394,12 @@ class TrainingCliV2:
             "--training-slice-peak-warmup-frames",
             type=int,
             default=TrainingConfigV2.training_slice_peak_warmup_frames,
+        )
+        parser.add_argument(
+            "--input-novelty-features",
+            choices=("none", "flux"),
+            default=TrainingConfigV2.input_novelty_features,
+            help="Append derived onset-novelty features to each frame.",
         )
         parser.add_argument("--gpu-frame-extraction", action="store_true")
         parser.add_argument("--pin-memory", action="store_true")
@@ -2539,6 +3501,41 @@ class TrainingCliV2:
             default=TrainingConfigV2.hard_boundary_negative_fraction,
         )
         parser.add_argument(
+            "--onset-pairwise-ranking-loss-weight",
+            type=float,
+            default=TrainingConfigV2.onset_pairwise_ranking_loss_weight,
+        )
+        parser.add_argument(
+            "--onset-pairwise-ranking-margin",
+            type=float,
+            default=TrainingConfigV2.onset_pairwise_ranking_margin,
+        )
+        parser.add_argument(
+            "--onset-pairwise-ranking-max-positives",
+            type=int,
+            default=TrainingConfigV2.onset_pairwise_ranking_max_positives,
+        )
+        parser.add_argument(
+            "--onset-pairwise-ranking-max-negatives",
+            type=int,
+            default=TrainingConfigV2.onset_pairwise_ranking_max_negatives,
+        )
+        parser.add_argument(
+            "--onset-softmax-loss-weight",
+            type=float,
+            default=TrainingConfigV2.onset_softmax_loss_weight,
+        )
+        parser.add_argument(
+            "--onset-sequence-loss-weight",
+            type=float,
+            default=TrainingConfigV2.onset_sequence_loss_weight,
+        )
+        parser.add_argument(
+            "--onset-sequence-pairwise-ranking-loss-weight",
+            type=float,
+            default=TrainingConfigV2.onset_sequence_pairwise_ranking_loss_weight,
+        )
+        parser.add_argument(
             "--onset-peak-loss-weight",
             type=float,
             default=TrainingConfigV2.onset_peak_loss_weight,
@@ -2562,6 +3559,91 @@ class TrainingCliV2:
             "--onset-false-peak-fraction",
             type=float,
             default=TrainingConfigV2.onset_false_peak_fraction,
+        )
+        parser.add_argument(
+            "--first-pass-boundary-loss-weight",
+            type=float,
+            default=TrainingConfigV2.first_pass_boundary_loss_weight,
+        )
+        parser.add_argument(
+            "--free-run-onset-sequence-loss-weight",
+            type=float,
+            default=TrainingConfigV2.free_run_onset_sequence_loss_weight,
+            help=(
+                "Extra onset sequence BCE loss on the no-state/free-running "
+                "first pass."
+            ),
+        )
+        parser.add_argument(
+            "--free-run-onset-sequence-pairwise-ranking-loss-weight",
+            type=float,
+            default=(
+                TrainingConfigV2.free_run_onset_sequence_pairwise_ranking_loss_weight
+            ),
+            help=(
+                "Extra onset sequence pairwise ranking loss on the "
+                "no-state/free-running first pass."
+            ),
+        )
+        parser.add_argument(
+            "--first-pass-distillation-loss-weight",
+            type=float,
+            default=TrainingConfigV2.first_pass_distillation_loss_weight,
+            help=(
+                "Soft-target distillation weight from true-history boundary logits "
+                "to the no-state first pass final-frame logits."
+            ),
+        )
+        parser.add_argument(
+            "--first-pass-sequence-distillation-loss-weight",
+            type=float,
+            default=TrainingConfigV2.first_pass_sequence_distillation_loss_weight,
+            help=(
+                "Soft-target distillation weight from true-history boundary "
+                "sequence logits to the no-state first pass sequence logits."
+            ),
+        )
+        parser.add_argument(
+            "--first-pass-distillation-offset-weight",
+            type=float,
+            default=TrainingConfigV2.first_pass_distillation_offset_weight,
+            help="Relative offset weight inside first-pass distillation losses.",
+        )
+        parser.add_argument(
+            "--first-pass-event-age-loss-weight",
+            type=float,
+            default=TrainingConfigV2.first_pass_event_age_loss_weight,
+            help="Loss weight for no-state first-pass onset/offset event-age heads.",
+        )
+        parser.add_argument(
+            "--first-pass-event-age-offset-weight",
+            type=float,
+            default=TrainingConfigV2.first_pass_event_age_offset_weight,
+            help="Relative offset-age weight inside first-pass event-age loss.",
+        )
+        parser.add_argument(
+            "--first-pass-event-age-recent-weight",
+            type=float,
+            default=TrainingConfigV2.first_pass_event_age_recent_weight,
+            help="Extra event-age loss weight for frames near a recent event.",
+        )
+        parser.add_argument(
+            "--freeze-for-first-pass-event-age",
+            action="store_true",
+            default=TrainingConfigV2.freeze_for_first_pass_event_age,
+            help="Train only the first-pass onset/offset age heads.",
+        )
+        parser.add_argument(
+            "--freeze-for-free-run-onset-sequence",
+            action="store_true",
+            default=TrainingConfigV2.freeze_for_free_run_onset_sequence,
+            help="Train only the free-run onset sequence head.",
+        )
+        parser.add_argument(
+            "--freeze-for-free-run-event-decoder",
+            action="store_true",
+            default=TrainingConfigV2.freeze_for_free_run_event_decoder,
+            help="Train only the event decoder block.",
         )
         parser.add_argument(
             "--model-dim",
@@ -2597,6 +3679,38 @@ class TrainingCliV2:
             "--event-teacher-forcing-end",
             type=float,
             default=TrainingConfigV2.event_teacher_forcing_end,
+        )
+        parser.add_argument(
+            "--event-state-onset-threshold",
+            type=float,
+            default=TrainingConfigV2.event_state_onset_threshold,
+        )
+        parser.add_argument(
+            "--event-state-offset-threshold",
+            type=float,
+            default=TrainingConfigV2.event_state_offset_threshold,
+        )
+        parser.add_argument(
+            "--event-state-soft-events",
+            action="store_true",
+            default=TrainingConfigV2.event_state_soft_events,
+        )
+        parser.add_argument(
+            "--event-state-use-predicted-age",
+            action="store_true",
+            default=TrainingConfigV2.event_state_use_predicted_age,
+        )
+        parser.add_argument(
+            "--event-state-noise-std",
+            type=float,
+            default=TrainingConfigV2.event_state_noise_std,
+            help="Training-only Gaussian noise added to sampled event-state channels.",
+        )
+        parser.add_argument(
+            "--event-state-dropout-prob",
+            type=float,
+            default=TrainingConfigV2.event_state_dropout_prob,
+            help="Training-only element dropout probability for sampled event state.",
         )
         parser.add_argument(
             "--identity-dim",

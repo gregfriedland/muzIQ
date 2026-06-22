@@ -83,6 +83,8 @@ class SourceTrackingEventDecoderV2(nn.Module):
         self.norm = nn.LayerNorm(config.model_dim)
         self.onset = nn.Linear(config.model_dim, 1)
         self.offset = nn.Linear(config.model_dim, 1)
+        self.onset_age = nn.Linear(config.model_dim, 1)
+        self.offset_age = nn.Linear(config.model_dim, 1)
 
     def forward(
         self,
@@ -112,9 +114,13 @@ class SourceTrackingEventDecoderV2(nn.Module):
         decoded = self.norm(decoded).view(batch, sources, frames, dim).permute(0, 2, 1, 3)
         onset_sequence = self.onset(decoded).squeeze(-1)
         offset_sequence = self.offset(decoded).squeeze(-1)
+        onset_age_sequence = self.onset_age(decoded).squeeze(-1)
+        offset_age_sequence = self.offset_age(decoded).squeeze(-1)
         return {
             "onset_logits_sequence": onset_sequence,
             "offset_logits_sequence": offset_sequence,
+            "onset_age_logits_sequence": onset_age_sequence,
+            "offset_age_logits_sequence": offset_age_sequence,
             "onset_logits": onset_sequence[:, -1, :],
             "offset_logits": offset_sequence[:, -1, :],
         }
@@ -130,6 +136,7 @@ class SourceTrackingEventStateBuilderV2:
         *,
         onset_threshold: float = 0.5,
         offset_threshold: float = 0.5,
+        soft_events: bool = False,
         event_state_dim: int = 5,
     ) -> torch.Tensor:
         batch, frames, sources = onset_logits_sequence.shape
@@ -139,15 +146,23 @@ class SourceTrackingEventStateBuilderV2:
         if event_state_dim <= 0:
             return state
 
-        onset_events = torch.sigmoid(onset_logits_sequence) >= onset_threshold
-        offset_events = torch.sigmoid(offset_logits_sequence) >= offset_threshold
+        onset_probs = torch.sigmoid(onset_logits_sequence)
+        offset_probs = torch.sigmoid(offset_logits_sequence)
+        onset_events = onset_probs >= onset_threshold
+        offset_events = offset_probs >= offset_threshold
 
         if frames > 1:
-            state[:, 1:, :, 0] = onset_events[:, :-1, :].float()
+            state[:, 1:, :, 0] = (
+                onset_probs[:, :-1, :] if soft_events else onset_events[:, :-1, :].float()
+            )
             if event_state_dim > 1:
-                state[:, 1:, :, 1] = offset_events[:, :-1, :].float()
+                state[:, 1:, :, 1] = (
+                    offset_probs[:, :-1, :]
+                    if soft_events
+                    else offset_events[:, :-1, :].float()
+                )
 
-        active = torch.zeros((batch, sources), dtype=torch.bool, device=state.device)
+        active = onset_logits_sequence.new_zeros((batch, sources))
         last_onset = torch.full(
             (batch, sources), -1, dtype=torch.long, device=state.device
         )
@@ -155,16 +170,27 @@ class SourceTrackingEventStateBuilderV2:
             (batch, sources), -1, dtype=torch.long, device=state.device
         )
         denom = max(1, frames - 1)
+        soft_last_onset_age = onset_logits_sequence.new_ones((batch, sources))
+        soft_last_offset_age = onset_logits_sequence.new_ones((batch, sources))
+        soft_age_step = 1.0 / float(denom)
         for frame_idx in range(frames):
             if event_state_dim > 2:
-                state[:, frame_idx, :, 2] = active.float()
+                state[:, frame_idx, :, 2] = active
             if event_state_dim > 3:
-                state[:, frame_idx, :, 3] = SourceTrackingEventStateBuilderV2._age(
-                    last_onset, frame_idx, denom
+                state[:, frame_idx, :, 3] = (
+                    soft_last_onset_age
+                    if soft_events
+                    else SourceTrackingEventStateBuilderV2._age(
+                        last_onset, frame_idx, denom
+                    )
                 )
             if event_state_dim > 4:
-                state[:, frame_idx, :, 4] = SourceTrackingEventStateBuilderV2._age(
-                    last_offset, frame_idx, denom
+                state[:, frame_idx, :, 4] = (
+                    soft_last_offset_age
+                    if soft_events
+                    else SourceTrackingEventStateBuilderV2._age(
+                        last_offset, frame_idx, denom
+                    )
                 )
             onset_now = onset_events[:, frame_idx, :]
             offset_now = offset_events[:, frame_idx, :]
@@ -174,7 +200,22 @@ class SourceTrackingEventStateBuilderV2:
             last_offset = torch.where(
                 offset_now, torch.full_like(last_offset, frame_idx), last_offset
             )
-            active = (active | onset_now) & ~offset_now
+            if soft_events:
+                offset_prob = offset_probs[:, frame_idx, :]
+                onset_prob = onset_probs[:, frame_idx, :]
+                active = active * (1.0 - offset_prob)
+                active = active + (1.0 - active) * onset_prob
+                aged_onset = torch.clamp(soft_last_onset_age + soft_age_step, max=1.0)
+                aged_offset = torch.clamp(soft_last_offset_age + soft_age_step, max=1.0)
+                soft_last_onset_age = onset_prob * soft_age_step + (
+                    1.0 - onset_prob
+                ) * aged_onset
+                soft_last_offset_age = offset_prob * soft_age_step + (
+                    1.0 - offset_prob
+                ) * aged_offset
+            else:
+                active = ((active > 0.5) | onset_now) & ~offset_now
+                active = active.float()
         return state
 
     @staticmethod
@@ -238,6 +279,13 @@ class SourceTrackingLossV2(nn.Module):
         boundary_f1_fn_weight: float = 1.0,
         hard_boundary_negative_loss_weight: float = 0.0,
         hard_boundary_negative_fraction: float = 0.1,
+        onset_pairwise_ranking_loss_weight: float = 0.0,
+        onset_pairwise_ranking_margin: float = 0.5,
+        onset_pairwise_ranking_max_positives: int = 512,
+        onset_pairwise_ranking_max_negatives: int = 2048,
+        onset_softmax_loss_weight: float = 0.0,
+        onset_sequence_loss_weight: float = 0.0,
+        onset_sequence_pairwise_ranking_loss_weight: float = 0.0,
         onset_peak_loss_weight: float = 0.0,
         onset_event_recall_loss_weight: float = 0.0,
         onset_false_peak_loss_weight: float = 0.0,
@@ -266,6 +314,15 @@ class SourceTrackingLossV2(nn.Module):
         self.boundary_f1_fn_weight = boundary_f1_fn_weight
         self.hard_boundary_negative_loss_weight = hard_boundary_negative_loss_weight
         self.hard_boundary_negative_fraction = hard_boundary_negative_fraction
+        self.onset_pairwise_ranking_loss_weight = onset_pairwise_ranking_loss_weight
+        self.onset_pairwise_ranking_margin = onset_pairwise_ranking_margin
+        self.onset_pairwise_ranking_max_positives = onset_pairwise_ranking_max_positives
+        self.onset_pairwise_ranking_max_negatives = onset_pairwise_ranking_max_negatives
+        self.onset_softmax_loss_weight = onset_softmax_loss_weight
+        self.onset_sequence_loss_weight = onset_sequence_loss_weight
+        self.onset_sequence_pairwise_ranking_loss_weight = (
+            onset_sequence_pairwise_ranking_loss_weight
+        )
         self.onset_peak_loss_weight = onset_peak_loss_weight
         self.onset_event_recall_loss_weight = onset_event_recall_loss_weight
         self.onset_false_peak_loss_weight = onset_false_peak_loss_weight
@@ -329,6 +386,15 @@ class SourceTrackingLossV2(nn.Module):
         )
         boundary_f1_loss = self._boundary_f1_loss(outputs, targets)
         hard_boundary_negative_loss = self._hard_boundary_negative_loss(outputs, targets)
+        onset_pairwise_ranking_loss = self._onset_pairwise_ranking_loss(
+            outputs,
+            targets,
+        )
+        onset_softmax_loss = self._onset_softmax_loss(outputs, targets)
+        onset_sequence_loss = self._onset_sequence_loss(outputs, targets)
+        onset_sequence_pairwise_ranking_loss = (
+            self._onset_sequence_pairwise_ranking_loss(outputs, targets)
+        )
         onset_peak_loss = self._onset_peak_shape_loss(outputs, targets)
         onset_event_recall_loss = self._onset_event_recall_loss(outputs, targets)
         onset_false_peak_loss = self._onset_false_peak_loss(outputs, targets)
@@ -344,10 +410,232 @@ class SourceTrackingLossV2(nn.Module):
             )
             + self.boundary_f1_loss_weight * boundary_f1_loss
             + self.hard_boundary_negative_loss_weight * hard_boundary_negative_loss
+            + self.onset_pairwise_ranking_loss_weight * onset_pairwise_ranking_loss
+            + self.onset_softmax_loss_weight * onset_softmax_loss
+            + self.onset_sequence_loss_weight * onset_sequence_loss
+            + self.onset_sequence_pairwise_ranking_loss_weight
+            * onset_sequence_pairwise_ranking_loss
             + self.onset_peak_loss_weight * onset_peak_loss
             + self.onset_event_recall_loss_weight * onset_event_recall_loss
             + self.onset_false_peak_loss_weight * onset_false_peak_loss
         )
+
+    def first_pass_boundary_loss(
+        self,
+        outputs: dict[str, torch.Tensor],
+        targets: dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        onset_loss = self._binary_boundary_loss(
+            outputs["onset_logits"],
+            targets["onset"].float(),
+            pos_weight=self._pos_weight(outputs["onset_logits"], self.onset_pos_weight),
+            focal_gamma=self.onset_focal_gamma,
+        )
+        offset_loss = self._binary_boundary_loss(
+            outputs["offset_logits"],
+            targets["offset"].float(),
+            pos_weight=self._pos_weight(outputs["offset_logits"], self.offset_pos_weight),
+            focal_gamma=self.offset_focal_gamma,
+        )
+        hard_boundary_negative_loss = self._hard_boundary_negative_loss(outputs, targets)
+        onset_pairwise_ranking_loss = self._onset_pairwise_ranking_loss(
+            outputs,
+            targets,
+        )
+        onset_softmax_loss = self._onset_softmax_loss(outputs, targets)
+        onset_sequence_loss = self._onset_sequence_loss(outputs, targets)
+        onset_sequence_pairwise_ranking_loss = (
+            self._onset_sequence_pairwise_ranking_loss(outputs, targets)
+        )
+        onset_peak_loss = self._onset_peak_shape_loss(outputs, targets)
+        onset_event_recall_loss = self._onset_event_recall_loss(outputs, targets)
+        onset_false_peak_loss = self._onset_false_peak_loss(outputs, targets)
+        return (
+            self.onset_loss_weight * onset_loss
+            + self.offset_loss_weight * offset_loss
+            + self.hard_boundary_negative_loss_weight * hard_boundary_negative_loss
+            + self.onset_pairwise_ranking_loss_weight * onset_pairwise_ranking_loss
+            + self.onset_softmax_loss_weight * onset_softmax_loss
+            + self.onset_sequence_loss_weight * onset_sequence_loss
+            + self.onset_sequence_pairwise_ranking_loss_weight
+            * onset_sequence_pairwise_ranking_loss
+            + self.onset_peak_loss_weight * onset_peak_loss
+            + self.onset_event_recall_loss_weight * onset_event_recall_loss
+            + self.onset_false_peak_loss_weight * onset_false_peak_loss
+        )
+
+    def onset_sequence_only_loss(
+        self,
+        outputs: dict[str, torch.Tensor],
+        targets: dict[str, torch.Tensor],
+        *,
+        sequence_loss_weight: float,
+        sequence_pairwise_ranking_loss_weight: float,
+    ) -> torch.Tensor:
+        onset_sequence_loss = self._onset_sequence_loss(outputs, targets)
+        onset_sequence_pairwise_ranking_loss = (
+            self._onset_sequence_pairwise_ranking_loss(outputs, targets)
+        )
+        return (
+            sequence_loss_weight * onset_sequence_loss
+            + sequence_pairwise_ranking_loss_weight
+            * onset_sequence_pairwise_ranking_loss
+        )
+
+    def first_pass_distillation_loss(
+        self,
+        student: dict[str, torch.Tensor],
+        teacher: dict[str, torch.Tensor],
+        *,
+        final_weight: float,
+        sequence_weight: float,
+        offset_weight: float,
+    ) -> torch.Tensor:
+        zero = student["onset_logits"].sum() * 0.0
+        final_weight = max(0.0, float(final_weight))
+        sequence_weight = max(0.0, float(sequence_weight))
+        offset_weight = max(0.0, float(offset_weight))
+        if final_weight <= 0.0 and sequence_weight <= 0.0:
+            return zero
+
+        loss = zero
+        if final_weight > 0.0:
+            loss = loss + final_weight * self._logit_distillation_loss(
+                student["onset_logits"],
+                teacher["onset_logits"],
+            )
+            loss = loss + final_weight * offset_weight * self._logit_distillation_loss(
+                student["offset_logits"],
+                teacher["offset_logits"],
+            )
+        if sequence_weight > 0.0:
+            loss = loss + sequence_weight * self._logit_distillation_loss(
+                student["onset_logits_sequence"],
+                teacher["onset_logits_sequence"],
+            )
+            loss = (
+                loss
+                + sequence_weight
+                * offset_weight
+                * self._logit_distillation_loss(
+                    student["offset_logits_sequence"],
+                    teacher["offset_logits_sequence"],
+                )
+            )
+        return loss
+
+    @staticmethod
+    def _logit_distillation_loss(
+        student_logits: torch.Tensor,
+        teacher_logits: torch.Tensor,
+    ) -> torch.Tensor:
+        return F.binary_cross_entropy_with_logits(
+            student_logits,
+            torch.sigmoid(teacher_logits.detach()),
+        )
+
+    def event_age_loss(
+        self,
+        outputs: dict[str, torch.Tensor],
+        targets: dict[str, torch.Tensor],
+        *,
+        offset_weight: float,
+        recent_weight: float = 0.0,
+    ) -> torch.Tensor:
+        event_state = targets.get("event_state")
+        onset_age = outputs.get("onset_age_logits_sequence")
+        offset_age = outputs.get("offset_age_logits_sequence")
+        if event_state is None or onset_age is None or offset_age is None:
+            return outputs["onset_logits"].sum() * 0.0
+        onset_target = event_state[..., 3].float()
+        offset_target = event_state[..., 4].float()
+        onset_loss = self._event_age_loss(onset_age, onset_target, recent_weight)
+        offset_loss = self._event_age_loss(offset_age, offset_target, recent_weight)
+        return onset_loss + max(0.0, float(offset_weight)) * offset_loss
+
+    @staticmethod
+    def _event_age_loss(
+        logits: torch.Tensor,
+        target: torch.Tensor,
+        recent_weight: float,
+    ) -> torch.Tensor:
+        loss = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
+        if recent_weight <= 0.0:
+            return loss.mean()
+        weights = 1.0 + float(recent_weight) * torch.square(1.0 - target)
+        return torch.mean(loss * weights) / torch.mean(weights).clamp_min(1e-6)
+
+    def _onset_pairwise_ranking_loss(
+        self,
+        outputs: dict[str, torch.Tensor],
+        targets: dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        logits = outputs["onset_logits"].reshape(-1)
+        target = targets["onset"].float().reshape(-1)
+        positives = logits[target > 0.5]
+        negatives = logits[target <= 0.5]
+        if positives.numel() == 0 or negatives.numel() == 0:
+            return logits.sum() * 0.0
+
+        max_positives = max(1, int(self.onset_pairwise_ranking_max_positives))
+        if positives.numel() > max_positives:
+            positives = torch.topk(-positives, k=max_positives).values.neg()
+
+        negative_fraction = min(1.0, max(0.0, self.hard_boundary_negative_fraction))
+        if negative_fraction <= 0.0:
+            return logits.sum() * 0.0
+        max_negatives = max(1, int(self.onset_pairwise_ranking_max_negatives))
+        negative_count = min(
+            max_negatives,
+            max(1, int(round(negatives.numel() * negative_fraction))),
+        )
+        hard_negatives = torch.topk(negatives, k=negative_count).values
+        margin = max(0.0, float(self.onset_pairwise_ranking_margin))
+        return F.softplus(hard_negatives[:, None] - positives[None, :] + margin).mean()
+
+    @staticmethod
+    def _onset_softmax_loss(
+        outputs: dict[str, torch.Tensor],
+        targets: dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        logits = outputs["onset_logits"]
+        target = targets["onset"].float()
+        single_onset = target.sum(dim=-1) == 1.0
+        if not single_onset.any():
+            return logits.sum() * 0.0
+        return F.cross_entropy(
+            logits[single_onset],
+            target[single_onset].argmax(dim=-1),
+        )
+
+    def _onset_sequence_loss(
+        self,
+        outputs: dict[str, torch.Tensor],
+        targets: dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        logits = outputs.get("onset_logits_sequence")
+        target = targets.get("context_onset")
+        if logits is None or target is None:
+            return outputs["onset_logits"].sum() * 0.0
+        return self._binary_boundary_loss(
+            logits,
+            target.float(),
+            pos_weight=self._pos_weight(logits, self.onset_pos_weight),
+            focal_gamma=0.0,
+        )
+
+    def _onset_sequence_pairwise_ranking_loss(
+        self,
+        outputs: dict[str, torch.Tensor],
+        targets: dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        logits = outputs.get("onset_logits_sequence")
+        target = targets.get("context_onset")
+        if logits is None or target is None:
+            return outputs["onset_logits"].sum() * 0.0
+        sequence_outputs = {"onset_logits": logits.reshape(-1)}
+        sequence_targets = {"onset": target.float().reshape(-1)}
+        return self._onset_pairwise_ranking_loss(sequence_outputs, sequence_targets)
 
     def _onset_peak_shape_loss(
         self,

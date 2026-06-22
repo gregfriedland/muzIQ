@@ -35,6 +35,7 @@ class SourceTrackingAudioConfigV2:
     onset_label_radius_frames = 2
     offset_label_radius_frames = 16
     boundary_negative_radius_frames = 24
+    onset_hard_negative_sample_prob = 0.0
 
 
 class FamilyVocabularyV2:
@@ -323,7 +324,12 @@ class SourceTrackingRendererV2:
         phase_offset_samples: int = 0,
     ) -> dict[str, np.ndarray]:
         audio, events = self._render_audio_events(stage, split, seed)
-        frame_idx = self._sample_training_frame_from_events(events, len(audio), seed)
+        frame_idx = self._sample_training_frame_from_events(
+            events,
+            len(audio),
+            seed,
+            use_hard_negatives=split == "train",
+        )
         target = self._label_at_frame(events, len(audio), frame_idx)
         context = self._label_context_for_frame(events, len(audio), frame_idx, frame_count)
         return {
@@ -349,7 +355,12 @@ class SourceTrackingRendererV2:
         phase_offset_samples: int = 0,
     ) -> dict[str, np.ndarray]:
         audio, events = self._render_audio_events(stage, split, seed)
-        frame_idx = self._sample_training_frame_from_events(events, len(audio), seed)
+        frame_idx = self._sample_training_frame_from_events(
+            events,
+            len(audio),
+            seed,
+            use_hard_negatives=split == "train",
+        )
         target = self._label_at_frame(events, len(audio), frame_idx)
         context = self._label_context_for_frame(events, len(audio), frame_idx, frame_count)
         return {
@@ -634,6 +645,8 @@ class SourceTrackingRendererV2:
         events: list[SourceEventLabelV2],
         n_samples: int,
         seed: int,
+        *,
+        use_hard_negatives: bool = True,
     ) -> int:
         n_frames = int(np.ceil(n_samples / self.config.hop))
         spans = [
@@ -648,6 +661,26 @@ class SourceTrackingRendererV2:
         start, end = spans[int(rng.integers(len(spans)))]
         probe = float(rng.random())
         negative_radius = self.config.boundary_negative_radius_frames
+        hard_negative_prob = (
+            min(1.0, max(0.0, float(self.config.onset_hard_negative_sample_prob)))
+            if use_hard_negatives
+            else 0.0
+        )
+        if probe < hard_negative_prob:
+            onset_gap = self.config.onset_label_radius_frames + 1
+            if rng.random() < 0.5:
+                lo = max(0, start - negative_radius)
+                hi = max(lo + 1, start - self.config.onset_label_radius_frames)
+                return int(rng.integers(lo, hi))
+            lo = min(n_frames - 1, start + onset_gap)
+            hi = min(n_frames, end, start + negative_radius + 1)
+            if hi > lo:
+                return int(rng.integers(lo, hi))
+            lo = max(0, start - negative_radius)
+            hi = max(lo + 1, start - self.config.onset_label_radius_frames)
+            return int(rng.integers(lo, hi))
+        if hard_negative_prob > 0.0:
+            probe = (probe - hard_negative_prob) / (1.0 - hard_negative_prob)
         if probe < 0.15:
             lo = max(0, start - negative_radius)
             hi = max(lo + 1, start - self.config.onset_label_radius_frames)
