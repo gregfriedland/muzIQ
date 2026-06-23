@@ -21,6 +21,7 @@ class SourceTrackingModelConfigV2:
     event_state_dim: int = 5
     event_decoder_layers: int = 1
     event_decoder_heads: int = 4
+    event_state_conditioning: bool = True
 
 
 class SourceTrackingHeadV2(nn.Module):
@@ -61,7 +62,7 @@ class SourceTrackingHeadV2(nn.Module):
 
 
 class SourceTrackingEventDecoderV2(nn.Module):
-    """Causal onset/offset decoder conditioned on prior event state."""
+    """Causal onset/offset decoder with optional prior-event conditioning."""
 
     def __init__(self, config: SourceTrackingModelConfigV2):
         super().__init__()
@@ -93,7 +94,7 @@ class SourceTrackingEventDecoderV2(nn.Module):
     ) -> dict[str, torch.Tensor]:
         batch, frames, dim = encoded.shape
         sources = self.config.max_sources
-        if event_state is None:
+        if event_state is None or not self.config.event_state_conditioning:
             event_state = encoded.new_zeros(
                 batch,
                 frames,
@@ -286,6 +287,11 @@ class SourceTrackingLossV2(nn.Module):
         onset_softmax_loss_weight: float = 0.0,
         onset_sequence_loss_weight: float = 0.0,
         onset_sequence_pairwise_ranking_loss_weight: float = 0.0,
+        onset_sequence_block_positive_loss_weight: float = 0.0,
+        onset_sequence_block_ranking_loss_weight: float = 0.0,
+        onset_nearby_pairwise_ranking_loss_weight: float = 0.0,
+        onset_peak_to_shoulder_ranking_loss_weight: float = 0.0,
+        onset_shoulder_loss_weight: float = 0.15,
         onset_peak_loss_weight: float = 0.0,
         onset_event_recall_loss_weight: float = 0.0,
         onset_false_peak_loss_weight: float = 0.0,
@@ -323,6 +329,19 @@ class SourceTrackingLossV2(nn.Module):
         self.onset_sequence_pairwise_ranking_loss_weight = (
             onset_sequence_pairwise_ranking_loss_weight
         )
+        self.onset_sequence_block_positive_loss_weight = (
+            onset_sequence_block_positive_loss_weight
+        )
+        self.onset_sequence_block_ranking_loss_weight = (
+            onset_sequence_block_ranking_loss_weight
+        )
+        self.onset_nearby_pairwise_ranking_loss_weight = (
+            onset_nearby_pairwise_ranking_loss_weight
+        )
+        self.onset_peak_to_shoulder_ranking_loss_weight = (
+            onset_peak_to_shoulder_ranking_loss_weight
+        )
+        self.onset_shoulder_loss_weight = onset_shoulder_loss_weight
         self.onset_peak_loss_weight = onset_peak_loss_weight
         self.onset_event_recall_loss_weight = onset_event_recall_loss_weight
         self.onset_false_peak_loss_weight = onset_false_peak_loss_weight
@@ -395,6 +414,20 @@ class SourceTrackingLossV2(nn.Module):
         onset_sequence_pairwise_ranking_loss = (
             self._onset_sequence_pairwise_ranking_loss(outputs, targets)
         )
+        onset_sequence_block_positive_loss = self._onset_sequence_block_positive_loss(
+            outputs,
+            targets,
+        )
+        onset_sequence_block_ranking_loss = self._onset_sequence_block_ranking_loss(
+            outputs,
+            targets,
+        )
+        onset_nearby_pairwise_ranking_loss = (
+            self._onset_nearby_pairwise_ranking_loss(outputs, targets)
+        )
+        onset_peak_to_shoulder_ranking_loss = (
+            self._onset_peak_to_shoulder_ranking_loss(outputs, targets)
+        )
         onset_peak_loss = self._onset_peak_shape_loss(outputs, targets)
         onset_event_recall_loss = self._onset_event_recall_loss(outputs, targets)
         onset_false_peak_loss = self._onset_false_peak_loss(outputs, targets)
@@ -415,6 +448,14 @@ class SourceTrackingLossV2(nn.Module):
             + self.onset_sequence_loss_weight * onset_sequence_loss
             + self.onset_sequence_pairwise_ranking_loss_weight
             * onset_sequence_pairwise_ranking_loss
+            + self.onset_sequence_block_positive_loss_weight
+            * onset_sequence_block_positive_loss
+            + self.onset_sequence_block_ranking_loss_weight
+            * onset_sequence_block_ranking_loss
+            + self.onset_nearby_pairwise_ranking_loss_weight
+            * onset_nearby_pairwise_ranking_loss
+            + self.onset_peak_to_shoulder_ranking_loss_weight
+            * onset_peak_to_shoulder_ranking_loss
             + self.onset_peak_loss_weight * onset_peak_loss
             + self.onset_event_recall_loss_weight * onset_event_recall_loss
             + self.onset_false_peak_loss_weight * onset_false_peak_loss
@@ -447,6 +488,20 @@ class SourceTrackingLossV2(nn.Module):
         onset_sequence_pairwise_ranking_loss = (
             self._onset_sequence_pairwise_ranking_loss(outputs, targets)
         )
+        onset_sequence_block_positive_loss = self._onset_sequence_block_positive_loss(
+            outputs,
+            targets,
+        )
+        onset_sequence_block_ranking_loss = self._onset_sequence_block_ranking_loss(
+            outputs,
+            targets,
+        )
+        onset_nearby_pairwise_ranking_loss = (
+            self._onset_nearby_pairwise_ranking_loss(outputs, targets)
+        )
+        onset_peak_to_shoulder_ranking_loss = (
+            self._onset_peak_to_shoulder_ranking_loss(outputs, targets)
+        )
         onset_peak_loss = self._onset_peak_shape_loss(outputs, targets)
         onset_event_recall_loss = self._onset_event_recall_loss(outputs, targets)
         onset_false_peak_loss = self._onset_false_peak_loss(outputs, targets)
@@ -459,6 +514,14 @@ class SourceTrackingLossV2(nn.Module):
             + self.onset_sequence_loss_weight * onset_sequence_loss
             + self.onset_sequence_pairwise_ranking_loss_weight
             * onset_sequence_pairwise_ranking_loss
+            + self.onset_sequence_block_positive_loss_weight
+            * onset_sequence_block_positive_loss
+            + self.onset_sequence_block_ranking_loss_weight
+            * onset_sequence_block_ranking_loss
+            + self.onset_nearby_pairwise_ranking_loss_weight
+            * onset_nearby_pairwise_ranking_loss
+            + self.onset_peak_to_shoulder_ranking_loss_weight
+            * onset_peak_to_shoulder_ranking_loss
             + self.onset_peak_loss_weight * onset_peak_loss
             + self.onset_event_recall_loss_weight * onset_event_recall_loss
             + self.onset_false_peak_loss_weight * onset_false_peak_loss
@@ -608,6 +671,42 @@ class SourceTrackingLossV2(nn.Module):
             target[single_onset].argmax(dim=-1),
         )
 
+    def _onset_sequence_target_and_weights(
+        self,
+        logits: torch.Tensor,
+        targets: dict[str, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        target = targets["context_onset"].float()
+        weights = torch.ones_like(logits)
+        nearby = targets.get("context_onset_nearby_mask")
+        delta = targets.get("context_onset_delta")
+        if nearby is None or delta is None or nearby.shape != logits.shape:
+            return target, weights
+
+        radius = max(1, int(self.onset_peak_radius_frames))
+        accepted = nearby.float() > 0.5
+        center = accepted & (delta.float().abs() < 0.5)
+        peak_target = torch.clamp(
+            1.0 - delta.float().abs() / float(radius + 1),
+            min=0.0,
+        )
+        target = torch.where(accepted, peak_target, target)
+        shoulder_weight = max(0.0, float(self.onset_shoulder_loss_weight))
+        shoulder = accepted & ~center
+        weights = torch.where(shoulder, weights.new_full((), shoulder_weight), weights)
+        return target, weights
+
+    @staticmethod
+    def _onset_sequence_hard_negative_mask(
+        targets: dict[str, torch.Tensor],
+        logits: torch.Tensor,
+    ) -> torch.Tensor | None:
+        target = targets.get("context_onset")
+        nearby = targets.get("context_onset_nearby_mask")
+        if target is None or nearby is None or nearby.shape != logits.shape:
+            return None
+        return (target.float() <= 0.5) & (nearby.float() <= 0.5)
+
     def _onset_sequence_loss(
         self,
         outputs: dict[str, torch.Tensor],
@@ -617,12 +716,58 @@ class SourceTrackingLossV2(nn.Module):
         target = targets.get("context_onset")
         if logits is None or target is None:
             return outputs["onset_logits"].sum() * 0.0
-        return self._binary_boundary_loss(
+        censored = self._onset_sequence_censored_loss(logits, targets)
+        if censored is not None:
+            return censored
+        soft_target, weights = self._onset_sequence_target_and_weights(
             logits,
-            target.float(),
-            pos_weight=self._pos_weight(logits, self.onset_pos_weight),
-            focal_gamma=0.0,
+            targets,
         )
+        loss = F.binary_cross_entropy_with_logits(
+            logits,
+            soft_target,
+            reduction="none",
+            pos_weight=self._pos_weight(logits, self.onset_pos_weight),
+        )
+        return (loss * weights).sum() / weights.sum().clamp_min(1e-6)
+
+    def _onset_sequence_censored_loss(
+        self,
+        logits: torch.Tensor,
+        targets: dict[str, torch.Tensor],
+    ) -> torch.Tensor | None:
+        nearby = targets.get("context_onset_nearby_mask")
+        delta = targets.get("context_onset_delta")
+        if nearby is None or delta is None or nearby.shape != logits.shape:
+            return None
+
+        accepted = nearby.float() > 0.5
+        hard_negative = ~accepted
+        total = logits.sum() * 0.0
+        normalizer = logits.new_tensor(0.0)
+
+        if hard_negative.any():
+            negative_loss = F.binary_cross_entropy_with_logits(
+                logits[hard_negative],
+                torch.zeros_like(logits[hard_negative]),
+                reduction="sum",
+            )
+            total = total + negative_loss
+            normalizer = normalizer + hard_negative.sum().to(logits.dtype)
+
+        center = self._onset_center_mask(targets)
+        if center.shape == logits.shape and center.any() and accepted.any():
+            radius = int(torch.ceil(delta.float().abs()[accepted].max()).item())
+            window_max_probability = self._temporal_max(torch.sigmoid(logits), radius)
+            positive_probability = window_max_probability[center].clamp_min(1e-6)
+            positive_loss = -torch.log(positive_probability).sum()
+            positive_weight = max(0.0, float(self.onset_pos_weight))
+            total = total + positive_weight * positive_loss
+            normalizer = normalizer + center.sum().to(logits.dtype)
+
+        if normalizer <= 0:
+            return logits.sum() * 0.0
+        return total / normalizer.clamp_min(1e-6)
 
     def _onset_sequence_pairwise_ranking_loss(
         self,
@@ -633,9 +778,139 @@ class SourceTrackingLossV2(nn.Module):
         target = targets.get("context_onset")
         if logits is None or target is None:
             return outputs["onset_logits"].sum() * 0.0
-        sequence_outputs = {"onset_logits": logits.reshape(-1)}
-        sequence_targets = {"onset": target.float().reshape(-1)}
+        negatives = self._onset_sequence_hard_negative_mask(targets, logits)
+        if negatives is None:
+            negatives = target.float() <= 0.5
+        sequence_outputs = {"onset_logits": logits[negatives | (target.float() > 0.5)]}
+        sequence_targets = {"onset": target.float()[negatives | (target.float() > 0.5)]}
         return self._onset_pairwise_ranking_loss(sequence_outputs, sequence_targets)
+
+    def _onset_sequence_block_positive_loss(
+        self,
+        outputs: dict[str, torch.Tensor],
+        targets: dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        logits = outputs.get("onset_logits_sequence")
+        if logits is None:
+            return outputs["onset_logits"].sum() * 0.0
+        block_logits = self._onset_block_max_logits(logits, targets)
+        if block_logits.numel() == 0:
+            return logits.sum() * 0.0
+        target = torch.ones_like(block_logits)
+        return F.binary_cross_entropy_with_logits(block_logits, target)
+
+    def _onset_sequence_block_ranking_loss(
+        self,
+        outputs: dict[str, torch.Tensor],
+        targets: dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        logits = outputs.get("onset_logits_sequence")
+        if logits is None:
+            return outputs["onset_logits"].sum() * 0.0
+        positives = self._onset_block_max_logits(logits, targets)
+        hard_negative = self._onset_sequence_hard_negative_mask(targets, logits)
+        if (
+            positives.numel() == 0
+            or hard_negative is None
+            or not bool(hard_negative.any().item())
+        ):
+            return logits.sum() * 0.0
+        negatives = logits[hard_negative]
+        max_positives = max(1, int(self.onset_pairwise_ranking_max_positives))
+        if positives.numel() > max_positives:
+            positives = torch.topk(-positives, k=max_positives).values.neg()
+        max_negatives = max(1, int(self.onset_pairwise_ranking_max_negatives))
+        if negatives.numel() > max_negatives:
+            negatives = torch.topk(negatives, k=max_negatives).values
+        margin = max(0.0, float(self.onset_pairwise_ranking_margin))
+        return F.softplus(negatives[:, None] - positives[None, :] + margin).mean()
+
+    def _onset_block_max_logits(
+        self,
+        logits: torch.Tensor,
+        targets: dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        nearby = targets.get("context_onset_nearby_mask")
+        delta = targets.get("context_onset_delta")
+        if nearby is None or delta is None or nearby.shape != logits.shape:
+            return logits.new_empty((0,))
+        accepted = nearby.float() > 0.5
+        center = self._onset_center_mask(targets)
+        if center.shape != logits.shape or not center.any() or not accepted.any():
+            return logits.new_empty((0,))
+        radius = int(torch.ceil(delta.float().abs()[accepted].max()).item())
+        masked_logits = torch.where(
+            accepted,
+            logits,
+            logits.new_full((), -torch.inf),
+        )
+        return self._temporal_max(masked_logits, radius)[center]
+
+    def _onset_nearby_pairwise_ranking_loss(
+        self,
+        outputs: dict[str, torch.Tensor],
+        targets: dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        logits = outputs.get("onset_logits_sequence")
+        target = targets.get("context_onset")
+        nearby = targets.get("context_onset_nearby_mask")
+        if logits is None or target is None or nearby is None:
+            return outputs["onset_logits"].sum() * 0.0
+
+        flat_logits = logits.reshape(-1)
+        flat_nearby = nearby.float().reshape(-1)
+        positives = flat_logits[flat_nearby > 0.5]
+        hard_negative = self._onset_sequence_hard_negative_mask(targets, logits)
+        if hard_negative is None:
+            return flat_logits.sum() * 0.0
+        hard_negatives = logits[hard_negative]
+        if positives.numel() == 0 or hard_negatives.numel() == 0:
+            return flat_logits.sum() * 0.0
+
+        max_positives = max(1, int(self.onset_pairwise_ranking_max_positives))
+        if positives.numel() > max_positives:
+            positives = torch.topk(-positives, k=max_positives).values.neg()
+
+        max_negatives = max(1, int(self.onset_pairwise_ranking_max_negatives))
+        if hard_negatives.numel() > max_negatives:
+            hard_negatives = torch.topk(hard_negatives, k=max_negatives).values
+
+        margin = max(0.0, float(self.onset_pairwise_ranking_margin))
+        return F.softplus(
+            hard_negatives[:, None] - positives[None, :] + margin
+        ).mean()
+
+    def _onset_peak_to_shoulder_ranking_loss(
+        self,
+        outputs: dict[str, torch.Tensor],
+        targets: dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        logits = outputs.get("onset_logits_sequence")
+        nearby = targets.get("context_onset_nearby_mask")
+        if logits is None or nearby is None:
+            return outputs["onset_logits"].sum() * 0.0
+
+        center = self._onset_center_mask(targets)
+        if center.shape != logits.shape:
+            return logits.sum() * 0.0
+        shoulder = (nearby.float() > 0.5) & ~center
+        peak_logits = logits[center]
+        shoulder_logits = logits[shoulder]
+        if peak_logits.numel() == 0 or shoulder_logits.numel() == 0:
+            return logits.sum() * 0.0
+
+        max_positives = max(1, int(self.onset_pairwise_ranking_max_positives))
+        if peak_logits.numel() > max_positives:
+            peak_logits = torch.topk(-peak_logits, k=max_positives).values.neg()
+
+        max_negatives = max(1, int(self.onset_pairwise_ranking_max_negatives))
+        if shoulder_logits.numel() > max_negatives:
+            shoulder_logits = torch.topk(shoulder_logits, k=max_negatives).values
+
+        margin = max(0.0, float(self.onset_pairwise_ranking_margin))
+        return F.softplus(
+            shoulder_logits[:, None] - peak_logits[None, :] + margin
+        ).mean()
 
     def _onset_peak_shape_loss(
         self,
@@ -644,19 +919,21 @@ class SourceTrackingLossV2(nn.Module):
     ) -> torch.Tensor:
         logits = outputs.get("onset_logits_sequence")
         target = targets.get("context_onset")
-        delta = targets.get("context_onset_delta")
-        mask = targets.get("context_onset_timing_mask")
         if logits is None or target is None:
             return outputs["onset_logits"].sum() * 0.0
-        if delta is None or mask is None:
-            peak_target = target.float()
-        else:
-            radius = max(1, int(self.onset_peak_radius_frames))
-            peak_target = torch.clamp(
-                1.0 - delta.float().abs() / float(radius + 1),
-                min=0.0,
-            ) * mask.float()
-        return F.binary_cross_entropy_with_logits(logits, peak_target)
+        peak_target, weights = self._onset_sequence_target_and_weights(
+            logits,
+            targets,
+        )
+        nearby = targets.get("context_onset_nearby_mask")
+        if nearby is not None and nearby.shape == logits.shape:
+            weights = weights * (nearby.float() > 0.5).float()
+        loss = F.binary_cross_entropy_with_logits(
+            logits,
+            peak_target,
+            reduction="none",
+        )
+        return (loss * weights).sum() / weights.sum().clamp_min(1e-6)
 
     def _onset_event_recall_loss(
         self,
@@ -685,7 +962,9 @@ class SourceTrackingLossV2(nn.Module):
             return outputs["onset_logits"].sum() * 0.0
         probability = torch.sigmoid(logits)
         local_max = probability >= self._temporal_max(probability, 1).detach()
-        exclusion = targets.get("context_onset_timing_mask")
+        exclusion = targets.get("context_onset_nearby_mask")
+        if exclusion is None:
+            exclusion = targets.get("context_onset_timing_mask")
         if exclusion is None:
             exclusion = torch.zeros_like(probability)
         candidates = probability[(exclusion <= 0.5) & local_max]

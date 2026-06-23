@@ -32,10 +32,15 @@ class SourceTrackingAudioConfigV2:
     log_min_hz = 40.0
     log_max_hz = 8_000.0
     log_feature_scale = 1_000.0
-    onset_label_radius_frames = 2
+    onset_shoulder_radius_frames = 5
     offset_label_radius_frames = 16
     boundary_negative_radius_frames = 24
     onset_hard_negative_sample_prob = 0.0
+    onset_context_sample_prob = 0.0
+    positive_family_boosts = ""
+    positive_quality_boosts = ""
+    positive_source_boosts = ""
+    positive_velocity_boosts = ""
 
 
 class FamilyVocabularyV2:
@@ -198,12 +203,25 @@ class NsynthNoteStoreV2:
             raise ValueError(f"No NSynth notes cached for split {split!r}")
         return instruments[int(rng.integers(len(instruments)))]
 
-    def sample_family(self, split: SplitName, rng: np.random.Generator) -> str:
+    def sample_family(
+        self,
+        split: SplitName,
+        rng: np.random.Generator,
+        family_boosts: dict[str, float] | None = None,
+    ) -> str:
         families = sorted(
             family for family, notes in self._by_split_family[split].items() if notes
         )
         if not families:
             raise ValueError(f"No NSynth families cached for split {split!r}")
+        if family_boosts:
+            weights = np.asarray(
+                [max(0.0, family_boosts.get(family, 1.0)) for family in families],
+                dtype=np.float64,
+            )
+            total = float(weights.sum())
+            if total > 0.0:
+                return str(rng.choice(families, p=weights / total))
         return families[int(rng.integers(len(families)))]
 
     def nearest_pitch(self, notes: list[NsynthNoteV2], pitch: int) -> NsynthNoteV2:
@@ -229,6 +247,7 @@ class NsynthNoteStoreV2:
         split: SplitName,
         rng: np.random.Generator,
         family: str | None = None,
+        weight_fn=None,
     ) -> NsynthNoteV2:
         notes = (
             self._by_split_family[split].get(family, [])
@@ -237,6 +256,11 @@ class NsynthNoteStoreV2:
         )
         if not notes:
             raise ValueError(f"No NSynth notes cached for split {split!r}")
+        if weight_fn is not None:
+            weights = np.asarray([max(0.0, float(weight_fn(note))) for note in notes])
+            total = float(weights.sum())
+            if total > 0.0:
+                return notes[int(rng.choice(len(notes), p=weights / total))]
         return notes[int(rng.integers(len(notes)))]
 
     def _resample(self, audio: np.ndarray, sample_rate: int) -> np.ndarray:
@@ -296,6 +320,37 @@ class SourceTrackingRendererV2:
         self.config = config
         self.extractor = AudioFrameExtractorV2(config)
         self.families = FamilyVocabularyV2()
+        self.positive_family_boosts = self._parse_weight_spec(
+            config.positive_family_boosts
+        )
+        self.positive_quality_boosts = self._parse_weight_spec(
+            config.positive_quality_boosts
+        )
+        self.positive_source_boosts = self._parse_weight_spec(
+            config.positive_source_boosts
+        )
+        self.positive_velocity_boosts = self._parse_weight_spec(
+            config.positive_velocity_boosts
+        )
+
+    @staticmethod
+    def _parse_weight_spec(spec: str) -> dict[str, float]:
+        weights: dict[str, float] = {}
+        for item in str(spec or "").split(","):
+            item = item.strip()
+            if not item:
+                continue
+            if "=" in item:
+                key, value = item.split("=", 1)
+            elif ":" in item:
+                key, value = item.split(":", 1)
+            else:
+                key, value = item, "1.0"
+            try:
+                weights[key.strip()] = max(0.0, float(value))
+            except ValueError:
+                continue
+        return weights
 
     def render(
         self, stage: str, split: SplitName, seed: int
@@ -328,6 +383,7 @@ class SourceTrackingRendererV2:
             events,
             len(audio),
             seed,
+            context_frame_count=frame_count,
             use_hard_negatives=split == "train",
         )
         target = self._label_at_frame(events, len(audio), frame_idx)
@@ -359,6 +415,7 @@ class SourceTrackingRendererV2:
             events,
             len(audio),
             seed,
+            context_frame_count=frame_count,
             use_hard_negatives=split == "train",
         )
         target = self._label_at_frame(events, len(audio), frame_idx)
@@ -451,10 +508,28 @@ class SourceTrackingRendererV2:
         audio: np.ndarray,
         events: list[SourceEventLabelV2],
     ) -> None:
-        family = self.note_store.sample_family(split, rng)
-        note = self.note_store.random_note(split, rng, family=family)
+        family = self.note_store.sample_family(split, rng, self.positive_family_boosts)
+        note = self.note_store.random_note(
+            split,
+            rng,
+            family=family,
+            weight_fn=self._positive_note_weight,
+        )
         start_s = float(rng.uniform(0.25, 1.25))
         self._mix_note(audio, note, 0, start_s, events)
+
+    def _positive_note_weight(self, note: NsynthNoteV2) -> float:
+        weight = self.positive_family_boosts.get(note.family, 1.0)
+        weight *= self.positive_source_boosts.get(note.source, 1.0)
+        weight *= self.positive_velocity_boosts.get(str(note.velocity), 1.0)
+        if note.qualities:
+            weight *= max(
+                self.positive_quality_boosts.get(quality, 1.0)
+                for quality in note.qualities
+            )
+        else:
+            weight *= self.positive_quality_boosts.get("<none>", 1.0)
+        return weight
 
     def _render_generated_melody(
         self,
@@ -577,6 +652,7 @@ class SourceTrackingRendererV2:
         onset_delta = np.zeros(shape, dtype=np.float32)
         offset_delta = np.zeros(shape, dtype=np.float32)
         onset_timing_mask = np.zeros(shape, dtype=np.float32)
+        onset_nearby_mask = np.zeros(shape, dtype=np.float32)
         offset_timing_mask = np.zeros(shape, dtype=np.float32)
         family = np.full(shape, -1, dtype=np.int32)
         source_id = np.full(shape, -1, dtype=np.int32)
@@ -592,18 +668,28 @@ class SourceTrackingRendererV2:
             active[start:end, event.source_id] = 1.0
             family[start:end, event.source_id] = event.family_index
             source_id[start:end, event.source_id] = event.source_id
-            onset_start = max(0, start - self.config.onset_label_radius_frames)
-            onset_end = min(n_frames, start + self.config.onset_label_radius_frames + 1)
+            onset_nearby_start = max(0, start - self.config.onset_shoulder_radius_frames)
+            onset_nearby_end = min(
+                n_frames,
+                start + self.config.onset_shoulder_radius_frames + 1,
+            )
             offset_center = end - 1
             offset_start = max(0, offset_center - self.config.offset_label_radius_frames)
             offset_end = min(
                 n_frames, offset_center + self.config.offset_label_radius_frames + 1
             )
-            onset[onset_start:onset_end, event.source_id] = 1.0
+            onset[onset_nearby_start:onset_nearby_end, event.source_id] = 1.0
             offset[offset_start:offset_end, event.source_id] = 1.0
-            onset_frames = np.arange(onset_start, onset_end, dtype=np.float32)
-            onset_delta[onset_start:onset_end, event.source_id] = onset_frames - start
-            onset_timing_mask[onset_start:onset_end, event.source_id] = 1.0
+            onset_nearby_frames = np.arange(
+                onset_nearby_start,
+                onset_nearby_end,
+                dtype=np.float32,
+            )
+            onset_delta[onset_nearby_start:onset_nearby_end, event.source_id] = (
+                onset_nearby_frames - start
+            )
+            onset_timing_mask[onset_nearby_start:onset_nearby_end, event.source_id] = 1.0
+            onset_nearby_mask[onset_nearby_start:onset_nearby_end, event.source_id] = 1.0
             offset_frames = np.arange(offset_start, offset_end, dtype=np.float32)
             offset_delta[offset_start:offset_end, event.source_id] = (
                 offset_frames - offset_center
@@ -616,6 +702,7 @@ class SourceTrackingRendererV2:
             onset_delta=onset_delta,
             offset_delta=offset_delta,
             onset_timing_mask=onset_timing_mask,
+            onset_nearby_mask=onset_nearby_mask,
             offset_timing_mask=offset_timing_mask,
             family=family,
             source_id=source_id,
@@ -646,6 +733,7 @@ class SourceTrackingRendererV2:
         n_samples: int,
         seed: int,
         *,
+        context_frame_count: int | None = None,
         use_hard_negatives: bool = True,
     ) -> int:
         n_frames = int(np.ceil(n_samples / self.config.hop))
@@ -660,6 +748,17 @@ class SourceTrackingRendererV2:
         rng = np.random.default_rng(seed + 9_973)
         start, end = spans[int(rng.integers(len(spans)))]
         probe = float(rng.random())
+        onset_context_prob = min(
+            1.0,
+            max(0.0, float(self.config.onset_context_sample_prob)),
+        )
+        if (
+            context_frame_count is not None
+            and context_frame_count > 0
+            and probe < onset_context_prob
+        ):
+            hi = min(n_frames, start + int(context_frame_count))
+            return int(rng.integers(start, max(start + 1, hi)))
         negative_radius = self.config.boundary_negative_radius_frames
         hard_negative_prob = (
             min(1.0, max(0.0, float(self.config.onset_hard_negative_sample_prob)))
@@ -667,23 +766,23 @@ class SourceTrackingRendererV2:
             else 0.0
         )
         if probe < hard_negative_prob:
-            onset_gap = self.config.onset_label_radius_frames + 1
+            onset_gap = self.config.onset_shoulder_radius_frames + 1
             if rng.random() < 0.5:
                 lo = max(0, start - negative_radius)
-                hi = max(lo + 1, start - self.config.onset_label_radius_frames)
+                hi = max(lo + 1, start - self.config.onset_shoulder_radius_frames)
                 return int(rng.integers(lo, hi))
             lo = min(n_frames - 1, start + onset_gap)
             hi = min(n_frames, end, start + negative_radius + 1)
             if hi > lo:
                 return int(rng.integers(lo, hi))
             lo = max(0, start - negative_radius)
-            hi = max(lo + 1, start - self.config.onset_label_radius_frames)
+            hi = max(lo + 1, start - self.config.onset_shoulder_radius_frames)
             return int(rng.integers(lo, hi))
         if hard_negative_prob > 0.0:
             probe = (probe - hard_negative_prob) / (1.0 - hard_negative_prob)
         if probe < 0.15:
             lo = max(0, start - negative_radius)
-            hi = max(lo + 1, start - self.config.onset_label_radius_frames)
+            hi = max(lo + 1, start - self.config.onset_shoulder_radius_frames)
             return int(rng.integers(lo, hi))
         if probe < 0.35:
             return int(start)
@@ -710,6 +809,7 @@ class SourceTrackingRendererV2:
         onset_delta = np.zeros(self.config.max_sources, dtype=np.float32)
         offset_delta = np.zeros(self.config.max_sources, dtype=np.float32)
         onset_timing_mask = np.zeros(self.config.max_sources, dtype=np.float32)
+        onset_nearby_mask = np.zeros(self.config.max_sources, dtype=np.float32)
         offset_timing_mask = np.zeros(self.config.max_sources, dtype=np.float32)
         family = np.full(self.config.max_sources, -1, dtype=np.int32)
         for event in events:
@@ -719,9 +819,12 @@ class SourceTrackingRendererV2:
             if start <= frame_idx < end:
                 activity[event.source_id] = 1.0
                 family[event.source_id] = event.family_index
-            if abs(frame_idx - start) <= self.config.onset_label_radius_frames:
+            onset_frame_delta = frame_idx - start
+            if abs(onset_frame_delta) <= self.config.onset_shoulder_radius_frames:
+                onset_delta[event.source_id] = float(onset_frame_delta)
+                onset_nearby_mask[event.source_id] = 1.0
+            if abs(onset_frame_delta) <= self.config.onset_shoulder_radius_frames:
                 onset[event.source_id] = 1.0
-                onset_delta[event.source_id] = float(frame_idx - start)
                 onset_timing_mask[event.source_id] = 1.0
             offset_center = end - 1
             if abs(frame_idx - offset_center) <= self.config.offset_label_radius_frames:
@@ -736,6 +839,7 @@ class SourceTrackingRendererV2:
             "onset_delta": onset_delta,
             "offset_delta": offset_delta,
             "onset_timing_mask": onset_timing_mask,
+            "onset_nearby_mask": onset_nearby_mask,
             "offset_timing_mask": offset_timing_mask,
         }
 
@@ -763,6 +867,7 @@ class SourceTrackingRendererV2:
         onset_delta = window(labels.onset_delta)
         offset_delta = window(labels.offset_delta)
         onset_timing_mask = window(labels.onset_timing_mask)
+        onset_nearby_mask = window(labels.onset_nearby_mask)
         offset_timing_mask = window(labels.offset_timing_mask)
         family = window(labels.family, fill=-1)
         event_state = self._event_state_context(active, onset, offset)
@@ -774,6 +879,7 @@ class SourceTrackingRendererV2:
             "context_onset_delta": onset_delta,
             "context_offset_delta": offset_delta,
             "context_onset_timing_mask": onset_timing_mask,
+            "context_onset_nearby_mask": onset_nearby_mask,
             "context_offset_timing_mask": offset_timing_mask,
             "event_state": event_state,
         }

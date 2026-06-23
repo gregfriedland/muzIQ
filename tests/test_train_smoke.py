@@ -87,6 +87,23 @@ class TestTrainSmokeV2:
             "single_instrument_melody",
         ]
 
+    def test_stage_filter_selects_single_note_shape_alias(self, tmp_path):
+        TinyCorpusBuilderV2(tmp_path / "data").build()
+        trainer = SourceTrackingTrainerV2(
+            TrainingConfigV2(
+                data_root=str(tmp_path / "data"),
+                stage_filter="single_note_shape,single_note_all",
+                device="cpu",
+            )
+        )
+        stages = trainer._filter_stages(CurriculumPlanV2().stages)
+
+        assert [stage.name for stage in stages] == [
+            "single_note_shape",
+            "single_note_all",
+        ]
+        assert trainer._base_stage_for_training("single_note_shape") == "single_note_all"
+
     def test_stage_filter_rejects_removed_cached_frame_stages(self, tmp_path):
         TinyCorpusBuilderV2(tmp_path / "data").build()
         trainer = SourceTrackingTrainerV2(
@@ -134,14 +151,24 @@ class TestTrainSmokeV2:
                 "2",
                 "--validation-teacher-forcing-rate",
                 "0.25",
-                "--onset-label-radius-frames",
-                "0",
+                "--onset-shoulder-radius-frames",
+                "5",
                 "--offset-label-radius-frames",
                 "8",
                 "--boundary-negative-radius-frames",
                 "32",
                 "--onset-hard-negative-sample-prob",
                 "0.25",
+                "--onset-context-sample-prob",
+                "1.0",
+                "--positive-family-boosts",
+                "guitar=2,flute=2",
+                "--positive-quality-boosts",
+                "fast_decay=2,bright=1.5",
+                "--positive-source-boosts",
+                "acoustic=1.2",
+                "--positive-velocity-boosts",
+                "50=1.4",
                 "--early-stopping-metric",
                 "onset_average_precision",
                 "--early-stopping-patience",
@@ -170,8 +197,18 @@ class TestTrainSmokeV2:
                 "0.25",
                 "--onset-sequence-pairwise-ranking-loss-weight",
                 "0.1",
+                "--onset-sequence-block-positive-loss-weight",
+                "0.3",
+                "--onset-sequence-block-ranking-loss-weight",
+                "0.7",
+                "--onset-nearby-pairwise-ranking-loss-weight",
+                "0.9",
+                "--onset-peak-to-shoulder-ranking-loss-weight",
+                "1.1",
                 "--onset-peak-loss-weight",
                 "0.25",
+                "--onset-shoulder-loss-weight",
+                "0.12",
                 "--onset-event-recall-loss-weight",
                 "1.5",
                 "--onset-false-peak-loss-weight",
@@ -198,12 +235,14 @@ class TestTrainSmokeV2:
                 "--freeze-for-free-run-onset-sequence",
                 "--freeze-for-free-run-event-decoder",
                 "--event-state-use-predicted-age",
+                "--disable-event-state-conditioning",
+                "--primary-audio-only-event-decoder",
                 "--event-state-noise-std",
                 "0.1",
                 "--event-state-dropout-prob",
                 "0.2",
                 "--input-novelty-features",
-                "flux",
+                "salience",
                 "--anneal-noise-phase-jitter-samples",
                 "79",
                 "--anneal-noise-feature-std",
@@ -227,10 +266,15 @@ class TestTrainSmokeV2:
         assert config.validation_examples_per_epoch == 4
         assert config.validation_interval_epochs == 2
         assert config.validation_teacher_forcing_rate == 0.25
-        assert config.onset_label_radius_frames == 0
+        assert config.onset_shoulder_radius_frames == 5
         assert config.offset_label_radius_frames == 8
         assert config.boundary_negative_radius_frames == 32
         assert config.onset_hard_negative_sample_prob == 0.25
+        assert config.onset_context_sample_prob == 1.0
+        assert config.positive_family_boosts == "guitar=2,flute=2"
+        assert config.positive_quality_boosts == "fast_decay=2,bright=1.5"
+        assert config.positive_source_boosts == "acoustic=1.2"
+        assert config.positive_velocity_boosts == "50=1.4"
         assert config.early_stopping_metric == "onset_average_precision"
         assert config.early_stopping_patience == 10
         assert config.early_stopping_min_delta == 0.001
@@ -245,7 +289,12 @@ class TestTrainSmokeV2:
         assert config.onset_softmax_loss_weight == 0.5
         assert config.onset_sequence_loss_weight == 0.25
         assert config.onset_sequence_pairwise_ranking_loss_weight == 0.1
+        assert config.onset_sequence_block_positive_loss_weight == 0.3
+        assert config.onset_sequence_block_ranking_loss_weight == 0.7
+        assert config.onset_nearby_pairwise_ranking_loss_weight == 0.9
+        assert config.onset_peak_to_shoulder_ranking_loss_weight == 1.1
         assert config.onset_peak_loss_weight == 0.25
+        assert config.onset_shoulder_loss_weight == 0.12
         assert config.onset_event_recall_loss_weight == 1.5
         assert config.onset_false_peak_loss_weight == 0.4
         assert config.first_pass_boundary_loss_weight == 0.5
@@ -261,9 +310,11 @@ class TestTrainSmokeV2:
         assert config.freeze_for_free_run_onset_sequence is True
         assert config.freeze_for_free_run_event_decoder is True
         assert config.event_state_use_predicted_age is True
+        assert config.event_state_conditioning is False
+        assert config.primary_audio_only_event_decoder is True
         assert config.event_state_noise_std == 0.1
         assert config.event_state_dropout_prob == 0.2
-        assert config.input_novelty_features == "flux"
+        assert config.input_novelty_features == "salience"
         assert config.anneal_noise_phase_jitter_samples == 79
         assert config.anneal_noise_feature_std == 0.01
 
@@ -288,6 +339,46 @@ class TestTrainSmokeV2:
         assert torch.allclose(
             augmented[..., 2:],
             torch.tensor([[[0.0, 0.0], [0.3, 0.0], [0.0, 0.3]]]),
+        )
+
+    def test_salience_input_features_append_dsp_onset_channels(self):
+        builder = object.__new__(TrainingBatchBuilderV2)
+        builder.input_novelty_features = "salience"
+        frames = torch.tensor(
+            [
+                [
+                    [0.1, 0.3],
+                    [0.4, 0.2],
+                    [0.2, 0.5],
+                ]
+            ],
+            dtype=torch.float32,
+        )
+
+        augmented = builder._augment_frame_features(frames)
+
+        assert TrainingBatchBuilderV2.feature_dim("salience") == 245
+        assert augmented.shape == (1, 3, 17)
+        assert torch.equal(augmented[..., :2], frames)
+        assert torch.allclose(
+            augmented[..., 2:4],
+            torch.tensor([[[0.0, 0.0], [0.3, 0.0], [0.0, 0.3]]]),
+        )
+        assert torch.allclose(
+            augmented[..., 4:6],
+            torch.tensor([[[0.0, 0.0], [0.0, 0.1], [0.2, 0.0]]]),
+        )
+        assert torch.allclose(
+            augmented[..., -5:],
+            torch.tensor(
+                [
+                    [
+                        [0.2, 0.0, 0.0, 0.0, 0.75],
+                        [0.3, 0.15, 0.3, 0.0, 1.0 / 3.0],
+                        [0.35, 0.15, 0.0, 0.3, 5.0 / 7.0],
+                    ]
+                ]
+            ),
         )
 
     def test_partial_warm_start_expands_input_weight_for_flux_features(self, tmp_path):
@@ -450,20 +541,20 @@ class TestTrainSmokeV2:
             teacher_forcing_rate=0.0,
         )
 
-    def test_label_radius_config_reaches_renderer(self, tmp_path):
+    def test_boundary_radius_config_reaches_renderer(self, tmp_path):
         TinyCorpusBuilderV2(tmp_path / "data").build()
         trainer = SourceTrackingTrainerV2(
             TrainingConfigV2(
                 data_root=str(tmp_path / "data"),
                 device="cpu",
-                onset_label_radius_frames=0,
+                onset_shoulder_radius_frames=5,
                 offset_label_radius_frames=8,
                 boundary_negative_radius_frames=32,
                 onset_hard_negative_sample_prob=0.25,
             )
         )
 
-        assert trainer.renderer.config.onset_label_radius_frames == 0
+        assert trainer.renderer.config.onset_shoulder_radius_frames == 5
         assert trainer.renderer.config.offset_label_radius_frames == 8
         assert trainer.renderer.config.boundary_negative_radius_frames == 32
         assert trainer.renderer.config.onset_hard_negative_sample_prob == 0.25
@@ -615,7 +706,11 @@ class TestTrainSmokeV2:
 
         validation = payload["history"][0]["validation"]
         assert validation["metric_scope"] == "validation"
-        assert validation["metric_definition"] == "pointwise_inference_style_validation"
+        assert (
+            validation["metric_definition"]
+            == "pointwise_inference_style_validation_onset_shoulder_accepted"
+        )
+        assert validation["onset_metric_label"] == "onset_nearby_mask_when_available"
         assert validation["split"] == "validation"
         assert validation["event_teacher_forcing_rate"] == 0.0
         assert validation["examples"] == 2
@@ -838,6 +933,106 @@ class TestTrainSmokeV2:
         trainer._model_forward(batch, teacher_forcing_rate=1.0)
 
         assert trainer.model.calls == [batch["event_state"]]
+
+    def test_disabled_event_state_conditioning_bypasses_scheduled_sampling(self):
+        class SpyModel:
+            def __init__(self):
+                self.calls = []
+
+            def __call__(self, frames, event_state=None):
+                self.calls.append(event_state)
+                batch, frames_count = frames.shape[:2]
+                sources = 2
+                logits = torch.zeros(batch, frames_count, sources)
+                return {
+                    "onset_logits_sequence": logits,
+                    "offset_logits_sequence": logits,
+                }
+
+        trainer = object.__new__(SourceTrackingTrainerV2)
+        trainer.model = SpyModel()
+        trainer.config = TrainingConfigV2(event_state_conditioning=False)
+        batch = {
+            "frames": torch.zeros(1, 4, 40),
+            "event_state": torch.ones(1, 4, 2, 5),
+        }
+
+        trainer._model_forward(batch, teacher_forcing_rate=1.0)
+
+        assert trainer.model.calls == [None]
+
+    def test_primary_audio_only_event_decoder_bypasses_scheduled_sampling(self):
+        class SpyModel:
+            def __init__(self):
+                self.calls = []
+
+            def __call__(self, frames, event_state=None):
+                self.calls.append(event_state)
+                batch, frames_count = frames.shape[:2]
+                sources = 2
+                logits = torch.zeros(batch, frames_count, sources)
+                return {
+                    "onset_logits_sequence": logits,
+                    "offset_logits_sequence": logits,
+                }
+
+        trainer = object.__new__(SourceTrackingTrainerV2)
+        trainer.model = SpyModel()
+        trainer.config = TrainingConfigV2(primary_audio_only_event_decoder=True)
+        batch = {
+            "frames": torch.zeros(1, 4, 40),
+            "event_state": torch.ones(1, 4, 2, 5),
+        }
+
+        trainer._model_forward(batch, teacher_forcing_rate=0.0)
+
+        assert trainer.model.calls == [None]
+
+    def test_onset_sequence_negative_diagnostics_splits_hard_negative_classes(self):
+        scores = torch.tensor([[[0.9], [0.7], [0.1], [0.8]]])
+        targets = torch.tensor([[[1.0], [1.0], [0.0], [0.0]]])
+        nearby = torch.tensor([[[1.0], [1.0], [0.0], [0.0]]])
+        timing = torch.tensor([[[1.0], [0.0], [0.0], [0.0]]])
+
+        metrics = SourceTrackingTrainerV2._onset_sequence_negative_diagnostics(
+            scores,
+            targets,
+            nearby,
+            timing,
+        )
+
+        assert metrics["onset_sequence_positive_score_count"] == 2
+        assert metrics["onset_sequence_core_positive_score_count"] == 1
+        assert metrics["onset_sequence_shoulder_score_count"] == 1
+        assert metrics["onset_sequence_nearby_negative_score_count"] == 1
+        assert metrics["onset_sequence_far_negative_score_count"] == 2
+        assert metrics["onset_sequence_false_peak_negative_score_count"] == 1
+        assert metrics["onset_sequence_nearby_negative_score_max"] == pytest.approx(0.7)
+        assert metrics["onset_sequence_false_peak_negative_score_max"] == pytest.approx(0.8)
+
+    def test_censored_onset_sequence_metric_uses_one_item_per_onset_block(self):
+        scores = torch.tensor([[[0.2], [0.9], [0.1], [0.8], [0.05]]])
+        nearby = torch.tensor([[[1.0], [1.0], [1.0], [0.0], [0.0]]])
+        delta = torch.tensor([[[-1.0], [0.0], [1.0], [0.0], [0.0]]])
+        timing = torch.tensor([[[1.0], [1.0], [1.0], [0.0], [0.0]]])
+
+        metric_scores, metric_targets = (
+            SourceTrackingTrainerV2._censored_onset_sequence_metric_items(
+                scores,
+                nearby,
+                delta,
+                timing,
+            )
+        )
+
+        torch.testing.assert_close(metric_scores, torch.tensor([0.9, 0.8, 0.05]))
+        torch.testing.assert_close(metric_targets, torch.tensor([1.0, 0.0, 0.0]))
+        metrics = SourceTrackingTrainerV2._threshold_free_boundary_metrics(
+            metric_scores,
+            metric_targets,
+            "onset_sequence",
+        )
+        assert metrics["onset_sequence_average_precision"] == pytest.approx(1.0)
 
     def test_boundary_classification_metrics_aggregate_counts(self):
         first = {

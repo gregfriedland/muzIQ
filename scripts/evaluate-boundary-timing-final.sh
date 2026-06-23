@@ -17,6 +17,7 @@ sequence_calibration_melodies_per_instrument="1"
 activity_threshold="0.35"
 onset_threshold="0.35"
 offset_threshold="0.35"
+onset_tolerance_frames=""
 offset_tolerance_frames=""
 gcs_checkpoint_prefix="gs://rezo-flyte/scratch/serializable/muziq-nn/20260619/boundary-timing-notes200/checkpoints/"
 force=0
@@ -51,6 +52,7 @@ Options:
   --activity-threshold X            Activity threshold. Default: 0.35.
   --onset-threshold X               Fallback onset threshold. Default: 0.35.
   --offset-threshold X              Fallback offset threshold. Default: 0.35.
+  --onset-tolerance-frames N         Onset probe tolerance override.
   --offset-tolerance-frames N        Offset probe tolerance override.
   --gcs-checkpoint-prefix URI       Checkpoint upload prefix to record in summary.
   --force                           Re-run steps even when outputs exist.
@@ -114,6 +116,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --offset-threshold)
       offset_threshold="$2"
+      shift 2
+      ;;
+    --onset-tolerance-frames)
+      onset_tolerance_frames="$2"
       shift 2
       ;;
     --offset-tolerance-frames)
@@ -183,6 +189,9 @@ heldout_common=(
   --batch-size "$batch_size"
   --device "$device"
 )
+if [[ -n "$onset_tolerance_frames" ]]; then
+  heldout_common+=(--onset-tolerance-frames "$onset_tolerance_frames")
+fi
 if [[ -n "$offset_tolerance_frames" ]]; then
   heldout_common+=(--offset-tolerance-frames "$offset_tolerance_frames")
 fi

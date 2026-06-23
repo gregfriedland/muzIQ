@@ -65,6 +65,7 @@ class BoundaryTimingSequenceEvaluator:
             "family": family,
             "event_count": len(events),
             "sample_stride_ms": self.sample_stride_ms,
+            "onset_metric_label": "onset_shoulder_radius_frames",
             "calibration": self.calibration,
             "onset": self._event_metrics(events, predictions, family, "onset"),
             "offset": self._event_metrics(events, predictions, family, "offset"),
@@ -237,8 +238,12 @@ class BoundaryTimingSequenceEvaluator:
                     offset_threshold=offset_state_threshold,
                 )
             activity = torch.sigmoid(outputs["activity_logits"]).cpu().numpy()
-            onset = torch.sigmoid(outputs["onset_logits"]).cpu().numpy()
-            offset = torch.sigmoid(outputs["offset_logits"]).cpu().numpy()
+            onset = torch.sigmoid(
+                checkpoint.event_logits(outputs, "onset")
+            ).cpu().numpy()
+            offset = torch.sigmoid(
+                checkpoint.event_logits(outputs, "offset")
+            ).cpu().numpy()
             onset_delta = outputs["onset_delta"].cpu().numpy()
             offset_delta = outputs["offset_delta"].cpu().numpy()
             for item_idx in range(activity.shape[0]):
@@ -266,11 +271,7 @@ class BoundaryTimingSequenceEvaluator:
         kind: str,
     ) -> dict[str, object]:
         threshold = self._threshold(family, kind)
-        tolerance = (
-            SourceTrackingAudioConfigV2.onset_label_radius_frames
-            if kind == "onset"
-            else SourceTrackingAudioConfigV2.offset_label_radius_frames
-        )
+        tolerance = self._match_tolerance_frames(kind)
         errors = []
         matched = 0
         for event in events:
@@ -336,11 +337,7 @@ class BoundaryTimingSequenceEvaluator:
         kind: str,
         threshold: float,
     ) -> dict[str, object]:
-        tolerance = (
-            SourceTrackingAudioConfigV2.onset_label_radius_frames
-            if kind == "onset"
-            else SourceTrackingAudioConfigV2.offset_label_radius_frames
-        )
+        tolerance = self._match_tolerance_frames(kind)
         hop_ms = (
             1000.0
             * SourceTrackingAudioConfigV2.hop
@@ -502,11 +499,7 @@ class BoundaryTimingSequenceEvaluator:
         examples: list[tuple[list[SourceEventLabelV2], list[dict[str, object]], str]],
         kind: str,
     ) -> float:
-        tolerance = (
-            SourceTrackingAudioConfigV2.onset_label_radius_frames
-            if kind == "onset"
-            else SourceTrackingAudioConfigV2.offset_label_radius_frames
-        )
+        tolerance = self._match_tolerance_frames(kind)
         total_positives = sum(len(events) for events, _predictions, _family in examples)
         if total_positives == 0:
             return 0.0
@@ -557,6 +550,12 @@ class BoundaryTimingSequenceEvaluator:
             / SourceTrackingAudioConfigV2.sample_rate
         )
         return max(1, int(round(self.event_refractory_ms / hop_ms)))
+
+    @staticmethod
+    def _match_tolerance_frames(kind: str) -> int:
+        if kind == "onset":
+            return SourceTrackingAudioConfigV2.onset_shoulder_radius_frames
+        return SourceTrackingAudioConfigV2.offset_label_radius_frames
 
     @staticmethod
     def _prediction_peaks(

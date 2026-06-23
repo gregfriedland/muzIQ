@@ -34,6 +34,7 @@ class HeldoutEvalConfigV2:
     activity_threshold: float = 0.35
     onset_threshold: float = 0.35
     offset_threshold: float = 0.35
+    onset_tolerance_frames: int = SourceTrackingAudioConfigV2.onset_shoulder_radius_frames
     offset_tolerance_frames: int = SourceTrackingAudioConfigV2.offset_label_radius_frames
     batch_size: int = 1024
     device: str = "auto"
@@ -81,6 +82,8 @@ class NsynthHeldoutEvaluatorV2:
             "activity_threshold": self.config.activity_threshold,
             "onset_threshold": self.config.onset_threshold,
             "offset_threshold": self.config.offset_threshold,
+            "onset_tolerance_frames": self.config.onset_tolerance_frames,
+            "onset_metric_label": "onset_shoulder_radius_frames",
             "offset_tolerance_frames": self.config.offset_tolerance_frames,
             "calibration": self.calibration,
             "note_count": len(notes),
@@ -295,13 +298,18 @@ class NsynthHeldoutEvaluatorV2:
         end_frame = max(start_frame, int(math.floor(event.end_s * sample_rate / hop)))
         offset_frame = max(start_frame, end_frame - 1)
         mid_frame = (start_frame + end_frame) // 2
+        onset_start = max(0, start_frame - self.config.onset_tolerance_frames)
+        onset_end = start_frame + self.config.onset_tolerance_frames + 1
+        onset_frames = tuple(
+            ("onset", frame, start_frame) for frame in range(onset_start, onset_end)
+        )
         offset_start = max(0, offset_frame - self.config.offset_tolerance_frames)
         offset_end = offset_frame + self.config.offset_tolerance_frames + 1
         offset_frames = tuple(
             ("offset", frame, offset_frame) for frame in range(offset_start, offset_end)
         )
         return (
-            ("onset", start_frame, start_frame),
+            *onset_frames,
             ("active", mid_frame, None),
             *offset_frames,
         )
@@ -325,8 +333,12 @@ class NsynthHeldoutEvaluatorV2:
                 )
             activity = torch.sigmoid(outputs["activity_logits"]).cpu().numpy()
             family_probs = torch.softmax(outputs["family_logits"], dim=-1).cpu().numpy()
-            onset = torch.sigmoid(outputs["onset_logits"]).cpu().numpy()
-            offset = torch.sigmoid(outputs["offset_logits"]).cpu().numpy()
+            onset = torch.sigmoid(
+                self.checkpoint.event_logits(outputs, "onset")
+            ).cpu().numpy()
+            offset = torch.sigmoid(
+                self.checkpoint.event_logits(outputs, "offset")
+            ).cpu().numpy()
             onset_delta = outputs["onset_delta"].cpu().numpy()
             offset_delta = outputs["offset_delta"].cpu().numpy()
             count_logits = outputs.get("count_logits")
@@ -737,6 +749,11 @@ class NsynthHeldoutEvalCliV2:
         parser.add_argument("--onset-threshold", type=float, default=0.35)
         parser.add_argument("--offset-threshold", type=float, default=0.35)
         parser.add_argument(
+            "--onset-tolerance-frames",
+            type=int,
+            default=SourceTrackingAudioConfigV2.onset_shoulder_radius_frames,
+        )
+        parser.add_argument(
             "--offset-tolerance-frames",
             type=int,
             default=SourceTrackingAudioConfigV2.offset_label_radius_frames,
@@ -763,6 +780,7 @@ class NsynthHeldoutEvalCliV2:
                 activity_threshold=args.activity_threshold,
                 onset_threshold=args.onset_threshold,
                 offset_threshold=args.offset_threshold,
+                onset_tolerance_frames=args.onset_tolerance_frames,
                 offset_tolerance_frames=args.offset_tolerance_frames,
                 batch_size=args.batch_size,
                 device=args.device,

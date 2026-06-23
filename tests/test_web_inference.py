@@ -13,6 +13,7 @@ from muziq_nn.webapp import app as web_app
 from muziq_nn.webapp.app import MacAudioDeviceProbeV2, SourceTrackingWebAppV2, create_app
 from muziq_nn.webapp.inference import (
     RealtimeSourceTrackerV2,
+    SourceTrackingCheckpointLoaderV2,
     SourceTrackingCheckpointLocatorV2,
 )
 
@@ -105,6 +106,18 @@ class TestRealtimeSourceTrackerV2:
         assert RealtimeSourceTrackerV2._slot_position(np.array([], dtype=np.float32)) == 0.5
         assert RealtimeSourceTrackerV2._slot_position(np.array([0.0], dtype=np.float32)) == 0.5
         assert RealtimeSourceTrackerV2._slot_position(np.array([2.0], dtype=np.float32)) > 0.9
+
+    def test_event_logits_prefers_latest_sequence_step(self):
+        outputs = {
+            "onset_logits": torch.tensor([[99.0, 99.0]]),
+            "onset_logits_sequence": torch.tensor(
+                [[[1.0, 2.0], [3.0, 4.0]]]
+            ),
+        }
+
+        logits = SourceTrackingCheckpointLoaderV2.event_logits(outputs, "onset")
+
+        assert torch.equal(logits, torch.tensor([[3.0, 4.0]]))
 
 
 class TestMacAudioDeviceProbeV2:

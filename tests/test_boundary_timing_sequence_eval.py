@@ -59,6 +59,15 @@ def test_threshold_prefers_sequence_calibration_over_sparse_probe_calibration():
     assert evaluator._threshold("guitar", "onset") == 0.7
 
 
+def test_onset_sequence_matching_uses_shoulder_tolerance():
+    module = _load_sequence_eval_module()
+    evaluator_cls = module.BoundaryTimingSequenceEvaluator
+
+    assert evaluator_cls._match_tolerance_frames("onset") == (
+        module.SourceTrackingAudioConfigV2.onset_shoulder_radius_frames
+    )
+
+
 def test_sequence_threshold_search_penalizes_false_peaks():
     module = _load_sequence_eval_module()
     evaluator = object.__new__(module.BoundaryTimingSequenceEvaluator)

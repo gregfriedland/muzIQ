@@ -22,6 +22,7 @@ from typing import Any
 
 import numpy as np
 import torch
+from torch.nn import functional as F
 
 from muziq_nn.datasets.midi import MidiIndexV2
 from muziq_nn.datasets.nsynth import NsynthIndexV2
@@ -204,6 +205,11 @@ class TrainingConfigV2:
     onset_softmax_loss_weight: float = 0.0
     onset_sequence_loss_weight: float = 0.0
     onset_sequence_pairwise_ranking_loss_weight: float = 0.0
+    onset_sequence_block_positive_loss_weight: float = 0.0
+    onset_sequence_block_ranking_loss_weight: float = 0.0
+    onset_nearby_pairwise_ranking_loss_weight: float = 0.0
+    onset_peak_to_shoulder_ranking_loss_weight: float = 0.0
+    onset_shoulder_loss_weight: float = 0.15
     onset_peak_loss_weight: float = 0.25
     onset_event_recall_loss_weight: float = 1.0
     onset_false_peak_loss_weight: float = 0.5
@@ -231,6 +237,8 @@ class TrainingConfigV2:
     event_state_onset_threshold: float = 0.5
     event_state_offset_threshold: float = 0.5
     event_state_soft_events: bool = False
+    event_state_conditioning: bool = True
+    primary_audio_only_event_decoder: bool = False
     event_state_use_predicted_age: bool = False
     event_state_noise_std: float = 0.0
     event_state_dropout_prob: float = 0.0
@@ -242,7 +250,9 @@ class TrainingConfigV2:
     frame_phase_noise_std: float = 0.0
     anneal_noise_phase_jitter_samples: int = 0
     anneal_noise_feature_std: float = 0.0
-    onset_label_radius_frames: int = SourceTrackingAudioConfigV2.onset_label_radius_frames
+    onset_shoulder_radius_frames: int = (
+        SourceTrackingAudioConfigV2.onset_shoulder_radius_frames
+    )
     offset_label_radius_frames: int = SourceTrackingAudioConfigV2.offset_label_radius_frames
     boundary_negative_radius_frames: int = (
         SourceTrackingAudioConfigV2.boundary_negative_radius_frames
@@ -250,6 +260,11 @@ class TrainingConfigV2:
     onset_hard_negative_sample_prob: float = (
         SourceTrackingAudioConfigV2.onset_hard_negative_sample_prob
     )
+    onset_context_sample_prob: float = SourceTrackingAudioConfigV2.onset_context_sample_prob
+    positive_family_boosts: str = SourceTrackingAudioConfigV2.positive_family_boosts
+    positive_quality_boosts: str = SourceTrackingAudioConfigV2.positive_quality_boosts
+    positive_source_boosts: str = SourceTrackingAudioConfigV2.positive_source_boosts
+    positive_velocity_boosts: str = SourceTrackingAudioConfigV2.positive_velocity_boosts
     early_stopping_metric: str = ""
     early_stopping_patience: int = 0
     early_stopping_min_delta: float = 0.0
@@ -296,6 +311,7 @@ class TrainingBatchBuilderV2:
         onset_delta = []
         offset_delta = []
         onset_timing_mask = []
+        onset_nearby_mask = []
         offset_timing_mask = []
         context_activity = []
         context_family = []
@@ -304,6 +320,7 @@ class TrainingBatchBuilderV2:
         context_onset_delta = []
         context_offset_delta = []
         context_onset_timing_mask = []
+        context_onset_nearby_mask = []
         context_offset_timing_mask = []
         event_state = []
         for item in slices:
@@ -314,6 +331,7 @@ class TrainingBatchBuilderV2:
             onset_delta.append(item["onset_delta"])
             offset_delta.append(item["offset_delta"])
             onset_timing_mask.append(item["onset_timing_mask"])
+            onset_nearby_mask.append(item["onset_nearby_mask"])
             offset_timing_mask.append(item["offset_timing_mask"])
             context_activity.append(item["context_activity"])
             context_family.append(np.maximum(item["context_family"], 0))
@@ -322,6 +340,7 @@ class TrainingBatchBuilderV2:
             context_onset_delta.append(item["context_onset_delta"])
             context_offset_delta.append(item["context_offset_delta"])
             context_onset_timing_mask.append(item["context_onset_timing_mask"])
+            context_onset_nearby_mask.append(item["context_onset_nearby_mask"])
             context_offset_timing_mask.append(item["context_offset_timing_mask"])
             event_state.append(item["event_state"])
         return {
@@ -334,6 +353,9 @@ class TrainingBatchBuilderV2:
             "offset_delta": self._to_device(np.asarray(offset_delta, dtype=np.float32)),
             "onset_timing_mask": self._to_device(
                 np.asarray(onset_timing_mask, dtype=np.float32)
+            ),
+            "onset_nearby_mask": self._to_device(
+                np.asarray(onset_nearby_mask, dtype=np.float32)
             ),
             "offset_timing_mask": self._to_device(
                 np.asarray(offset_timing_mask, dtype=np.float32)
@@ -352,6 +374,9 @@ class TrainingBatchBuilderV2:
             ),
             "context_onset_timing_mask": self._to_device(
                 np.asarray(context_onset_timing_mask, dtype=np.float32)
+            ),
+            "context_onset_nearby_mask": self._to_device(
+                np.asarray(context_onset_nearby_mask, dtype=np.float32)
             ),
             "context_offset_timing_mask": self._to_device(
                 np.asarray(context_offset_timing_mask, dtype=np.float32)
@@ -387,22 +412,72 @@ class TrainingBatchBuilderV2:
 
     @classmethod
     def feature_dim(cls, input_novelty_features: str = "none") -> int:
+        bands = SourceTrackingAudioConfigV2.bands
         if input_novelty_features == "none":
-            return SourceTrackingAudioConfigV2.bands
+            return bands
         if input_novelty_features == "flux":
-            return SourceTrackingAudioConfigV2.bands * 2
+            return bands * 2
+        if input_novelty_features == "salience":
+            return bands * 6 + 5
         raise ValueError(f"Unknown input_novelty_features={input_novelty_features!r}")
 
     def _augment_frame_features(self, frames: torch.Tensor) -> torch.Tensor:
         if self.input_novelty_features == "none":
             return frames
-        if self.input_novelty_features != "flux":
+        if self.input_novelty_features not in {"flux", "salience"}:
             raise ValueError(
                 f"Unknown input_novelty_features={self.input_novelty_features!r}"
             )
         previous = torch.cat([frames[:, :1, :], frames[:, :-1, :]], dim=1)
-        flux = torch.relu(frames - previous)
-        return torch.cat([frames, flux], dim=-1)
+        diff = frames - previous
+        flux = torch.relu(diff)
+        if self.input_novelty_features == "flux":
+            return torch.cat([frames, flux], dim=-1)
+
+        previous_diff = torch.cat([diff[:, :1, :], diff[:, :-1, :]], dim=1)
+        negative_flux = torch.relu(-diff)
+        absolute_flux = diff.abs()
+        positive_acceleration = torch.relu(diff - previous_diff)
+        local_mean = F.avg_pool1d(
+            frames.reshape(-1, frames.shape[-1]).unsqueeze(1),
+            kernel_size=5,
+            stride=1,
+            padding=2,
+        ).squeeze(1).reshape_as(frames)
+        local_contrast = torch.relu(frames - local_mean)
+
+        broadband_energy = frames.mean(dim=-1, keepdim=True)
+        broadband_flux = flux.mean(dim=-1, keepdim=True)
+        low_band_flux = flux[..., : frames.shape[-1] // 2].mean(dim=-1, keepdim=True)
+        high_band_flux = flux[..., frames.shape[-1] // 2 :].mean(dim=-1, keepdim=True)
+        weights = torch.linspace(
+            0.0,
+            1.0,
+            frames.shape[-1],
+            dtype=frames.dtype,
+            device=frames.device,
+        ).view(1, 1, -1)
+        spectral_centroid = (frames * weights).sum(dim=-1, keepdim=True) / frames.sum(
+            dim=-1,
+            keepdim=True,
+        ).clamp_min(1e-6)
+
+        return torch.cat(
+            [
+                frames,
+                flux,
+                negative_flux,
+                absolute_flux,
+                positive_acceleration,
+                local_contrast,
+                broadband_energy,
+                broadband_flux,
+                low_band_flux,
+                high_band_flux,
+                spectral_centroid,
+            ],
+            dim=-1,
+        )
 
     def _to_device(self, array: np.ndarray) -> torch.Tensor:
         tensor = torch.from_numpy(array)
@@ -436,6 +511,7 @@ class TrainingBatchBuilderV2:
             "onset_delta": example.labels.onset_delta[frame_idx],
             "offset_delta": example.labels.offset_delta[frame_idx],
             "onset_timing_mask": example.labels.onset_timing_mask[frame_idx],
+            "onset_nearby_mask": example.labels.onset_nearby_mask[frame_idx],
             "offset_timing_mask": example.labels.offset_timing_mask[frame_idx],
         }
 
@@ -496,6 +572,10 @@ class CachedFramePoolV2:
             (examples, SourceTrackingAudioConfigV2.max_sources),
             dtype=np.float32,
         )
+        self.onset_nearby_mask = np.empty(
+            (examples, SourceTrackingAudioConfigV2.max_sources),
+            dtype=np.float32,
+        )
         self.offset_timing_mask = np.empty(
             (examples, SourceTrackingAudioConfigV2.max_sources),
             dtype=np.float32,
@@ -512,6 +592,7 @@ class CachedFramePoolV2:
         self.context_onset_delta = np.empty(context_shape, dtype=np.float32)
         self.context_offset_delta = np.empty(context_shape, dtype=np.float32)
         self.context_onset_timing_mask = np.empty(context_shape, dtype=np.float32)
+        self.context_onset_nearby_mask = np.empty(context_shape, dtype=np.float32)
         self.context_offset_timing_mask = np.empty(context_shape, dtype=np.float32)
         self.event_state = np.empty((*context_shape, 5), dtype=np.float32)
 
@@ -528,6 +609,9 @@ class CachedFramePoolV2:
         self.offset_delta[start:stop] = batch["offset_delta"].detach().cpu().numpy()
         self.onset_timing_mask[start:stop] = (
             batch["onset_timing_mask"].detach().cpu().numpy()
+        )
+        self.onset_nearby_mask[start:stop] = (
+            batch["onset_nearby_mask"].detach().cpu().numpy()
         )
         self.offset_timing_mask[start:stop] = (
             batch["offset_timing_mask"].detach().cpu().numpy()
@@ -546,6 +630,9 @@ class CachedFramePoolV2:
         )
         self.context_onset_timing_mask[start:stop] = (
             batch["context_onset_timing_mask"].detach().cpu().numpy()
+        )
+        self.context_onset_nearby_mask[start:stop] = (
+            batch["context_onset_nearby_mask"].detach().cpu().numpy()
         )
         self.context_offset_timing_mask[start:stop] = (
             batch["context_offset_timing_mask"].detach().cpu().numpy()
@@ -590,6 +677,9 @@ class CachedFramePoolV2:
         self.onset_timing_mask[start:stop] = np.asarray(
             [item["onset_timing_mask"] for item in slices], dtype=np.float32
         )
+        self.onset_nearby_mask[start:stop] = np.asarray(
+            [item["onset_nearby_mask"] for item in slices], dtype=np.float32
+        )
         self.offset_timing_mask[start:stop] = np.asarray(
             [item["offset_timing_mask"] for item in slices], dtype=np.float32
         )
@@ -614,6 +704,9 @@ class CachedFramePoolV2:
         )
         self.context_onset_timing_mask[start:stop] = np.asarray(
             [item["context_onset_timing_mask"] for item in slices], dtype=np.float32
+        )
+        self.context_onset_nearby_mask[start:stop] = np.asarray(
+            [item["context_onset_nearby_mask"] for item in slices], dtype=np.float32
         )
         self.context_offset_timing_mask[start:stop] = np.asarray(
             [item["context_offset_timing_mask"] for item in slices], dtype=np.float32
@@ -654,6 +747,9 @@ class CachedFramePoolV2:
             "onset_timing_mask": self._to_device(
                 self.onset_timing_mask[indices], device, pin_memory
             ).float(),
+            "onset_nearby_mask": self._to_device(
+                self.onset_nearby_mask[indices], device, pin_memory
+            ).float(),
             "offset_timing_mask": self._to_device(
                 self.offset_timing_mask[indices], device, pin_memory
             ).float(),
@@ -677,6 +773,9 @@ class CachedFramePoolV2:
             ).float(),
             "context_onset_timing_mask": self._to_device(
                 self.context_onset_timing_mask[indices], device, pin_memory
+            ).float(),
+            "context_onset_nearby_mask": self._to_device(
+                self.context_onset_nearby_mask[indices], device, pin_memory
             ).float(),
             "context_offset_timing_mask": self._to_device(
                 self.context_offset_timing_mask[indices], device, pin_memory
@@ -724,46 +823,100 @@ class TrainingProgressLoggerV2:
 class TrainingRenderWorkerV2:
     """Render batch slices in worker processes with one renderer per process."""
 
-    _renderers: dict[tuple[str, bool, int, int, int, float], SourceTrackingRendererV2] = {}
+    _renderers: dict[tuple[object, ...], SourceTrackingRendererV2] = {}
 
     @staticmethod
     def render_slice(
-        task: tuple[
-            str,
-            str,
-            SplitName,
-            int,
-            int,
-            int,
-            bool,
-            int,
-            int,
-            int,
-            int,
-            float,
-        ],
+        task: tuple[object, ...],
     ) -> dict[str, np.ndarray]:
-        (
-            data_root,
-            stage,
-            split,
-            seed,
-            frame_count,
-            peak_warmup_frames,
-            gpu_frame_extraction,
-            phase_offset_samples,
-            onset_label_radius_frames,
-            offset_label_radius_frames,
-            boundary_negative_radius_frames,
-            onset_hard_negative_sample_prob,
-        ) = task
+        if len(task) == 8:
+            (
+                data_root,
+                stage,
+                split,
+                seed,
+                frame_count,
+                peak_warmup_frames,
+                gpu_frame_extraction,
+                phase_offset_samples,
+            ) = task
+            onset_shoulder_radius_frames = (
+                SourceTrackingAudioConfigV2.onset_shoulder_radius_frames
+            )
+            offset_label_radius_frames = (
+                SourceTrackingAudioConfigV2.offset_label_radius_frames
+            )
+            boundary_negative_radius_frames = (
+                SourceTrackingAudioConfigV2.boundary_negative_radius_frames
+            )
+            onset_hard_negative_sample_prob = (
+                SourceTrackingAudioConfigV2.onset_hard_negative_sample_prob
+            )
+            onset_context_sample_prob = (
+                SourceTrackingAudioConfigV2.onset_context_sample_prob
+            )
+            positive_family_boosts = SourceTrackingAudioConfigV2.positive_family_boosts
+            positive_quality_boosts = SourceTrackingAudioConfigV2.positive_quality_boosts
+            positive_source_boosts = SourceTrackingAudioConfigV2.positive_source_boosts
+            positive_velocity_boosts = SourceTrackingAudioConfigV2.positive_velocity_boosts
+        else:
+            values = tuple(task)
+            (
+                data_root,
+                stage,
+                split,
+                seed,
+                frame_count,
+                peak_warmup_frames,
+                gpu_frame_extraction,
+                phase_offset_samples,
+                onset_shoulder_radius_frames,
+                offset_label_radius_frames,
+                boundary_negative_radius_frames,
+                onset_hard_negative_sample_prob,
+            ) = values[:12]
+            if len(values) >= 17:
+                onset_context_sample_prob = values[12]
+                positive_family_boosts = values[13]
+                positive_quality_boosts = values[14]
+                positive_source_boosts = values[15]
+                positive_velocity_boosts = values[16]
+            else:
+                onset_context_sample_prob = (
+                    SourceTrackingAudioConfigV2.onset_context_sample_prob
+                )
+                positive_family_boosts = (
+                    values[12]
+                    if len(values) > 12
+                    else SourceTrackingAudioConfigV2.positive_family_boosts
+                )
+                positive_quality_boosts = (
+                    values[13]
+                    if len(values) > 13
+                    else SourceTrackingAudioConfigV2.positive_quality_boosts
+                )
+                positive_source_boosts = (
+                    values[14]
+                    if len(values) > 14
+                    else SourceTrackingAudioConfigV2.positive_source_boosts
+                )
+                positive_velocity_boosts = (
+                    values[15]
+                    if len(values) > 15
+                    else SourceTrackingAudioConfigV2.positive_velocity_boosts
+                )
         renderer = TrainingRenderWorkerV2._renderer(
             data_root,
             include_midi=stage == "midi_complex",
-            onset_label_radius_frames=onset_label_radius_frames,
+            onset_shoulder_radius_frames=onset_shoulder_radius_frames,
             offset_label_radius_frames=offset_label_radius_frames,
             boundary_negative_radius_frames=boundary_negative_radius_frames,
             onset_hard_negative_sample_prob=onset_hard_negative_sample_prob,
+            onset_context_sample_prob=onset_context_sample_prob,
+            positive_family_boosts=positive_family_boosts,
+            positive_quality_boosts=positive_quality_boosts,
+            positive_source_boosts=positive_source_boosts,
+            positive_velocity_boosts=positive_velocity_boosts,
         )
         if gpu_frame_extraction:
             return renderer.render_training_audio_slice(
@@ -787,18 +940,28 @@ class TrainingRenderWorkerV2:
     def _renderer(
         data_root: str,
         include_midi: bool,
-        onset_label_radius_frames: int,
+        onset_shoulder_radius_frames: int,
         offset_label_radius_frames: int,
         boundary_negative_radius_frames: int,
         onset_hard_negative_sample_prob: float,
+        onset_context_sample_prob: float,
+        positive_family_boosts: str,
+        positive_quality_boosts: str,
+        positive_source_boosts: str,
+        positive_velocity_boosts: str,
     ) -> SourceTrackingRendererV2:
         cache_key = (
             data_root,
             include_midi,
-            onset_label_radius_frames,
+            onset_shoulder_radius_frames,
             offset_label_radius_frames,
             boundary_negative_radius_frames,
             onset_hard_negative_sample_prob,
+            onset_context_sample_prob,
+            positive_family_boosts,
+            positive_quality_boosts,
+            positive_source_boosts,
+            positive_velocity_boosts,
         )
         renderer = TrainingRenderWorkerV2._renderers.get(cache_key)
         if renderer is not None:
@@ -809,10 +972,15 @@ class TrainingRenderWorkerV2:
             "TrainingAudioConfigV2",
             (SourceTrackingAudioConfigV2,),
             {
-                "onset_label_radius_frames": onset_label_radius_frames,
+                "onset_shoulder_radius_frames": onset_shoulder_radius_frames,
                 "offset_label_radius_frames": offset_label_radius_frames,
                 "boundary_negative_radius_frames": boundary_negative_radius_frames,
                 "onset_hard_negative_sample_prob": onset_hard_negative_sample_prob,
+                "onset_context_sample_prob": onset_context_sample_prob,
+                "positive_family_boosts": positive_family_boosts,
+                "positive_quality_boosts": positive_quality_boosts,
+                "positive_source_boosts": positive_source_boosts,
+                "positive_velocity_boosts": positive_velocity_boosts,
             },
         )
         renderer = SourceTrackingRendererV2(
@@ -1008,7 +1176,12 @@ class SourceTrackingTrainerV2:
     """Train the compact attention model from generated examples."""
 
     FRAME_CACHE_STAGE_TO_BASE: dict[str, str] = {}
-    ANNEALED_NOISE_STAGES = {"single_note_all", "single_instrument_melody"}
+    STAGE_ALIASES: dict[str, str] = {"single_note_shape": "single_note_all"}
+    ANNEALED_NOISE_STAGES = {
+        "single_note_shape",
+        "single_note_all",
+        "single_instrument_melody",
+    }
     BOUNDARY_COUNT_METRIC_SUFFIXES = (
         "_true_positive_count",
         "_false_positive_count",
@@ -1035,6 +1208,7 @@ class SourceTrackingTrainerV2:
             layers=config.model_layers,
             event_decoder_layers=config.event_decoder_layers,
             event_decoder_heads=config.event_decoder_heads,
+            event_state_conditioning=config.event_state_conditioning,
             identity_dim=config.identity_dim,
         )
         self.model = DualPathTransformerSourceTrackerV2(self.model_config).to(self.device)
@@ -1075,6 +1249,19 @@ class SourceTrackingTrainerV2:
             onset_sequence_pairwise_ranking_loss_weight=(
                 config.onset_sequence_pairwise_ranking_loss_weight
             ),
+            onset_sequence_block_positive_loss_weight=(
+                config.onset_sequence_block_positive_loss_weight
+            ),
+            onset_sequence_block_ranking_loss_weight=(
+                config.onset_sequence_block_ranking_loss_weight
+            ),
+            onset_nearby_pairwise_ranking_loss_weight=(
+                config.onset_nearby_pairwise_ranking_loss_weight
+            ),
+            onset_peak_to_shoulder_ranking_loss_weight=(
+                config.onset_peak_to_shoulder_ranking_loss_weight
+            ),
+            onset_shoulder_loss_weight=config.onset_shoulder_loss_weight,
             onset_peak_loss_weight=config.onset_peak_loss_weight,
             onset_event_recall_loss_weight=config.onset_event_recall_loss_weight,
             onset_false_peak_loss_weight=config.onset_false_peak_loss_weight,
@@ -1143,7 +1330,9 @@ class SourceTrackingTrainerV2:
                     self.config.anneal_noise_phase_jitter_samples
                 ),
                 "anneal_noise_feature_std": self.config.anneal_noise_feature_std,
-                "onset_label_radius_frames": self.config.onset_label_radius_frames,
+                "onset_shoulder_radius_frames": (
+                    self.config.onset_shoulder_radius_frames
+                ),
                 "offset_label_radius_frames": self.config.offset_label_radius_frames,
                 "boundary_negative_radius_frames": (
                     self.config.boundary_negative_radius_frames
@@ -1151,6 +1340,11 @@ class SourceTrackingTrainerV2:
                 "onset_hard_negative_sample_prob": (
                     self.config.onset_hard_negative_sample_prob
                 ),
+                "onset_context_sample_prob": self.config.onset_context_sample_prob,
+                "positive_family_boosts": self.config.positive_family_boosts,
+                "positive_quality_boosts": self.config.positive_quality_boosts,
+                "positive_source_boosts": self.config.positive_source_boosts,
+                "positive_velocity_boosts": self.config.positive_velocity_boosts,
                 "event_teacher_forcing_start": self.config.event_teacher_forcing_start,
                 "event_teacher_forcing_end": self.config.event_teacher_forcing_end,
                 "event_state_onset_threshold": (
@@ -1160,6 +1354,10 @@ class SourceTrackingTrainerV2:
                     self.config.event_state_offset_threshold
                 ),
                 "event_state_soft_events": self.config.event_state_soft_events,
+                "event_state_conditioning": self.config.event_state_conditioning,
+                "primary_audio_only_event_decoder": (
+                    self.config.primary_audio_only_event_decoder
+                ),
                 "event_state_use_predicted_age": (
                     self.config.event_state_use_predicted_age
                 ),
@@ -1228,6 +1426,21 @@ class SourceTrackingTrainerV2:
                     ),
                     "onset_sequence_pairwise_ranking_loss_weight": (
                         self.config.onset_sequence_pairwise_ranking_loss_weight
+                    ),
+                    "onset_sequence_block_positive_loss_weight": (
+                        self.config.onset_sequence_block_positive_loss_weight
+                    ),
+                    "onset_sequence_block_ranking_loss_weight": (
+                        self.config.onset_sequence_block_ranking_loss_weight
+                    ),
+                    "onset_nearby_pairwise_ranking_loss_weight": (
+                        self.config.onset_nearby_pairwise_ranking_loss_weight
+                    ),
+                    "onset_peak_to_shoulder_ranking_loss_weight": (
+                        self.config.onset_peak_to_shoulder_ranking_loss_weight
+                    ),
+                    "onset_shoulder_loss_weight": (
+                        self.config.onset_shoulder_loss_weight
                     ),
                     "onset_peak_loss_weight": self.config.onset_peak_loss_weight,
                     "onset_event_recall_loss_weight": (
@@ -1835,6 +2048,75 @@ class SourceTrackingTrainerV2:
         interval = max(1, self.config.validation_interval_epochs)
         return (epoch + 1) % interval == 0 or epoch + 1 == stage_epochs
 
+    @staticmethod
+    def _accepted_onset_target(
+        core_onset: torch.Tensor,
+        nearby_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if nearby_mask is not None and nearby_mask.shape == core_onset.shape:
+            return nearby_mask > 0.5
+        return core_onset > 0.5
+
+    @classmethod
+    def _onset_sequence_negative_diagnostics(
+        cls,
+        scores: torch.Tensor,
+        targets: torch.Tensor,
+        nearby_mask: torch.Tensor,
+        timing_mask: torch.Tensor,
+    ) -> dict[str, object]:
+        accepted_positive = targets > 0.5
+        core_positive = timing_mask > 0.5
+        shoulder = (nearby_mask > 0.5) & ~core_positive
+        far_negative = ~accepted_positive
+        local_max = scores >= SourceTrackingLossV2._temporal_max(scores, 1)
+        false_peak = (nearby_mask <= 0.5) & local_max
+        return {
+            **cls._score_summary(
+                "onset_sequence_positive_score",
+                scores[accepted_positive],
+            ),
+            **cls._score_summary(
+                "onset_sequence_core_positive_score",
+                scores[core_positive],
+            ),
+            **cls._score_summary(
+                "onset_sequence_shoulder_score",
+                scores[shoulder],
+            ),
+            **cls._score_summary(
+                "onset_sequence_nearby_negative_score",
+                scores[shoulder],
+            ),
+            **cls._score_summary(
+                "onset_sequence_far_negative_score",
+                scores[far_negative],
+            ),
+            **cls._score_summary(
+                "onset_sequence_false_peak_negative_score",
+                scores[false_peak],
+            ),
+        }
+
+    @staticmethod
+    def _score_summary(prefix: str, values: torch.Tensor) -> dict[str, object]:
+        count = int(values.numel())
+        if count == 0:
+            return {
+                f"{prefix}_count": 0,
+                f"{prefix}_mean": None,
+                f"{prefix}_top1p_mean": None,
+                f"{prefix}_max": None,
+            }
+        values = values.detach().float().reshape(-1)
+        k = max(1, int(np.ceil(count * 0.01)))
+        return {
+            f"{prefix}_count": count,
+            f"{prefix}_mean": float(values.mean().item()),
+            f"{prefix}_top1p_mean": float(torch.topk(values, k=k).values.mean().item()),
+            f"{prefix}_max": float(values.max().item()),
+        }
+
     def _validation_epoch_metrics(
         self,
         stage_name: str,
@@ -1848,6 +2130,9 @@ class SourceTrackingTrainerV2:
         boundary_targets: dict[str, list[torch.Tensor]] = {"onset": [], "offset": []}
         sequence_scores: dict[str, list[torch.Tensor]] = {"onset": []}
         sequence_targets: dict[str, list[torch.Tensor]] = {"onset": []}
+        sequence_nearby_masks: list[torch.Tensor] = []
+        sequence_timing_masks: list[torch.Tensor] = []
+        sequence_deltas: list[torch.Tensor] = []
         age_scores: dict[str, list[torch.Tensor]] = {"onset": [], "offset": []}
         age_targets: dict[str, list[torch.Tensor]] = {"onset": [], "offset": []}
         validation_start = time.monotonic()
@@ -1882,9 +2167,15 @@ class SourceTrackingTrainerV2:
                             .float()
                             .cpu()
                         )
-                        boundary_targets[prefix].append(
-                            (batch[prefix] > 0.5).detach().float().cpu()
+                        target = (
+                            self._accepted_onset_target(
+                                batch[prefix],
+                                batch.get("onset_nearby_mask"),
+                            )
+                            if prefix == "onset"
+                            else batch[prefix] > 0.5
                         )
+                        boundary_targets[prefix].append(target.detach().float().cpu())
                     onset_sequence = outputs.get("onset_logits_sequence")
                     if onset_sequence is not None:
                         sequence_scores["onset"].append(
@@ -1893,12 +2184,28 @@ class SourceTrackingTrainerV2:
                             .float()
                             .cpu()
                         )
+                        nearby_mask = batch.get("context_onset_nearby_mask")
                         sequence_targets["onset"].append(
-                            (batch["context_onset"] > 0.5)
+                            self._accepted_onset_target(
+                                batch["context_onset"],
+                                nearby_mask,
+                            )
                             .detach()
                             .float()
                             .cpu()
                         )
+                        if nearby_mask is not None:
+                            sequence_nearby_masks.append(
+                                (nearby_mask > 0.5).detach().float().cpu()
+                            )
+                        timing_mask = batch.get("context_onset_timing_mask")
+                        if timing_mask is not None:
+                            sequence_timing_masks.append(
+                                (timing_mask > 0.5).detach().float().cpu()
+                            )
+                        delta = batch.get("context_onset_delta")
+                        if delta is not None:
+                            sequence_deltas.append(delta.detach().float().cpu())
                     if self._uses_first_pass_age_metrics():
                         with self._autocast_context():
                             first_pass = self.model(batch["frames"])
@@ -1944,16 +2251,53 @@ class SourceTrackingTrainerV2:
                 self._threshold_free_boundary_metrics(
                     scores.reshape(-1),
                     targets.reshape(-1),
-                    "onset_sequence",
+                    "onset_sequence_frame",
                 )
             )
-            threshold_free_metrics.update(
-                self._slot_invariant_boundary_metrics(
-                    scores,
-                    targets,
-                    "onset_sequence_slot_invariant",
+            if sequence_nearby_masks and sequence_deltas:
+                censored_scores, censored_targets = (
+                    self._censored_onset_sequence_metric_items(
+                        scores,
+                        torch.cat(sequence_nearby_masks),
+                        torch.cat(sequence_deltas),
+                        torch.cat(sequence_timing_masks)
+                        if sequence_timing_masks
+                        else torch.cat(sequence_nearby_masks),
+                    )
                 )
-            )
+                threshold_free_metrics.update(
+                    self._threshold_free_boundary_metrics(
+                        censored_scores,
+                        censored_targets,
+                        "onset_sequence",
+                    )
+                )
+            else:
+                threshold_free_metrics.update(
+                    self._threshold_free_boundary_metrics(
+                        scores.reshape(-1),
+                        targets.reshape(-1),
+                        "onset_sequence",
+                    )
+                )
+                threshold_free_metrics.update(
+                    self._slot_invariant_boundary_metrics(
+                        scores,
+                        targets,
+                        "onset_sequence_slot_invariant",
+                    )
+                )
+            if sequence_nearby_masks:
+                threshold_free_metrics.update(
+                    self._onset_sequence_negative_diagnostics(
+                        scores,
+                        targets,
+                        torch.cat(sequence_nearby_masks),
+                        torch.cat(sequence_timing_masks)
+                        if sequence_timing_masks
+                        else torch.zeros_like(targets),
+                    )
+                )
         for prefix in ("onset", "offset"):
             if age_scores[prefix]:
                 scores = torch.cat(age_scores[prefix])
@@ -1970,7 +2314,11 @@ class SourceTrackingTrainerV2:
             "epoch": epoch + 1,
             "split": self.config.validation_split,
             "metric_scope": "validation",
-            "metric_definition": "pointwise_inference_style_validation",
+            "metric_definition": (
+                "pointwise_inference_style_validation_onset_shoulder_accepted_"
+                "sequence_onset_censored_block_ap"
+            ),
+            "onset_metric_label": "onset_nearby_mask_when_available",
             "event_teacher_forcing_rate": round(
                 self.config.validation_teacher_forcing_rate,
                 6,
@@ -1992,7 +2340,13 @@ class SourceTrackingTrainerV2:
         teacher_forcing_rate: float,
     ) -> dict[str, torch.Tensor]:
         event_state = batch.get("event_state")
-        if event_state is None:
+        config = getattr(self, "config", None)
+        event_state_conditioning = (
+            True if config is None else config.event_state_conditioning
+        )
+        if event_state is None or not event_state_conditioning:
+            return self.model(batch["frames"])
+        if config is not None and config.primary_audio_only_event_decoder:
             return self.model(batch["frames"])
         if teacher_forcing_rate >= 0.999:
             return self.model(
@@ -2167,7 +2521,8 @@ class SourceTrackingTrainerV2:
         return self._corrupt_event_state(torch.where(keep_true, true_state, predicted))
 
     def _corrupt_event_state(self, event_state: torch.Tensor) -> torch.Tensor:
-        if not getattr(self.model, "training", False):
+        model = getattr(self, "model", None)
+        if model is None or not getattr(model, "training", False):
             return event_state
         noise_std = max(0.0, float(self.config.event_state_noise_std))
         dropout_prob = min(1.0, max(0.0, float(self.config.event_state_dropout_prob)))
@@ -2290,7 +2645,7 @@ class SourceTrackingTrainerV2:
         )
         batch = self.batch_builder.build_slices(
             self._render_slices(
-                stage_name,
+                self._base_stage_for_training(stage_name),
                 "train",
                 seeds,
                 phase_jitter_samples=phase_jitter_samples,
@@ -2436,12 +2791,30 @@ class SourceTrackingTrainerV2:
         requested = {
             item.strip() for item in self.config.stage_filter.split(",") if item.strip()
         }
-        known = {stage.name for stage in stages} | set(self.FRAME_CACHE_STAGE_TO_BASE)
+        known = (
+            {stage.name for stage in stages}
+            | set(self.FRAME_CACHE_STAGE_TO_BASE)
+            | set(self.STAGE_ALIASES)
+        )
         unknown = sorted(requested - known)
         if unknown:
             raise ValueError(f"Unknown training stage(s): {unknown}")
         filtered_rows = []
         for stage in stages:
+            alias_names = sorted(
+                alias for alias, base_stage in self.STAGE_ALIASES.items()
+                if base_stage == stage.name
+            )
+            for alias in alias_names:
+                if alias in requested:
+                    filtered_rows.append(
+                        CurriculumStageV2(
+                            alias,
+                            stage.train_examples_per_epoch,
+                            stage.epochs,
+                            stage.learning_rate,
+                        )
+                    )
             if stage.name in requested:
                 filtered_rows.append(stage)
             for cache_stage, base_stage in self.FRAME_CACHE_STAGE_TO_BASE.items():
@@ -2468,6 +2841,7 @@ class SourceTrackingTrainerV2:
         return stage_name in self.FRAME_CACHE_STAGE_TO_BASE
 
     def _base_stage_for_training(self, stage_name: str) -> str:
+        stage_name = self.STAGE_ALIASES.get(stage_name, stage_name)
         return self.FRAME_CACHE_STAGE_TO_BASE.get(stage_name, stage_name)
 
     def _batch_metrics(
@@ -2489,7 +2863,10 @@ class SourceTrackingTrainerV2:
             family_pred = torch.argmax(outputs["family_logits"], dim=-1)
             family_mask = true_active
             family_ok = family_pred[family_mask] == batch["family"][family_mask]
-            onset_target = batch["onset"] > 0.5
+            onset_target = self._accepted_onset_target(
+                batch["onset"],
+                batch.get("onset_nearby_mask"),
+            )
             onset_pred = (
                 torch.sigmoid(outputs["onset_logits"])
                 >= self.config.metric_activity_threshold
@@ -2581,6 +2958,38 @@ class SourceTrackingTrainerV2:
             f"{prefix}_target_negative_count": float((~target_positive).sum().cpu()),
             f"{prefix}_predicted_positive_count": float(predicted_positive.sum().cpu()),
         }
+
+    @staticmethod
+    def _censored_onset_sequence_metric_items(
+        scores: torch.Tensor,
+        nearby_mask: torch.Tensor,
+        delta: torch.Tensor,
+        timing_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        scores = scores.detach().float().cpu()
+        nearby = nearby_mask.detach().float().cpu() > 0.5
+        delta = delta.detach().float().cpu()
+        timing = timing_mask.detach().float().cpu() > 0.5
+        center = timing & (delta.abs() < 0.5)
+        if not nearby.any():
+            return scores.reshape(-1), torch.zeros_like(scores.reshape(-1))
+
+        radius = int(torch.ceil(delta[nearby].abs().max()).item())
+        masked_scores = torch.where(
+            nearby,
+            scores,
+            scores.new_full((), -torch.inf),
+        )
+        block_scores = SourceTrackingLossV2._temporal_max(masked_scores, radius)[center]
+        negative_scores = scores[~nearby]
+        metric_scores = torch.cat((block_scores, negative_scores.reshape(-1)))
+        metric_targets = torch.cat(
+            (
+                torch.ones_like(block_scores),
+                torch.zeros_like(negative_scores.reshape(-1)),
+            )
+        )
+        return metric_scores, metric_targets
 
     @staticmethod
     def _threshold_free_boundary_metrics(
@@ -2971,10 +3380,15 @@ class SourceTrackingTrainerV2:
                 self.config.training_slice_peak_warmup_frames,
                 use_gpu_frame_extraction,
                 phase_offset,
-                self.config.onset_label_radius_frames,
+                self.config.onset_shoulder_radius_frames,
                 self.config.offset_label_radius_frames,
                 self.config.boundary_negative_radius_frames,
                 self.config.onset_hard_negative_sample_prob,
+                self.config.onset_context_sample_prob,
+                self.config.positive_family_boosts,
+                self.config.positive_quality_boosts,
+                self.config.positive_source_boosts,
+                self.config.positive_velocity_boosts,
             )
             for seed, phase_offset in zip(seeds, phase_offsets, strict=True)
         ]
@@ -3041,7 +3455,9 @@ class SourceTrackingTrainerV2:
             "TrainingAudioConfigV2",
             (SourceTrackingAudioConfigV2,),
             {
-                "onset_label_radius_frames": self.config.onset_label_radius_frames,
+                "onset_shoulder_radius_frames": (
+                    self.config.onset_shoulder_radius_frames
+                ),
                 "offset_label_radius_frames": self.config.offset_label_radius_frames,
                 "boundary_negative_radius_frames": (
                     self.config.boundary_negative_radius_frames
@@ -3049,6 +3465,11 @@ class SourceTrackingTrainerV2:
                 "onset_hard_negative_sample_prob": (
                     self.config.onset_hard_negative_sample_prob
                 ),
+                "onset_context_sample_prob": self.config.onset_context_sample_prob,
+                "positive_family_boosts": self.config.positive_family_boosts,
+                "positive_quality_boosts": self.config.positive_quality_boosts,
+                "positive_source_boosts": self.config.positive_source_boosts,
+                "positive_velocity_boosts": self.config.positive_velocity_boosts,
             },
         )
         return SourceTrackingRendererV2(note_store, midi_store, config=audio_config)
@@ -3305,10 +3726,10 @@ class TrainingCliV2:
             ),
         )
         parser.add_argument(
-            "--onset-label-radius-frames",
+            "--onset-shoulder-radius-frames",
             type=int,
-            default=TrainingConfigV2.onset_label_radius_frames,
-            help="Frames on either side of an onset center labeled positive.",
+            default=TrainingConfigV2.onset_shoulder_radius_frames,
+            help="Frames on either side of an onset center treated as soft shoulder.",
         )
         parser.add_argument(
             "--offset-label-radius-frames",
@@ -3330,6 +3751,35 @@ class TrainingCliV2:
                 "Probability of sampling a frame just outside the onset-positive "
                 "window before falling back to the default frame sampler."
             ),
+        )
+        parser.add_argument(
+            "--onset-context-sample-prob",
+            type=float,
+            default=TrainingConfigV2.onset_context_sample_prob,
+            help=(
+                "Probability of sampling a frame whose sequence context still "
+                "contains the selected note onset."
+            ),
+        )
+        parser.add_argument(
+            "--positive-family-boosts",
+            default=TrainingConfigV2.positive_family_boosts,
+            help="Comma-separated family=weight note-sampling boosts.",
+        )
+        parser.add_argument(
+            "--positive-quality-boosts",
+            default=TrainingConfigV2.positive_quality_boosts,
+            help="Comma-separated NSynth quality=weight note-sampling boosts.",
+        )
+        parser.add_argument(
+            "--positive-source-boosts",
+            default=TrainingConfigV2.positive_source_boosts,
+            help="Comma-separated source=weight note-sampling boosts.",
+        )
+        parser.add_argument(
+            "--positive-velocity-boosts",
+            default=TrainingConfigV2.positive_velocity_boosts,
+            help="Comma-separated velocity=weight note-sampling boosts.",
         )
         parser.add_argument(
             "--early-stopping-metric",
@@ -3397,7 +3847,7 @@ class TrainingCliV2:
         )
         parser.add_argument(
             "--input-novelty-features",
-            choices=("none", "flux"),
+            choices=("none", "flux", "salience"),
             default=TrainingConfigV2.input_novelty_features,
             help="Append derived onset-novelty features to each frame.",
         )
@@ -3536,9 +3986,48 @@ class TrainingCliV2:
             default=TrainingConfigV2.onset_sequence_pairwise_ranking_loss_weight,
         )
         parser.add_argument(
+            "--onset-sequence-block-positive-loss-weight",
+            type=float,
+            default=TrainingConfigV2.onset_sequence_block_positive_loss_weight,
+            help=(
+                "Push the max logit inside each accepted onset block high. "
+                "Complements censored sequence AP supervision."
+            ),
+        )
+        parser.add_argument(
+            "--onset-sequence-block-ranking-loss-weight",
+            type=float,
+            default=TrainingConfigV2.onset_sequence_block_ranking_loss_weight,
+            help="Rank accepted onset-block max logits above far-negative logits.",
+        )
+        parser.add_argument(
+            "--onset-nearby-pairwise-ranking-loss-weight",
+            type=float,
+            default=TrainingConfigV2.onset_nearby_pairwise_ranking_loss_weight,
+            help=(
+                "Rank exact/shoulder onset frames above nearby non-onset frames "
+                "inside the onset negative window."
+            ),
+        )
+        parser.add_argument(
+            "--onset-peak-to-shoulder-ranking-loss-weight",
+            type=float,
+            default=TrainingConfigV2.onset_peak_to_shoulder_ranking_loss_weight,
+            help=(
+                "Rank exact onset-center frames above nearby shoulder frames "
+                "for the sequence onset head."
+            ),
+        )
+        parser.add_argument(
             "--onset-peak-loss-weight",
             type=float,
             default=TrainingConfigV2.onset_peak_loss_weight,
+        )
+        parser.add_argument(
+            "--onset-shoulder-loss-weight",
+            type=float,
+            default=TrainingConfigV2.onset_shoulder_loss_weight,
+            help="Relative BCE weight for soft onset-shoulder frames.",
         )
         parser.add_argument(
             "--onset-event-recall-loss-weight",
@@ -3694,6 +4183,22 @@ class TrainingCliV2:
             "--event-state-soft-events",
             action="store_true",
             default=TrainingConfigV2.event_state_soft_events,
+        )
+        parser.add_argument(
+            "--disable-event-state-conditioning",
+            dest="event_state_conditioning",
+            action="store_false",
+            default=TrainingConfigV2.event_state_conditioning,
+            help="Ignore event-state history inputs in the causal event decoder.",
+        )
+        parser.add_argument(
+            "--primary-audio-only-event-decoder",
+            action="store_true",
+            default=TrainingConfigV2.primary_audio_only_event_decoder,
+            help=(
+                "Use the audio-only event-decoder pass as primary train/validation "
+                "output while keeping decoder event-state conditioning available."
+            ),
         )
         parser.add_argument(
             "--event-state-use-predicted-age",

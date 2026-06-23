@@ -179,6 +179,13 @@ class SourceTrackingCheckpointLoaderV2:
         )
         return self.model(frames, event_state=event_state)
 
+    @staticmethod
+    def event_logits(outputs: dict[str, torch.Tensor], prefix: str) -> torch.Tensor:
+        sequence = outputs.get(f"{prefix}_logits_sequence")
+        if sequence is not None:
+            return sequence[:, -1, :]
+        return outputs[f"{prefix}_logits"]
+
 
 class RealtimeSourceTrackerV2:
     """Maintain rolling audio context and emit source-slot predictions."""
@@ -239,8 +246,18 @@ class RealtimeSourceTrackerV2:
             outputs = self.loaded.predict_sequence(tensor)
         activity = torch.sigmoid(outputs["activity_logits"])[0].detach().cpu().numpy()
         family_probs = torch.softmax(outputs["family_logits"], dim=-1)[0].detach().cpu()
-        onset = torch.sigmoid(outputs["onset_logits"])[0].detach().cpu().numpy()
-        offset = torch.sigmoid(outputs["offset_logits"])[0].detach().cpu().numpy()
+        onset = (
+            torch.sigmoid(self.loaded.event_logits(outputs, "onset"))[0]
+            .detach()
+            .cpu()
+            .numpy()
+        )
+        offset = (
+            torch.sigmoid(self.loaded.event_logits(outputs, "offset"))[0]
+            .detach()
+            .cpu()
+            .numpy()
+        )
         onset_delta = outputs["onset_delta"][0].detach().cpu().numpy()
         offset_delta = outputs["offset_delta"][0].detach().cpu().numpy()
         identity = outputs["identity"][0].detach().cpu().numpy()

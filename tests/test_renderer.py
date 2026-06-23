@@ -14,6 +14,7 @@ from muziq_nn.datasets.render import (
     SourceTrackingAudioConfigV2,
     SourceTrackingRendererV2,
 )
+from muziq_nn.datasets.schema import SourceEventLabelV2
 from muziq_nn.training.train import TrainingBatchBuilderV2, TrainingRenderWorkerV2
 
 
@@ -50,6 +51,56 @@ class TestRendererV2:
         assert example.frames.shape[1] == SourceTrackingAudioConfigV2.bands
         assert example.labels.active.shape[1] == SourceTrackingAudioConfigV2.max_sources
         assert example.labels.active.sum() > 0
+
+    def test_onset_label_uses_shoulder_radius(self, tmp_path):
+        TinyCorpusBuilderV2(tmp_path).build()
+        config = type(
+            "TestAudioConfig",
+            (SourceTrackingAudioConfigV2,),
+            {
+                "onset_shoulder_radius_frames": 5,
+                "boundary_negative_radius_frames": 4,
+            },
+        )
+        renderer = SourceTrackingRendererV2(
+            NsynthNoteStoreV2(NsynthIndexV2(tmp_path)),
+            MidiScheduleStoreV2(MidiIndexV2(tmp_path)),
+            config=config,
+        )
+        start_frame = 10
+        labels = renderer._labels_from_events(
+            [
+                SourceEventLabelV2(
+                    source_id=0,
+                    family="guitar",
+                    family_index=3,
+                    start_s=start_frame * config.hop / config.sample_rate,
+                    end_s=(start_frame + 20) * config.hop / config.sample_rate,
+                )
+            ],
+            n_samples=40 * config.hop,
+        )
+
+        assert labels.onset[start_frame - 5 : start_frame + 6, 0].tolist() == [
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+        ]
+        assert labels.onset[start_frame - 6, 0] == 0.0
+        assert labels.onset[start_frame + 6, 0] == 0.0
+        assert labels.onset_nearby_mask[start_frame - 5, 0] == 1.0
+        assert labels.onset_nearby_mask[start_frame + 5, 0] == 1.0
+        assert labels.onset_nearby_mask[start_frame + 6, 0] == 0.0
+        assert labels.onset_delta[start_frame - 5, 0] == -5.0
+        assert labels.onset_delta[start_frame + 5, 0] == 5.0
 
     def test_chords_within_one_midi_track_keep_one_source_id(self, tmp_path):
         TinyCorpusBuilderV2(tmp_path).build()
@@ -98,6 +149,30 @@ class TestRendererV2:
         assert (sliced["family"] == full_slice["family"]).all()
         assert (sliced["onset"] == full_slice["onset"]).all()
         assert (sliced["offset"] == full_slice["offset"]).all()
+
+    def test_onset_context_sampling_keeps_onset_in_sequence_context(self, tmp_path):
+        TinyCorpusBuilderV2(tmp_path).build()
+        config = type(
+            "OnsetContextAudioConfig",
+            (SourceTrackingAudioConfigV2,),
+            {"onset_context_sample_prob": 1.0},
+        )
+        renderer = SourceTrackingRendererV2(
+            NsynthNoteStoreV2(NsynthIndexV2(tmp_path)),
+            MidiScheduleStoreV2(MidiIndexV2(tmp_path)),
+            config=config,
+        )
+
+        for seed in range(20):
+            sliced = renderer.render_training_slice(
+                "single_note_all",
+                "train",
+                seed=seed,
+                frame_count=32,
+                peak_warmup_frames=128,
+            )
+
+            assert sliced["context_onset_nearby_mask"].sum() > 0
 
     def test_audio_training_slice_matches_cpu_frame_slice_after_batching(
         self, tmp_path

@@ -83,6 +83,7 @@ class SourceLabelFramesV2:
     onset_delta: np.ndarray
     offset_delta: np.ndarray
     onset_timing_mask: np.ndarray
+    onset_nearby_mask: np.ndarray
     offset_timing_mask: np.ndarray
     family: np.ndarray
     source_id: np.ndarray

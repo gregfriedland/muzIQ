@@ -2,8 +2,9 @@
 
 ## Status
 
-Accepted. The higher-AP pursuit is still active; the current strict
-validation onset AP target of greater than 0.90 has not been met.
+Accepted. The strict validation onset AP target of greater than 0.90 has
+now been met on the notes480 phase 1 screen. The current best checkpoint is
+the notes480 onset-context run from 2026-06-23.
 
 ## Date
 
@@ -196,6 +197,79 @@ below 0.90 AP, the next larger design change is to replace the externally
 constructed event-state feedback with a learned recurrent or causal decoder
 state that is trained end to end.
 
+On 2026-06-23, the successful version of that idea used more real NSynth notes
+rather than repeating the same notes with `--curriculum-scale`. The earlier
+notes48 attempt with `--curriculum-scale 10.0` was stopped and replaced with a
+notes480 metadata split. The new split increased the cap to
+`--nsynth-notes-per-instrument 480`, kept `--onset-context-sample-prob 1.0`,
+and removed `--curriculum-scale`, so the training examples came from a larger
+set of real note recordings instead of repeated sampling from the notes48
+subset.
+
+The notes480 data root was:
+
+`runs/nsynth_metadata_800_100_100_notes480_20260623`
+
+The split contained:
+
+| Split | Notes |
+| --- | ---: |
+| Train | 242237 |
+| Validation | 31633 |
+| Test | 30366 |
+| Total selected | 304236 |
+
+This required a larger ephemeral-storage pod. The first attempt on a 40G
+ephemeral-storage G4 pod was evicted during notes480 preparation. The
+successful run used an east5 spot G4 pod with a 100G ephemeral-storage request
+and 120G limit.
+
+Successful run:
+
+`runs/boundary_sequence_onset_context_notes480_20260623`
+
+Key configuration:
+
+- `--data-root runs/nsynth_metadata_800_100_100_notes480_20260623`
+- `--stage-filter single_note_all`
+- no `--curriculum-scale`
+- `--onset-context-sample-prob 1.0`
+- `--early-stopping-metric onset_sequence_average_precision`
+- `--early-stopping-patience 10`
+- warm-start from `checkpoint_000009_phase-epoch_done_stage-single_note_all_epoch-003_batch-000235.pt`
+
+Best validation result from the final summary:
+
+| Metric | Value |
+| --- | ---: |
+| Epoch | 32 |
+| Onset AP | 0.9709844589 |
+| Slot-invariant onset AP | 0.9714295268 |
+| Onset best-threshold F1 | 0.9189189672 |
+| Onset best threshold | 0.5039062500 |
+| Onset best precision | 0.9272727370 |
+| Onset best recall | 0.9107142687 |
+| Onset sequence AP | 0.9375238419 |
+| Onset sequence best-threshold F1 | 0.9017426372 |
+| Onset sequence best threshold | 0.9375000000 |
+| Onset sequence best precision | 0.9131414294 |
+| Onset sequence best recall | 0.8906250000 |
+| Onset sequence frame AP | 0.5893448591 |
+
+Best uploaded checkpoint:
+
+`gs://rezo-flyte/scratch/serializable/muziq-nn/20260623/boundary-sequence-onset-context-notes480/checkpoints/20260623/20260623-051427/checkpoints/checkpoint_000032_phase-epoch_done_stage-single_note_all_epoch-032_batch-000235.pt`
+
+Local pod run directory:
+
+`/workspace/muziq/runs/boundary_sequence_onset_context_notes480_20260623/train_runs_notes480/20260623-051427`
+
+The main conclusion is that the previous AP ceiling was largely data-limited:
+notes48 did not provide enough distinct note recordings for the onset-context
+training objective. Expanding to notes480 moved strict validation onset AP from
+the low 0.8 range to 0.971 and onset sequence AP to 0.938 without increasing
+model size.
+
 ## Experiments Tried
 
 | Change | Result | Decision |
@@ -214,6 +288,8 @@ state that is trained end to end.
 | Activity-gated onset scoring, `min(onset, activity)` | AP 0.7213 | Rejected |
 | Iterative inference refinement, extra decode passes | Pass 2 AP 0.7427; passes 3 to 5 fell to about 0.724 to 0.730 | Rejected; repeated self-conditioning did not repair history |
 | First-pass boundary auxiliary loss, weight 0.5 | Best onset AP 0.8179 | Accepted |
+| Notes48 onset-context sampling with `--curriculum-scale 10.0` | Validation sequence AP reached about 0.92 quickly, but repeated the same small note pool | Replaced with notes480 to test real-data diversity |
+| Notes480 onset-context sampling with no `--curriculum-scale` | Best onset AP 0.9710; best onset sequence AP 0.9375 | Accepted; clears the strict AP target |
 
 Earlier focal-loss and hard-negative variants improved some batch-level behavior
 but did not solve validation onset AP. In particular, hard-negative-heavy
@@ -248,7 +324,8 @@ shows capacity is again the bottleneck.
 
 ## Follow-Up
 
-The earlier phase 1 screen improved validation AP, but the current greater than
-0.90 strict validation AP target is still unmet. Do not proceed to phase 2 as a
-production candidate until the phase 1 generated-history path clears the AP
-target or a new diagnostic justifies changing the target.
+The notes480 phase 1 screen cleared the greater than 0.90 strict validation AP
+target. The next decision is no longer whether the phase 1 generated-history
+path can reach the AP target; it can. The next step is to run the corresponding
+phase 2 melody evaluation and confirm that the gain transfers from held-out
+single-note validation to continuous generated sequences and preview audio.
