@@ -7,10 +7,12 @@ const ROW_COLORS = [
 ];
 const BLACKHOLE_CAPTURE_DEVICE = "BlackHole 2ch";
 const SIGNAL_ACTIVE_RMS = 0.006;
-const SOURCE_ONSET_THRESHOLD = 0.35;
+const SOURCE_ONSET_THRESHOLD = 0.001;
 const SOURCE_OFFSET_THRESHOLD = 0.35;
-const SOURCE_ONSET_REFRACTORY_MS = 200;
+const SOURCE_ONSET_REFRACTORY_MS = 400;
 const SOURCE_OFFSET_REFRACTORY_MS = 200;
+const ONSET_PEAK_DETECTION_DELAY_MS = 25;
+const NOTE_SWEEP_MS = 550;
 
 class SourceGridApp {
   constructor() {
@@ -36,6 +38,12 @@ class SourceGridApp {
     this.activeRowKey = null;
     this.slotStates = new Map();
     this.lastSignalAt = 0;
+    this.debug = {
+      onsetPeaks: 0,
+      lastOnsetScore: 0,
+      lastOnsetPeakScore: 0,
+      lastOnsetPeakAt: Number.NEGATIVE_INFINITY,
+    };
     this.bind();
     this.resize();
     window.addEventListener("resize", () => this.resize());
@@ -101,6 +109,7 @@ class SourceGridApp {
     this.sourceCount.textContent = String(this.instrumentRows.length);
     this.frameCount.textContent = String(payload.frame_count || 0);
     this.latency.textContent = latencyLabel(payload.latency_ms);
+    this.debug.lastCaptureChunkMs = payload.capture_chunk_ms || null;
     this.renderCards();
   }
 
@@ -148,17 +157,33 @@ class SourceGridApp {
     }
     const previous = state.previous;
     const current = state.current;
-    if (current && isLocalPeak(previous, current, source, "onset", SOURCE_ONSET_THRESHOLD)) {
+    const currentOnset = source.onset || 0;
+    const previousOnset = current?.onset || 0;
+    const risingOnset = currentOnset >= SOURCE_ONSET_THRESHOLD
+      && previousOnset < SOURCE_ONSET_THRESHOLD;
+    const confirmedOnsetPeak = current
+      && isLocalPeak(previous, current, source, "onset", SOURCE_ONSET_THRESHOLD);
+    if (risingOnset || confirmedOnsetPeak) {
       if (now - state.lastOnsetPeakAt >= SOURCE_ONSET_REFRACTORY_MS) {
-        this.startSourceNote(current, now);
+        const onsetSource = risingOnset ? source : current;
+        const startedAt = risingOnset ? now : now - ONSET_PEAK_DETECTION_DELAY_MS;
+        this.startSourceNote(onsetSource, startedAt);
         state.lastOnsetPeakAt = now;
+        this.debug.onsetPeaks += 1;
+        this.debug.lastOnsetPeakScore = onsetSource.onset;
+        this.debug.lastOnsetPeakAt = now;
       }
     }
+    this.debug.lastOnsetScore = currentOnset;
+    document.body.dataset.sourceGridDebug = JSON.stringify({
+      onsetPeaks: this.debug.onsetPeaks,
+      lastOnsetScore: this.debug.lastOnsetScore,
+      lastOnsetPeakScore: this.debug.lastOnsetPeakScore,
+      lastOnsetPeakAgoMs: now - this.debug.lastOnsetPeakAt,
+      captureChunkMs: this.debug.lastCaptureChunkMs,
+    });
     if (current && isLocalPeak(previous, current, source, "offset", SOURCE_OFFSET_THRESHOLD)) {
-      if (now - state.lastOffsetPeakAt >= SOURCE_OFFSET_REFRACTORY_MS) {
-        this.stopSourceNote(current);
-        state.lastOffsetPeakAt = now;
-      }
+      state.lastOffsetPeakAt = now;
     }
     state.previous = current;
     state.current = source;
@@ -191,7 +216,8 @@ class SourceGridApp {
   showNote(row, source, now) {
     row.lastSeenAt = now;
     row.activeNote = {
-      position: clampUnit(source.position),
+      startPosition: 0,
+      startedAt: now,
       activity: Math.max(source.onset, 0.35),
     };
     row.lastNoteStartAt = now;
@@ -305,13 +331,21 @@ class SourceGridApp {
     this.ctx.textBaseline = "top";
     this.ctx.font = `${Math.max(11, Math.min(16, Math.floor(rowHeight * 0.14)))}px sans-serif`;
     this.ctx.fillText(`ID ${row.slot + 1}`, 12, y + 10);
-    if (row.activeNote) {
+    const note = row.activeNote;
+    if (note) {
       const boxSize = Math.max(18, Math.min(54, Math.floor(rowHeight * 0.48)));
       const labelWidth = Math.min(170, Math.floor(width * 0.18));
       const usableWidth = Math.max(1, width - labelWidth - boxSize - 20);
-      const x = labelWidth + row.activeNote.position * usableWidth;
+      const age = Math.max(0, performance.now() - note.startedAt);
+      if (age > NOTE_SWEEP_MS) {
+        row.activeNote = null;
+        this.ctx.restore();
+        return;
+      }
+      const position = Math.min(1, note.startPosition + age / NOTE_SWEEP_MS);
+      const x = labelWidth + position * usableWidth;
       const centerY = y + rowHeight / 2;
-      this.ctx.fillStyle = colorCss(color, Math.min(1, 0.35 + row.activeNote.activity));
+      this.ctx.fillStyle = colorCss(color, Math.min(1, 0.35 + note.activity));
       this.ctx.fillRect(x, centerY - boxSize / 2, boxSize, boxSize);
     }
     this.ctx.restore();
@@ -365,4 +399,5 @@ function colorCss(rgb, level) {
   return `rgba(${rgb[0]}, ${rgb[1]}, ${rgb[2]}, ${alpha})`;
 }
 
-new SourceGridApp().start();
+window.sourceGridApp = new SourceGridApp();
+window.sourceGridApp.start();

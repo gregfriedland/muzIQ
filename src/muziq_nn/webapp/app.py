@@ -21,6 +21,8 @@ from muziq_nn.webapp.inference import (
     SourceTrackingCheckpointLocatorV2,
 )
 
+LIVE_CAPTURE_CHUNK_SAMPLES = SourceTrackingAudioConfigV2.sample_rate // 40
+
 
 class MacAudioDeviceProbeV2:
     """Report local CoreAudio devices visible through FFmpeg AVFoundation."""
@@ -192,6 +194,9 @@ class SourceTrackingWebAppV2:
                 "sample_rate": SourceTrackingAudioConfigV2.sample_rate,
                 "max_sources": SourceTrackingAudioConfigV2.max_sources,
                 "capture_device": capture_device,
+                "capture_chunk_ms": LIVE_CAPTURE_CHUNK_SAMPLES
+                / SourceTrackingAudioConfigV2.sample_rate
+                * 1000,
             }
         )
         process = await asyncio.create_subprocess_exec(
@@ -213,7 +218,7 @@ class SourceTrackingWebAppV2:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        chunk_bytes = 1600 * 4
+        chunk_bytes = LIVE_CAPTURE_CHUNK_SAMPLES * 4
         try:
             while True:
                 if process.stdout is None:
@@ -238,6 +243,9 @@ class SourceTrackingWebAppV2:
                     sample_rate=SourceTrackingAudioConfigV2.sample_rate,
                 ).to_json()
                 prediction["latency_ms"] = (time.perf_counter() - start) * 1000
+                prediction["capture_chunk_ms"] = (
+                    len(samples) / SourceTrackingAudioConfigV2.sample_rate * 1000
+                )
                 prediction["input_rms"] = self._rms(samples)
                 await websocket.send_json(prediction)
         except WebSocketDisconnect:

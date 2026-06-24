@@ -102,6 +102,109 @@ class TestRendererV2:
         assert labels.onset_delta[start_frame - 5, 0] == -5.0
         assert labels.onset_delta[start_frame + 5, 0] == 5.0
 
+    def test_same_instrument_overlap_onset_can_be_censored(self, tmp_path):
+        TinyCorpusBuilderV2(tmp_path).build()
+        config = type(
+            "CensorOverlapAudioConfig",
+            (SourceTrackingAudioConfigV2,),
+            {
+                "onset_shoulder_radius_frames": 2,
+                "censor_same_instrument_overlap_onset_families": "vocal,flute",
+            },
+        )
+        renderer = SourceTrackingRendererV2(
+            NsynthNoteStoreV2(NsynthIndexV2(tmp_path)),
+            MidiScheduleStoreV2(MidiIndexV2(tmp_path)),
+            config=config,
+        )
+        first_start = 10
+        second_start = 20
+        events = [
+            SourceEventLabelV2(
+                source_id=0,
+                family="vocal",
+                family_index=10,
+                instrument_str="vocal_acoustic_001",
+                start_s=first_start * config.hop / config.sample_rate,
+                end_s=50 * config.hop / config.sample_rate,
+            ),
+            SourceEventLabelV2(
+                source_id=0,
+                family="vocal",
+                family_index=10,
+                instrument_str="vocal_acoustic_001",
+                start_s=second_start * config.hop / config.sample_rate,
+                end_s=60 * config.hop / config.sample_rate,
+            ),
+        ]
+        labels = renderer._labels_from_events(
+            events,
+            n_samples=80 * config.hop,
+        )
+        frame_label = renderer._label_at_frame(
+            events,
+            n_samples=80 * config.hop,
+            frame_idx=second_start,
+        )
+
+        assert labels.active[second_start, 0] == 1.0
+        assert labels.onset[first_start - 2 : first_start + 3, 0].sum() == 5.0
+        assert labels.onset[second_start - 2 : second_start + 3, 0].sum() == 0.0
+        assert (
+            labels.onset_nearby_mask[second_start - 2 : second_start + 3, 0].sum()
+            == 0.0
+        )
+        assert frame_label["activity"][0] == 1.0
+        assert frame_label["onset"][0] == 0.0
+        assert frame_label["onset_nearby_mask"][0] == 0.0
+
+    def test_different_instrument_overlap_onset_is_not_censored(self, tmp_path):
+        TinyCorpusBuilderV2(tmp_path).build()
+        config = type(
+            "CensorOverlapAudioConfig",
+            (SourceTrackingAudioConfigV2,),
+            {
+                "onset_shoulder_radius_frames": 2,
+                "censor_same_instrument_overlap_onset_families": "vocal,flute",
+            },
+        )
+        renderer = SourceTrackingRendererV2(
+            NsynthNoteStoreV2(NsynthIndexV2(tmp_path)),
+            MidiScheduleStoreV2(MidiIndexV2(tmp_path)),
+            config=config,
+        )
+        second_start = 20
+        events = [
+            SourceEventLabelV2(
+                source_id=0,
+                family="vocal",
+                family_index=10,
+                instrument_str="vocal_acoustic_001",
+                start_s=10 * config.hop / config.sample_rate,
+                end_s=50 * config.hop / config.sample_rate,
+            ),
+            SourceEventLabelV2(
+                source_id=0,
+                family="vocal",
+                family_index=10,
+                instrument_str="vocal_acoustic_002",
+                start_s=second_start * config.hop / config.sample_rate,
+                end_s=60 * config.hop / config.sample_rate,
+            ),
+        ]
+        labels = renderer._labels_from_events(
+            events,
+            n_samples=80 * config.hop,
+        )
+        frame_label = renderer._label_at_frame(
+            events,
+            n_samples=80 * config.hop,
+            frame_idx=second_start,
+        )
+
+        assert labels.onset[second_start - 2 : second_start + 3, 0].sum() == 5.0
+        assert frame_label["onset"][0] == 1.0
+
     def test_chords_within_one_midi_track_keep_one_source_id(self, tmp_path):
         TinyCorpusBuilderV2(tmp_path).build()
         renderer = SourceTrackingRendererV2(

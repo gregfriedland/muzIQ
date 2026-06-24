@@ -10,6 +10,7 @@ from typing import Any
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from scipy import signal as sps
 
 from muziq_nn.datasets.render import (
@@ -137,6 +138,7 @@ class SourceTrackingCheckpointLoaderV2:
         slot_queries = state_dict["head.slot_queries"]
         identity_weight = state_dict["head.identity.weight"]
         layer_count = cls._infer_layer_count(state_dict)
+        event_decoder_layers = cls._infer_event_decoder_layer_count(state_dict)
         return SourceTrackingModelConfigV2(
             n_bands=int(input_weight.shape[1]),
             n_families=int(family_weight.shape[0]),
@@ -144,6 +146,7 @@ class SourceTrackingCheckpointLoaderV2:
             model_dim=int(input_weight.shape[0]),
             heads=4,
             layers=layer_count,
+            event_decoder_layers=event_decoder_layers,
             identity_dim=int(identity_weight.shape[0]),
         )
 
@@ -158,6 +161,19 @@ class SourceTrackingCheckpointLoaderV2:
                 layer_ids.add(int(parts[2]))
         return max(layer_ids) + 1 if layer_ids else 2
 
+    @staticmethod
+    def _infer_event_decoder_layer_count(
+        state_dict: dict[str, torch.Tensor],
+    ) -> int:
+        layer_ids: set[int] = set()
+        for name in state_dict:
+            if not name.startswith("event_decoder.decoder.layers."):
+                continue
+            parts = name.split(".")
+            if len(parts) > 3 and parts[3].isdigit():
+                layer_ids.add(int(parts[3]))
+        return max(layer_ids) + 1 if layer_ids else 1
+
     def predict_sequence(
         self,
         frames: torch.Tensor,
@@ -165,6 +181,7 @@ class SourceTrackingCheckpointLoaderV2:
         onset_threshold: float = 0.5,
         offset_threshold: float = 0.5,
     ) -> dict[str, torch.Tensor]:
+        frames = self.prepare_frames(frames)
         first = self.model(frames)
         onset = first.get("onset_logits_sequence")
         offset = first.get("offset_logits_sequence")
@@ -185,6 +202,74 @@ class SourceTrackingCheckpointLoaderV2:
         if sequence is not None:
             return sequence[:, -1, :]
         return outputs[f"{prefix}_logits"]
+
+    def prepare_frames(self, frames: torch.Tensor) -> torch.Tensor:
+        if frames.shape[-1] == self.config.n_bands:
+            return frames
+        if frames.shape[-1] != SourceTrackingAudioConfigV2.bands:
+            raise ValueError(
+                "frame feature width does not match checkpoint: "
+                f"got {frames.shape[-1]}, expected {self.config.n_bands}"
+            )
+        if self.config.n_bands == SourceTrackingAudioConfigV2.bands * 2:
+            return self._augment_frame_features(frames, "flux")
+        salience_width = SourceTrackingAudioConfigV2.bands * 6 + 5
+        if self.config.n_bands == salience_width:
+            return self._augment_frame_features(frames, "salience")
+        raise ValueError(
+            "unsupported checkpoint input feature width: "
+            f"{self.config.n_bands}"
+        )
+
+    @staticmethod
+    def _augment_frame_features(frames: torch.Tensor, mode: str) -> torch.Tensor:
+        previous = torch.cat([frames[:, :1, :], frames[:, :-1, :]], dim=1)
+        diff = frames - previous
+        flux = torch.relu(diff)
+        if mode == "flux":
+            return torch.cat([frames, flux], dim=-1)
+        previous_diff = torch.cat([diff[:, :1, :], diff[:, :-1, :]], dim=1)
+        negative_flux = torch.relu(-diff)
+        absolute_flux = diff.abs()
+        positive_acceleration = torch.relu(diff - previous_diff)
+        local_mean = F.avg_pool1d(
+            frames.reshape(-1, frames.shape[-1]).unsqueeze(1),
+            kernel_size=5,
+            stride=1,
+            padding=2,
+        ).squeeze(1).reshape_as(frames)
+        local_contrast = torch.relu(frames - local_mean)
+        broadband_energy = frames.mean(dim=-1, keepdim=True)
+        broadband_flux = flux.mean(dim=-1, keepdim=True)
+        low_band_flux = flux[..., : frames.shape[-1] // 2].mean(dim=-1, keepdim=True)
+        high_band_flux = flux[..., frames.shape[-1] // 2 :].mean(dim=-1, keepdim=True)
+        weights = torch.linspace(
+            0.0,
+            1.0,
+            frames.shape[-1],
+            dtype=frames.dtype,
+            device=frames.device,
+        ).view(1, 1, -1)
+        spectral_centroid = (frames * weights).sum(dim=-1, keepdim=True) / frames.sum(
+            dim=-1,
+            keepdim=True,
+        ).clamp_min(1e-6)
+        return torch.cat(
+            [
+                frames,
+                flux,
+                negative_flux,
+                absolute_flux,
+                positive_acceleration,
+                local_contrast,
+                broadband_energy,
+                broadband_flux,
+                low_band_flux,
+                high_band_flux,
+                spectral_centroid,
+            ],
+            dim=-1,
+        )
 
 
 class RealtimeSourceTrackerV2:

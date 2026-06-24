@@ -71,6 +71,7 @@ class SourceEventLabelV2(BaseModel):
     source_id: int
     family: str
     family_index: int
+    instrument_str: str = ""
     start_s: float
     end_s: float
 

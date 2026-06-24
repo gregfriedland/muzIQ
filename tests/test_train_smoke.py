@@ -201,6 +201,12 @@ class TestTrainSmokeV2:
                 "0.3",
                 "--onset-sequence-block-ranking-loss-weight",
                 "0.7",
+                "--onset-sequence-post-onset-ranking-loss-weight",
+                "1.3",
+                "--onset-sequence-post-onset-min-frames",
+                "4",
+                "--onset-sequence-post-onset-max-frames",
+                "12",
                 "--onset-nearby-pairwise-ranking-loss-weight",
                 "0.9",
                 "--onset-peak-to-shoulder-ranking-loss-weight",
@@ -225,6 +231,12 @@ class TestTrainSmokeV2:
                 "0.8",
                 "--first-pass-distillation-offset-weight",
                 "0.2",
+                "--phase1-onset-teacher-checkpoint",
+                "phase1.pt",
+                "--phase1-onset-distillation-loss-weight",
+                "0.11",
+                "--phase1-onset-sequence-distillation-loss-weight",
+                "0.22",
                 "--first-pass-event-age-loss-weight",
                 "0.9",
                 "--first-pass-event-age-offset-weight",
@@ -243,10 +255,14 @@ class TestTrainSmokeV2:
                 "0.2",
                 "--input-novelty-features",
                 "salience",
-                "--anneal-noise-phase-jitter-samples",
+                "--phase-jitter-samples",
                 "79",
-                "--anneal-noise-feature-std",
+                "--feature-noise-std",
                 "0.01",
+                "--anneal-noise-phase-jitter-samples",
+                "23",
+                "--anneal-noise-feature-std",
+                "0.02",
             ]
         )
 
@@ -291,6 +307,9 @@ class TestTrainSmokeV2:
         assert config.onset_sequence_pairwise_ranking_loss_weight == 0.1
         assert config.onset_sequence_block_positive_loss_weight == 0.3
         assert config.onset_sequence_block_ranking_loss_weight == 0.7
+        assert config.onset_sequence_post_onset_ranking_loss_weight == 1.3
+        assert config.onset_sequence_post_onset_min_frames == 4
+        assert config.onset_sequence_post_onset_max_frames == 12
         assert config.onset_nearby_pairwise_ranking_loss_weight == 0.9
         assert config.onset_peak_to_shoulder_ranking_loss_weight == 1.1
         assert config.onset_peak_loss_weight == 0.25
@@ -303,6 +322,9 @@ class TestTrainSmokeV2:
         assert config.first_pass_distillation_loss_weight == 0.7
         assert config.first_pass_sequence_distillation_loss_weight == 0.8
         assert config.first_pass_distillation_offset_weight == 0.2
+        assert config.phase1_onset_teacher_checkpoint == "phase1.pt"
+        assert config.phase1_onset_distillation_loss_weight == 0.11
+        assert config.phase1_onset_sequence_distillation_loss_weight == 0.22
         assert config.first_pass_event_age_loss_weight == 0.9
         assert config.first_pass_event_age_offset_weight == 0.3
         assert config.first_pass_event_age_recent_weight == 500
@@ -315,8 +337,10 @@ class TestTrainSmokeV2:
         assert config.event_state_noise_std == 0.1
         assert config.event_state_dropout_prob == 0.2
         assert config.input_novelty_features == "salience"
-        assert config.anneal_noise_phase_jitter_samples == 79
-        assert config.anneal_noise_feature_std == 0.01
+        assert config.phase_jitter_samples == 79
+        assert config.feature_noise_std == 0.01
+        assert config.anneal_noise_phase_jitter_samples == 23
+        assert config.anneal_noise_feature_std == 0.02
 
     def test_flux_input_features_append_bandwise_positive_deltas(self):
         builder = object.__new__(TrainingBatchBuilderV2)
@@ -686,6 +710,29 @@ class TestTrainSmokeV2:
         assert payload["config"]["anneal_noise_phase_jitter_samples"] == 12
         assert payload["config"]["anneal_noise_feature_std"] == 0.01
 
+    def test_constant_noise_train_step_runs(self, tmp_path):
+        TinyCorpusBuilderV2(tmp_path / "data").build()
+        config = TrainingConfigV2(
+            data_root=str(tmp_path / "data"),
+            run_root=str(tmp_path / "runs"),
+            calibration_examples=2,
+            batch_size=2,
+            epochs_per_stage=1,
+            stage_filter="single_note_all",
+            smoke_examples=0,
+            curriculum_scale=0.0002,
+            phase_jitter_samples=12,
+            feature_noise_std=0.01,
+            device="cpu",
+        )
+
+        payload = SourceTrackingTrainerV2(config).run()
+
+        assert payload["history"]
+        assert payload["history"][0]["stage"] == "single_note_all"
+        assert payload["config"]["phase_jitter_samples"] == 12
+        assert payload["config"]["feature_noise_std"] == 0.01
+
     def test_validation_epoch_metrics_use_inference_style_validation(self, tmp_path):
         TinyCorpusBuilderV2(tmp_path / "data").build()
         config = TrainingConfigV2(
@@ -708,7 +755,8 @@ class TestTrainSmokeV2:
         assert validation["metric_scope"] == "validation"
         assert (
             validation["metric_definition"]
-            == "pointwise_inference_style_validation_onset_shoulder_accepted"
+            == "pointwise_inference_style_validation_onset_shoulder_accepted_"
+            "sequence_onset_censored_block_ap"
         )
         assert validation["onset_metric_label"] == "onset_nearby_mask_when_available"
         assert validation["split"] == "validation"

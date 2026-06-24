@@ -71,6 +71,51 @@ class TestRealtimeSourceTrackerV2:
         assert len(prediction.sources) == config.max_sources
         assert isinstance(prediction.source_count, int)
 
+    def test_loads_salience_feature_checkpoint_and_predicts_sources(
+        self,
+        tmp_path: Path,
+    ):
+        checkpoint_path = tmp_path / "checkpoint.pt"
+        config = SourceTrackingModelConfigV2(
+            n_bands=245,
+            model_dim=32,
+            heads=4,
+            layers=1,
+            event_decoder_layers=2,
+        )
+        model = DualPathTransformerSourceTrackerV2(config)
+        torch.save({"state_dict": model.state_dict()}, checkpoint_path)
+
+        tracker = RealtimeSourceTrackerV2(
+            checkpoint_path,
+            device="cpu",
+            context_frames=64,
+        )
+        audio = np.zeros(16_000, dtype=np.float32)
+
+        prediction = tracker.append_audio(audio, 16_000)
+
+        assert tracker.loaded.config.n_bands == 245
+        assert tracker.loaded.config.event_decoder_layers == 2
+        assert len(prediction.sources) == config.max_sources
+
+    def test_prepare_frames_appends_salience_features(self, tmp_path: Path):
+        checkpoint_path = tmp_path / "checkpoint.pt"
+        config = SourceTrackingModelConfigV2(
+            n_bands=245,
+            model_dim=32,
+            heads=4,
+            layers=1,
+        )
+        model = DualPathTransformerSourceTrackerV2(config)
+        torch.save({"state_dict": model.state_dict()}, checkpoint_path)
+        loader = SourceTrackingCheckpointLoaderV2(checkpoint_path, device="cpu")
+
+        frames = torch.zeros(2, 4, 40)
+        prepared = loader.prepare_frames(frames)
+
+        assert prepared.shape == (2, 4, 245)
+
     def test_status_route_reports_explicit_checkpoint(self, tmp_path: Path):
         checkpoint_path = tmp_path / "checkpoint.pt"
         self._write_checkpoint(checkpoint_path)

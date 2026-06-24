@@ -207,6 +207,10 @@ class TrainingConfigV2:
     onset_sequence_pairwise_ranking_loss_weight: float = 0.0
     onset_sequence_block_positive_loss_weight: float = 0.0
     onset_sequence_block_ranking_loss_weight: float = 0.0
+    onset_sequence_post_onset_ranking_loss_weight: float = 0.0
+    onset_sequence_post_onset_min_frames: int = 5
+    onset_sequence_post_onset_max_frames: int = 15
+    onset_sequence_hard_context_ranking_loss_weight: float = 0.0
     onset_nearby_pairwise_ranking_loss_weight: float = 0.0
     onset_peak_to_shoulder_ranking_loss_weight: float = 0.0
     onset_shoulder_loss_weight: float = 0.15
@@ -221,6 +225,9 @@ class TrainingConfigV2:
     first_pass_distillation_loss_weight: float = 0.0
     first_pass_sequence_distillation_loss_weight: float = 0.0
     first_pass_distillation_offset_weight: float = 0.25
+    phase1_onset_teacher_checkpoint: str | None = None
+    phase1_onset_distillation_loss_weight: float = 0.0
+    phase1_onset_sequence_distillation_loss_weight: float = 0.0
     first_pass_event_age_loss_weight: float = 0.0
     first_pass_event_age_offset_weight: float = 0.25
     first_pass_event_age_recent_weight: float = 0.0
@@ -248,6 +255,8 @@ class TrainingConfigV2:
     frame_cache_dtype: str = "float16"
     frame_cache_phase_jitter_samples: int = 0
     frame_phase_noise_std: float = 0.0
+    phase_jitter_samples: int = 0
+    feature_noise_std: float = 0.0
     anneal_noise_phase_jitter_samples: int = 0
     anneal_noise_feature_std: float = 0.0
     onset_shoulder_radius_frames: int = (
@@ -265,6 +274,38 @@ class TrainingConfigV2:
     positive_quality_boosts: str = SourceTrackingAudioConfigV2.positive_quality_boosts
     positive_source_boosts: str = SourceTrackingAudioConfigV2.positive_source_boosts
     positive_velocity_boosts: str = SourceTrackingAudioConfigV2.positive_velocity_boosts
+    censor_same_instrument_overlap_onset_families: str = (
+        SourceTrackingAudioConfigV2.censor_same_instrument_overlap_onset_families
+    )
+    hard_context_sample_prob: float = SourceTrackingAudioConfigV2.hard_context_sample_prob
+    hard_context_mix: str = SourceTrackingAudioConfigV2.hard_context_mix
+    hard_context_positive_families: str = (
+        SourceTrackingAudioConfigV2.hard_context_positive_families
+    )
+    hard_context_negative_families: str = (
+        SourceTrackingAudioConfigV2.hard_context_negative_families
+    )
+    hard_context_reattack_min_ms: float = (
+        SourceTrackingAudioConfigV2.hard_context_reattack_min_ms
+    )
+    hard_context_reattack_max_ms: float = (
+        SourceTrackingAudioConfigV2.hard_context_reattack_max_ms
+    )
+    hard_context_min_remaining_ms: float = (
+        SourceTrackingAudioConfigV2.hard_context_min_remaining_ms
+    )
+    hard_context_post_onset_min_ms: float = (
+        SourceTrackingAudioConfigV2.hard_context_post_onset_min_ms
+    )
+    hard_context_post_onset_max_ms: float = (
+        SourceTrackingAudioConfigV2.hard_context_post_onset_max_ms
+    )
+    hard_context_pre_onset_min_ms: float = (
+        SourceTrackingAudioConfigV2.hard_context_pre_onset_min_ms
+    )
+    hard_context_pre_onset_max_ms: float = (
+        SourceTrackingAudioConfigV2.hard_context_pre_onset_max_ms
+    )
     early_stopping_metric: str = ""
     early_stopping_patience: int = 0
     early_stopping_min_delta: float = 0.0
@@ -323,6 +364,10 @@ class TrainingBatchBuilderV2:
         context_onset_nearby_mask = []
         context_offset_timing_mask = []
         event_state = []
+        hard_context_positive_mask = []
+        hard_context_post_onset_negative_mask = []
+        hard_context_pre_onset_negative_mask = []
+        hard_context_far_negative_mask = []
         for item in slices:
             activity.append(item["activity"])
             family.append(np.maximum(item["family"], 0))
@@ -343,6 +388,30 @@ class TrainingBatchBuilderV2:
             context_onset_nearby_mask.append(item["context_onset_nearby_mask"])
             context_offset_timing_mask.append(item["context_offset_timing_mask"])
             event_state.append(item["event_state"])
+            hard_context_positive_mask.append(
+                item.get(
+                    "hard_context_positive_mask",
+                    np.zeros_like(item["context_onset"], dtype=np.float32),
+                )
+            )
+            hard_context_post_onset_negative_mask.append(
+                item.get(
+                    "hard_context_post_onset_negative_mask",
+                    np.zeros_like(item["context_onset"], dtype=np.float32),
+                )
+            )
+            hard_context_pre_onset_negative_mask.append(
+                item.get(
+                    "hard_context_pre_onset_negative_mask",
+                    np.zeros_like(item["context_onset"], dtype=np.float32),
+                )
+            )
+            hard_context_far_negative_mask.append(
+                item.get(
+                    "hard_context_far_negative_mask",
+                    np.zeros_like(item["context_onset"], dtype=np.float32),
+                )
+            )
         return {
             "frames": self._build_frame_tensor(slices),
             "activity": self._to_device(np.asarray(activity, dtype=np.float32)),
@@ -382,6 +451,18 @@ class TrainingBatchBuilderV2:
                 np.asarray(context_offset_timing_mask, dtype=np.float32)
             ),
             "event_state": self._to_device(np.asarray(event_state, dtype=np.float32)),
+            "hard_context_positive_mask": self._to_device(
+                np.asarray(hard_context_positive_mask, dtype=np.float32)
+            ),
+            "hard_context_post_onset_negative_mask": self._to_device(
+                np.asarray(hard_context_post_onset_negative_mask, dtype=np.float32)
+            ),
+            "hard_context_pre_onset_negative_mask": self._to_device(
+                np.asarray(hard_context_pre_onset_negative_mask, dtype=np.float32)
+            ),
+            "hard_context_far_negative_mask": self._to_device(
+                np.asarray(hard_context_far_negative_mask, dtype=np.float32)
+            ),
         }
 
     def _build_frame_tensor(self, slices) -> torch.Tensor:
@@ -859,6 +940,38 @@ class TrainingRenderWorkerV2:
             positive_quality_boosts = SourceTrackingAudioConfigV2.positive_quality_boosts
             positive_source_boosts = SourceTrackingAudioConfigV2.positive_source_boosts
             positive_velocity_boosts = SourceTrackingAudioConfigV2.positive_velocity_boosts
+            censor_same_instrument_overlap_onset_families = (
+                SourceTrackingAudioConfigV2.censor_same_instrument_overlap_onset_families
+            )
+            hard_context_sample_prob = SourceTrackingAudioConfigV2.hard_context_sample_prob
+            hard_context_mix = SourceTrackingAudioConfigV2.hard_context_mix
+            hard_context_positive_families = (
+                SourceTrackingAudioConfigV2.hard_context_positive_families
+            )
+            hard_context_negative_families = (
+                SourceTrackingAudioConfigV2.hard_context_negative_families
+            )
+            hard_context_reattack_min_ms = (
+                SourceTrackingAudioConfigV2.hard_context_reattack_min_ms
+            )
+            hard_context_reattack_max_ms = (
+                SourceTrackingAudioConfigV2.hard_context_reattack_max_ms
+            )
+            hard_context_min_remaining_ms = (
+                SourceTrackingAudioConfigV2.hard_context_min_remaining_ms
+            )
+            hard_context_post_onset_min_ms = (
+                SourceTrackingAudioConfigV2.hard_context_post_onset_min_ms
+            )
+            hard_context_post_onset_max_ms = (
+                SourceTrackingAudioConfigV2.hard_context_post_onset_max_ms
+            )
+            hard_context_pre_onset_min_ms = (
+                SourceTrackingAudioConfigV2.hard_context_pre_onset_min_ms
+            )
+            hard_context_pre_onset_max_ms = (
+                SourceTrackingAudioConfigV2.hard_context_pre_onset_max_ms
+            )
         else:
             values = tuple(task)
             (
@@ -881,6 +994,69 @@ class TrainingRenderWorkerV2:
                 positive_quality_boosts = values[14]
                 positive_source_boosts = values[15]
                 positive_velocity_boosts = values[16]
+                censor_same_instrument_overlap_onset_families = (
+                    values[17]
+                    if len(values) > 17
+                    else (
+                        SourceTrackingAudioConfigV2
+                        .censor_same_instrument_overlap_onset_families
+                    )
+                )
+                hard_context_sample_prob = (
+                    values[18]
+                    if len(values) > 18
+                    else SourceTrackingAudioConfigV2.hard_context_sample_prob
+                )
+                hard_context_mix = (
+                    values[19]
+                    if len(values) > 19
+                    else SourceTrackingAudioConfigV2.hard_context_mix
+                )
+                hard_context_positive_families = (
+                    values[20]
+                    if len(values) > 20
+                    else SourceTrackingAudioConfigV2.hard_context_positive_families
+                )
+                hard_context_negative_families = (
+                    values[21]
+                    if len(values) > 21
+                    else SourceTrackingAudioConfigV2.hard_context_negative_families
+                )
+                hard_context_reattack_min_ms = (
+                    values[22]
+                    if len(values) > 22
+                    else SourceTrackingAudioConfigV2.hard_context_reattack_min_ms
+                )
+                hard_context_reattack_max_ms = (
+                    values[23]
+                    if len(values) > 23
+                    else SourceTrackingAudioConfigV2.hard_context_reattack_max_ms
+                )
+                hard_context_min_remaining_ms = (
+                    values[24]
+                    if len(values) > 24
+                    else SourceTrackingAudioConfigV2.hard_context_min_remaining_ms
+                )
+                hard_context_post_onset_min_ms = (
+                    values[25]
+                    if len(values) > 25
+                    else SourceTrackingAudioConfigV2.hard_context_post_onset_min_ms
+                )
+                hard_context_post_onset_max_ms = (
+                    values[26]
+                    if len(values) > 26
+                    else SourceTrackingAudioConfigV2.hard_context_post_onset_max_ms
+                )
+                hard_context_pre_onset_min_ms = (
+                    values[27]
+                    if len(values) > 27
+                    else SourceTrackingAudioConfigV2.hard_context_pre_onset_min_ms
+                )
+                hard_context_pre_onset_max_ms = (
+                    values[28]
+                    if len(values) > 28
+                    else SourceTrackingAudioConfigV2.hard_context_pre_onset_max_ms
+                )
             else:
                 onset_context_sample_prob = (
                     SourceTrackingAudioConfigV2.onset_context_sample_prob
@@ -905,6 +1081,40 @@ class TrainingRenderWorkerV2:
                     if len(values) > 15
                     else SourceTrackingAudioConfigV2.positive_velocity_boosts
                 )
+                censor_same_instrument_overlap_onset_families = (
+                    SourceTrackingAudioConfigV2.censor_same_instrument_overlap_onset_families
+                )
+                hard_context_sample_prob = (
+                    SourceTrackingAudioConfigV2.hard_context_sample_prob
+                )
+                hard_context_mix = SourceTrackingAudioConfigV2.hard_context_mix
+                hard_context_positive_families = (
+                    SourceTrackingAudioConfigV2.hard_context_positive_families
+                )
+                hard_context_negative_families = (
+                    SourceTrackingAudioConfigV2.hard_context_negative_families
+                )
+                hard_context_reattack_min_ms = (
+                    SourceTrackingAudioConfigV2.hard_context_reattack_min_ms
+                )
+                hard_context_reattack_max_ms = (
+                    SourceTrackingAudioConfigV2.hard_context_reattack_max_ms
+                )
+                hard_context_min_remaining_ms = (
+                    SourceTrackingAudioConfigV2.hard_context_min_remaining_ms
+                )
+                hard_context_post_onset_min_ms = (
+                    SourceTrackingAudioConfigV2.hard_context_post_onset_min_ms
+                )
+                hard_context_post_onset_max_ms = (
+                    SourceTrackingAudioConfigV2.hard_context_post_onset_max_ms
+                )
+                hard_context_pre_onset_min_ms = (
+                    SourceTrackingAudioConfigV2.hard_context_pre_onset_min_ms
+                )
+                hard_context_pre_onset_max_ms = (
+                    SourceTrackingAudioConfigV2.hard_context_pre_onset_max_ms
+                )
         renderer = TrainingRenderWorkerV2._renderer(
             data_root,
             include_midi=stage == "midi_complex",
@@ -917,6 +1127,20 @@ class TrainingRenderWorkerV2:
             positive_quality_boosts=positive_quality_boosts,
             positive_source_boosts=positive_source_boosts,
             positive_velocity_boosts=positive_velocity_boosts,
+            censor_same_instrument_overlap_onset_families=(
+                censor_same_instrument_overlap_onset_families
+            ),
+            hard_context_sample_prob=hard_context_sample_prob,
+            hard_context_mix=hard_context_mix,
+            hard_context_positive_families=hard_context_positive_families,
+            hard_context_negative_families=hard_context_negative_families,
+            hard_context_reattack_min_ms=hard_context_reattack_min_ms,
+            hard_context_reattack_max_ms=hard_context_reattack_max_ms,
+            hard_context_min_remaining_ms=hard_context_min_remaining_ms,
+            hard_context_post_onset_min_ms=hard_context_post_onset_min_ms,
+            hard_context_post_onset_max_ms=hard_context_post_onset_max_ms,
+            hard_context_pre_onset_min_ms=hard_context_pre_onset_min_ms,
+            hard_context_pre_onset_max_ms=hard_context_pre_onset_max_ms,
         )
         if gpu_frame_extraction:
             return renderer.render_training_audio_slice(
@@ -949,6 +1173,18 @@ class TrainingRenderWorkerV2:
         positive_quality_boosts: str,
         positive_source_boosts: str,
         positive_velocity_boosts: str,
+        censor_same_instrument_overlap_onset_families: str,
+        hard_context_sample_prob: float,
+        hard_context_mix: str,
+        hard_context_positive_families: str,
+        hard_context_negative_families: str,
+        hard_context_reattack_min_ms: float,
+        hard_context_reattack_max_ms: float,
+        hard_context_min_remaining_ms: float,
+        hard_context_post_onset_min_ms: float,
+        hard_context_post_onset_max_ms: float,
+        hard_context_pre_onset_min_ms: float,
+        hard_context_pre_onset_max_ms: float,
     ) -> SourceTrackingRendererV2:
         cache_key = (
             data_root,
@@ -962,6 +1198,18 @@ class TrainingRenderWorkerV2:
             positive_quality_boosts,
             positive_source_boosts,
             positive_velocity_boosts,
+            censor_same_instrument_overlap_onset_families,
+            hard_context_sample_prob,
+            hard_context_mix,
+            hard_context_positive_families,
+            hard_context_negative_families,
+            hard_context_reattack_min_ms,
+            hard_context_reattack_max_ms,
+            hard_context_min_remaining_ms,
+            hard_context_post_onset_min_ms,
+            hard_context_post_onset_max_ms,
+            hard_context_pre_onset_min_ms,
+            hard_context_pre_onset_max_ms,
         )
         renderer = TrainingRenderWorkerV2._renderers.get(cache_key)
         if renderer is not None:
@@ -981,6 +1229,20 @@ class TrainingRenderWorkerV2:
                 "positive_quality_boosts": positive_quality_boosts,
                 "positive_source_boosts": positive_source_boosts,
                 "positive_velocity_boosts": positive_velocity_boosts,
+                "censor_same_instrument_overlap_onset_families": (
+                    censor_same_instrument_overlap_onset_families
+                ),
+                "hard_context_sample_prob": hard_context_sample_prob,
+                "hard_context_mix": hard_context_mix,
+                "hard_context_positive_families": hard_context_positive_families,
+                "hard_context_negative_families": hard_context_negative_families,
+                "hard_context_reattack_min_ms": hard_context_reattack_min_ms,
+                "hard_context_reattack_max_ms": hard_context_reattack_max_ms,
+                "hard_context_min_remaining_ms": hard_context_min_remaining_ms,
+                "hard_context_post_onset_min_ms": hard_context_post_onset_min_ms,
+                "hard_context_post_onset_max_ms": hard_context_post_onset_max_ms,
+                "hard_context_pre_onset_min_ms": hard_context_pre_onset_min_ms,
+                "hard_context_pre_onset_max_ms": hard_context_pre_onset_max_ms,
             },
         )
         renderer = SourceTrackingRendererV2(
@@ -1214,6 +1476,11 @@ class SourceTrackingTrainerV2:
         self.model = DualPathTransformerSourceTrackerV2(self.model_config).to(self.device)
         if config.warm_start_checkpoint is not None:
             self._load_warm_start(Path(config.warm_start_checkpoint))
+        self.phase1_onset_teacher: DualPathTransformerSourceTrackerV2 | None = None
+        if config.phase1_onset_teacher_checkpoint is not None:
+            self.phase1_onset_teacher = self._load_phase1_onset_teacher(
+                Path(config.phase1_onset_teacher_checkpoint)
+            )
         self.loss_fn = SourceTrackingLossV2(
             activity_pos_weight=config.activity_pos_weight,
             inactive_slot_weight=config.inactive_slot_weight,
@@ -1254,6 +1521,18 @@ class SourceTrackingTrainerV2:
             ),
             onset_sequence_block_ranking_loss_weight=(
                 config.onset_sequence_block_ranking_loss_weight
+            ),
+            onset_sequence_post_onset_ranking_loss_weight=(
+                config.onset_sequence_post_onset_ranking_loss_weight
+            ),
+            onset_sequence_post_onset_min_frames=(
+                config.onset_sequence_post_onset_min_frames
+            ),
+            onset_sequence_post_onset_max_frames=(
+                config.onset_sequence_post_onset_max_frames
+            ),
+            onset_sequence_hard_context_ranking_loss_weight=(
+                config.onset_sequence_hard_context_ranking_loss_weight
             ),
             onset_nearby_pairwise_ranking_loss_weight=(
                 config.onset_nearby_pairwise_ranking_loss_weight
@@ -1326,6 +1605,8 @@ class SourceTrackingTrainerV2:
                     self.config.frame_cache_phase_jitter_samples
                 ),
                 "frame_phase_noise_std": self.config.frame_phase_noise_std,
+                "phase_jitter_samples": self.config.phase_jitter_samples,
+                "feature_noise_std": self.config.feature_noise_std,
                 "anneal_noise_phase_jitter_samples": (
                     self.config.anneal_noise_phase_jitter_samples
                 ),
@@ -1345,6 +1626,32 @@ class SourceTrackingTrainerV2:
                 "positive_quality_boosts": self.config.positive_quality_boosts,
                 "positive_source_boosts": self.config.positive_source_boosts,
                 "positive_velocity_boosts": self.config.positive_velocity_boosts,
+                "censor_same_instrument_overlap_onset_families": (
+                    self.config.censor_same_instrument_overlap_onset_families
+                ),
+                "hard_context_sample_prob": self.config.hard_context_sample_prob,
+                "hard_context_mix": self.config.hard_context_mix,
+                "hard_context_positive_families": (
+                    self.config.hard_context_positive_families
+                ),
+                "hard_context_negative_families": (
+                    self.config.hard_context_negative_families
+                ),
+                "hard_context_reattack_min_ms": self.config.hard_context_reattack_min_ms,
+                "hard_context_reattack_max_ms": self.config.hard_context_reattack_max_ms,
+                "hard_context_min_remaining_ms": self.config.hard_context_min_remaining_ms,
+                "hard_context_post_onset_min_ms": (
+                    self.config.hard_context_post_onset_min_ms
+                ),
+                "hard_context_post_onset_max_ms": (
+                    self.config.hard_context_post_onset_max_ms
+                ),
+                "hard_context_pre_onset_min_ms": (
+                    self.config.hard_context_pre_onset_min_ms
+                ),
+                "hard_context_pre_onset_max_ms": (
+                    self.config.hard_context_pre_onset_max_ms
+                ),
                 "event_teacher_forcing_start": self.config.event_teacher_forcing_start,
                 "event_teacher_forcing_end": self.config.event_teacher_forcing_end,
                 "event_state_onset_threshold": (
@@ -1433,6 +1740,18 @@ class SourceTrackingTrainerV2:
                     "onset_sequence_block_ranking_loss_weight": (
                         self.config.onset_sequence_block_ranking_loss_weight
                     ),
+                    "onset_sequence_post_onset_ranking_loss_weight": (
+                        self.config.onset_sequence_post_onset_ranking_loss_weight
+                    ),
+                    "onset_sequence_post_onset_min_frames": (
+                        self.config.onset_sequence_post_onset_min_frames
+                    ),
+                    "onset_sequence_post_onset_max_frames": (
+                        self.config.onset_sequence_post_onset_max_frames
+                    ),
+                    "onset_sequence_hard_context_ranking_loss_weight": (
+                        self.config.onset_sequence_hard_context_ranking_loss_weight
+                    ),
                     "onset_nearby_pairwise_ranking_loss_weight": (
                         self.config.onset_nearby_pairwise_ranking_loss_weight
                     ),
@@ -1468,6 +1787,15 @@ class SourceTrackingTrainerV2:
                     ),
                     "first_pass_distillation_offset_weight": (
                         self.config.first_pass_distillation_offset_weight
+                    ),
+                    "phase1_onset_teacher_checkpoint": (
+                        self.config.phase1_onset_teacher_checkpoint
+                    ),
+                    "phase1_onset_distillation_loss_weight": (
+                        self.config.phase1_onset_distillation_loss_weight
+                    ),
+                    "phase1_onset_sequence_distillation_loss_weight": (
+                        self.config.phase1_onset_sequence_distillation_loss_weight
                     ),
                     "first_pass_event_age_loss_weight": (
                         self.config.first_pass_event_age_loss_weight
@@ -1851,6 +2179,26 @@ class SourceTrackingTrainerV2:
                                 offset_weight=(
                                     self.config.first_pass_distillation_offset_weight
                                 ),
+                            )
+                        if self._uses_phase1_onset_teacher_loss():
+                            if self.phase1_onset_teacher is None:
+                                raise RuntimeError(
+                                    "phase1 onset teacher loss requires a loaded teacher"
+                                )
+                            with torch.no_grad():
+                                teacher_outputs = self.phase1_onset_teacher(
+                                    batch["frames"]
+                                )
+                            loss = loss + self.loss_fn.first_pass_distillation_loss(
+                                outputs,
+                                teacher_outputs,
+                                final_weight=(
+                                    self.config.phase1_onset_distillation_loss_weight
+                                ),
+                                sequence_weight=(
+                                    self.config.phase1_onset_sequence_distillation_loss_weight
+                                ),
+                                offset_weight=0.0,
                             )
                         if (
                             first_pass_outputs is not None
@@ -2399,6 +2747,15 @@ class SourceTrackingTrainerV2:
             or self.config.first_pass_sequence_distillation_loss_weight > 0.0
         )
 
+    def _uses_phase1_onset_teacher_loss(self) -> bool:
+        return (
+            self.config.phase1_onset_teacher_checkpoint is not None
+            and (
+                self.config.phase1_onset_distillation_loss_weight > 0.0
+                or self.config.phase1_onset_sequence_distillation_loss_weight > 0.0
+            )
+        )
+
     def _uses_first_pass_age_metrics(self) -> bool:
         return (
             self.config.first_pass_event_age_loss_weight > 0.0
@@ -2638,10 +2995,14 @@ class SourceTrackingTrainerV2:
         batch_idx: int,
     ) -> dict[str, torch.Tensor]:
         seeds = self._batch_seeds(epoch, batch_idx)
-        phase_jitter_samples = self._annealed_phase_jitter_samples(
-            stage_name,
-            epoch,
-            stage_epochs,
+        phase_jitter_samples = max(
+            0,
+            int(self.config.phase_jitter_samples),
+            self._annealed_phase_jitter_samples(
+                stage_name,
+                epoch,
+                stage_epochs,
+            ),
         )
         batch = self.batch_builder.build_slices(
             self._render_slices(
@@ -2651,7 +3012,11 @@ class SourceTrackingTrainerV2:
                 phase_jitter_samples=phase_jitter_samples,
             )
         )
-        noise_std = self._annealed_feature_noise_std(stage_name, epoch, stage_epochs)
+        noise_std = max(
+            0.0,
+            float(self.config.feature_noise_std),
+            self._annealed_feature_noise_std(stage_name, epoch, stage_epochs),
+        )
         if noise_std > 0.0:
             batch["frames"] = torch.clamp(
                 batch["frames"] + torch.randn_like(batch["frames"]) * noise_std,
@@ -3389,6 +3754,18 @@ class SourceTrackingTrainerV2:
                 self.config.positive_quality_boosts,
                 self.config.positive_source_boosts,
                 self.config.positive_velocity_boosts,
+                self.config.censor_same_instrument_overlap_onset_families,
+                self.config.hard_context_sample_prob,
+                self.config.hard_context_mix,
+                self.config.hard_context_positive_families,
+                self.config.hard_context_negative_families,
+                self.config.hard_context_reattack_min_ms,
+                self.config.hard_context_reattack_max_ms,
+                self.config.hard_context_min_remaining_ms,
+                self.config.hard_context_post_onset_min_ms,
+                self.config.hard_context_post_onset_max_ms,
+                self.config.hard_context_pre_onset_min_ms,
+                self.config.hard_context_pre_onset_max_ms,
             )
             for seed, phase_offset in zip(seeds, phase_offsets, strict=True)
         ]
@@ -3470,6 +3847,32 @@ class SourceTrackingTrainerV2:
                 "positive_quality_boosts": self.config.positive_quality_boosts,
                 "positive_source_boosts": self.config.positive_source_boosts,
                 "positive_velocity_boosts": self.config.positive_velocity_boosts,
+                "censor_same_instrument_overlap_onset_families": (
+                    self.config.censor_same_instrument_overlap_onset_families
+                ),
+                "hard_context_sample_prob": self.config.hard_context_sample_prob,
+                "hard_context_mix": self.config.hard_context_mix,
+                "hard_context_positive_families": (
+                    self.config.hard_context_positive_families
+                ),
+                "hard_context_negative_families": (
+                    self.config.hard_context_negative_families
+                ),
+                "hard_context_reattack_min_ms": self.config.hard_context_reattack_min_ms,
+                "hard_context_reattack_max_ms": self.config.hard_context_reattack_max_ms,
+                "hard_context_min_remaining_ms": self.config.hard_context_min_remaining_ms,
+                "hard_context_post_onset_min_ms": (
+                    self.config.hard_context_post_onset_min_ms
+                ),
+                "hard_context_post_onset_max_ms": (
+                    self.config.hard_context_post_onset_max_ms
+                ),
+                "hard_context_pre_onset_min_ms": (
+                    self.config.hard_context_pre_onset_min_ms
+                ),
+                "hard_context_pre_onset_max_ms": (
+                    self.config.hard_context_pre_onset_max_ms
+                ),
             },
         )
         return SourceTrackingRendererV2(note_store, midi_store, config=audio_config)
@@ -3582,6 +3985,25 @@ class SourceTrackingTrainerV2:
                 "mode": "strict",
                 "loaded_tensors": len(state_dict),
             }
+
+    def _load_phase1_onset_teacher(
+        self,
+        checkpoint: Path,
+    ) -> DualPathTransformerSourceTrackerV2:
+        if not checkpoint.exists():
+            raise FileNotFoundError(
+                f"Phase-1 onset teacher checkpoint not found: {checkpoint}"
+            )
+        payload = torch.load(checkpoint, map_location=self.device)
+        state_dict = (
+            payload.get("state_dict", payload) if isinstance(payload, dict) else payload
+        )
+        teacher = DualPathTransformerSourceTrackerV2(self.model_config).to(self.device)
+        teacher.load_state_dict(state_dict)
+        teacher.eval()
+        for parameter in teacher.parameters():
+            parameter.requires_grad = False
+        return teacher
 
     def _load_partial_state_dict(self, state_dict: dict[str, torch.Tensor]) -> None:
         model_state = self.model.state_dict()
@@ -3780,6 +4202,81 @@ class TrainingCliV2:
             "--positive-velocity-boosts",
             default=TrainingConfigV2.positive_velocity_boosts,
             help="Comma-separated velocity=weight note-sampling boosts.",
+        )
+        parser.add_argument(
+            "--censor-same-instrument-overlap-onset-families",
+            default=TrainingConfigV2.censor_same_instrument_overlap_onset_families,
+            help=(
+                "Comma-separated families whose same-source same-instrument "
+                "overlapping re-articulations should keep activity/audio labels "
+                "but not onset-positive labels."
+            ),
+        )
+        parser.add_argument(
+            "--hard-context-sample-prob",
+            type=float,
+            default=TrainingConfigV2.hard_context_sample_prob,
+            help="Probability of using the phase-2 hard context sampler.",
+        )
+        parser.add_argument(
+            "--hard-context-mix",
+            default=TrainingConfigV2.hard_context_mix,
+            help=(
+                "Comma-separated weights for reattack,post_onset,pre_onset,"
+                "ordinary hard-context sampling modes."
+            ),
+        )
+        parser.add_argument(
+            "--hard-context-positive-families",
+            default=TrainingConfigV2.hard_context_positive_families,
+            help="Comma-separated families used for hard re-attack positives.",
+        )
+        parser.add_argument(
+            "--hard-context-negative-families",
+            default=TrainingConfigV2.hard_context_negative_families,
+            help="Comma-separated families used for post/pre-onset hard negatives.",
+        )
+        parser.add_argument(
+            "--hard-context-reattack-min-ms",
+            type=float,
+            default=TrainingConfigV2.hard_context_reattack_min_ms,
+            help="Minimum prior-onset spacing for same-instrument re-attack positives.",
+        )
+        parser.add_argument(
+            "--hard-context-reattack-max-ms",
+            type=float,
+            default=TrainingConfigV2.hard_context_reattack_max_ms,
+            help="Maximum prior-onset spacing for same-instrument re-attack positives.",
+        )
+        parser.add_argument(
+            "--hard-context-min-remaining-ms",
+            type=float,
+            default=TrainingConfigV2.hard_context_min_remaining_ms,
+            help="Minimum previous-note sustain remaining at a re-attack positive.",
+        )
+        parser.add_argument(
+            "--hard-context-post-onset-min-ms",
+            type=float,
+            default=TrainingConfigV2.hard_context_post_onset_min_ms,
+            help="Start of post-onset hard-negative window.",
+        )
+        parser.add_argument(
+            "--hard-context-post-onset-max-ms",
+            type=float,
+            default=TrainingConfigV2.hard_context_post_onset_max_ms,
+            help="End of post-onset hard-negative window.",
+        )
+        parser.add_argument(
+            "--hard-context-pre-onset-min-ms",
+            type=float,
+            default=TrainingConfigV2.hard_context_pre_onset_min_ms,
+            help="Inner edge of pre-onset hard-negative window.",
+        )
+        parser.add_argument(
+            "--hard-context-pre-onset-max-ms",
+            type=float,
+            default=TrainingConfigV2.hard_context_pre_onset_max_ms,
+            help="Outer edge of pre-onset hard-negative window.",
         )
         parser.add_argument(
             "--early-stopping-metric",
@@ -4001,6 +4498,36 @@ class TrainingCliV2:
             help="Rank accepted onset-block max logits above far-negative logits.",
         )
         parser.add_argument(
+            "--onset-sequence-post-onset-ranking-loss-weight",
+            type=float,
+            default=TrainingConfigV2.onset_sequence_post_onset_ranking_loss_weight,
+            help=(
+                "Rank accepted onset-block max logits above post-onset "
+                "non-onset frames."
+            ),
+        )
+        parser.add_argument(
+            "--onset-sequence-post-onset-min-frames",
+            type=int,
+            default=TrainingConfigV2.onset_sequence_post_onset_min_frames,
+            help="First frame offset after an onset used as post-onset negative.",
+        )
+        parser.add_argument(
+            "--onset-sequence-post-onset-max-frames",
+            type=int,
+            default=TrainingConfigV2.onset_sequence_post_onset_max_frames,
+            help="Last frame offset after an onset used as post-onset negative.",
+        )
+        parser.add_argument(
+            "--onset-sequence-hard-context-ranking-loss-weight",
+            type=float,
+            default=TrainingConfigV2.onset_sequence_hard_context_ranking_loss_weight,
+            help=(
+                "Rank true hard-context onset blocks above sampled post/pre/far "
+                "negative context frames."
+            ),
+        )
+        parser.add_argument(
             "--onset-nearby-pairwise-ranking-loss-weight",
             type=float,
             default=TrainingConfigV2.onset_nearby_pairwise_ranking_loss_weight,
@@ -4097,6 +4624,26 @@ class TrainingCliV2:
             type=float,
             default=TrainingConfigV2.first_pass_distillation_offset_weight,
             help="Relative offset weight inside first-pass distillation losses.",
+        )
+        parser.add_argument(
+            "--phase1-onset-teacher-checkpoint",
+            default=TrainingConfigV2.phase1_onset_teacher_checkpoint,
+            help=(
+                "Frozen phase-1 checkpoint used to preserve onset ranking "
+                "during later-stage adaptation."
+            ),
+        )
+        parser.add_argument(
+            "--phase1-onset-distillation-loss-weight",
+            type=float,
+            default=TrainingConfigV2.phase1_onset_distillation_loss_weight,
+            help="Soft-target distillation weight for final-frame onset logits.",
+        )
+        parser.add_argument(
+            "--phase1-onset-sequence-distillation-loss-weight",
+            type=float,
+            default=TrainingConfigV2.phase1_onset_sequence_distillation_loss_weight,
+            help="Soft-target distillation weight for onset sequence logits.",
         )
         parser.add_argument(
             "--first-pass-event-age-loss-weight",
@@ -4249,6 +4796,24 @@ class TrainingCliV2:
             type=float,
             default=TrainingConfigV2.frame_phase_noise_std,
             help="Gaussian feature noise std added to cached frames at train time.",
+        )
+        parser.add_argument(
+            "--phase-jitter-samples",
+            type=int,
+            default=TrainingConfigV2.phase_jitter_samples,
+            help=(
+                "Constant train-time STFT phase jitter, in samples, applied from "
+                "the first epoch."
+            ),
+        )
+        parser.add_argument(
+            "--feature-noise-std",
+            type=float,
+            default=TrainingConfigV2.feature_noise_std,
+            help=(
+                "Constant train-time Gaussian feature noise std applied from the "
+                "first epoch."
+            ),
         )
         parser.add_argument(
             "--anneal-noise-phase-jitter-samples",

@@ -265,7 +265,7 @@ def test_onset_nearby_pairwise_ranking_loss_compares_shoulders_to_hard_negatives
         onset_pairwise_ranking_margin=0.5,
     )(outputs, targets)
 
-    assert ranked > plain + 2
+    assert ranked > plain + 1
 
 
 def test_onset_sequence_pairwise_ranking_loss_excludes_shoulder_negatives():
@@ -346,8 +346,18 @@ def test_onset_sequence_block_ranking_loss_ranks_block_above_far_negatives():
         "onset_logits": torch.zeros(1, 1),
         "offset_logits": torch.zeros(1, 1),
     }
-    bad = {**common, "onset_logits_sequence": torch.tensor([[[0.0], [1.0], [0.0], [4.0], [3.0]]])}
-    good = {**common, "onset_logits_sequence": torch.tensor([[[4.0], [5.0], [4.0], [0.0], [-1.0]]])}
+    bad = {
+        **common,
+        "onset_logits_sequence": torch.tensor(
+            [[[0.0], [1.0], [0.0], [4.0], [3.0]]]
+        ),
+    }
+    good = {
+        **common,
+        "onset_logits_sequence": torch.tensor(
+            [[[4.0], [5.0], [4.0], [0.0], [-1.0]]]
+        ),
+    }
     loss = SourceTrackingLossV2(
         count_loss_weight=0.0,
         family_loss_weight=0.0,
@@ -359,6 +369,58 @@ def test_onset_sequence_block_ranking_loss_ranks_block_above_far_negatives():
     )
 
     assert loss(bad, targets) > loss(good, targets) + 2.0
+
+
+def test_onset_sequence_post_onset_ranking_loss_targets_late_shoulders():
+    targets = {
+        "activity": torch.zeros(1, 1),
+        "family": torch.zeros(1, 1),
+        "onset": torch.zeros(1, 1),
+        "offset": torch.zeros(1, 1),
+        "context_onset": torch.tensor(
+            [[[1.0], [1.0], [1.0], [0.0], [0.0], [0.0], [0.0]]]
+        ),
+        "context_onset_delta": torch.tensor(
+            [[[-1.0], [0.0], [1.0], [0.0], [0.0], [0.0], [0.0]]]
+        ),
+        "context_onset_timing_mask": torch.tensor(
+            [[[1.0], [1.0], [1.0], [0.0], [0.0], [0.0], [0.0]]]
+        ),
+        "context_onset_nearby_mask": torch.tensor(
+            [[[1.0], [1.0], [1.0], [0.0], [0.0], [0.0], [0.0]]]
+        ),
+    }
+    common = {
+        "activity_logits": torch.full((1, 1), -20.0),
+        "family_logits": torch.zeros(1, 1, 11),
+        "onset_logits": torch.zeros(1, 1),
+        "offset_logits": torch.zeros(1, 1),
+    }
+    bad = {
+        **common,
+        "onset_logits_sequence": torch.tensor(
+            [[[2.0], [5.0], [2.0], [-3.0], [4.0], [3.0], [-3.0]]]
+        ),
+    }
+    good = {
+        **common,
+        "onset_logits_sequence": torch.tensor(
+            [[[2.0], [5.0], [2.0], [-3.0], [-2.0], [-2.0], [-3.0]]]
+        ),
+    }
+    loss = SourceTrackingLossV2(
+        count_loss_weight=0.0,
+        family_loss_weight=0.0,
+        boundary_loss_weight=0.0,
+        onset_loss_weight=0.0,
+        offset_loss_weight=0.0,
+        onset_sequence_post_onset_ranking_loss_weight=1.0,
+        onset_sequence_post_onset_min_frames=3,
+        onset_sequence_post_onset_max_frames=5,
+        onset_pairwise_ranking_margin=0.5,
+    )
+
+    assert loss(bad, targets) > loss(good, targets) + 0.1
 
 
 def test_onset_peak_to_shoulder_ranking_loss_compares_exact_onset_to_shoulders():

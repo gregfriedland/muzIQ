@@ -41,6 +41,18 @@ class SourceTrackingAudioConfigV2:
     positive_quality_boosts = ""
     positive_source_boosts = ""
     positive_velocity_boosts = ""
+    censor_same_instrument_overlap_onset_families = ""
+    hard_context_sample_prob = 0.0
+    hard_context_mix = "reattack=0.4,post_onset=0.3,pre_onset=0.15,ordinary=0.15"
+    hard_context_positive_families = ""
+    hard_context_negative_families = ""
+    hard_context_reattack_min_ms = 400.0
+    hard_context_reattack_max_ms = 900.0
+    hard_context_min_remaining_ms = 1000.0
+    hard_context_post_onset_min_ms = 25.0
+    hard_context_post_onset_max_ms = 75.0
+    hard_context_pre_onset_min_ms = 25.0
+    hard_context_pre_onset_max_ms = 100.0
 
 
 class FamilyVocabularyV2:
@@ -332,6 +344,18 @@ class SourceTrackingRendererV2:
         self.positive_velocity_boosts = self._parse_weight_spec(
             config.positive_velocity_boosts
         )
+        self.censor_same_instrument_overlap_onset_families = {
+            family.strip()
+            for family in config.censor_same_instrument_overlap_onset_families.split(",")
+            if family.strip()
+        }
+        self.hard_context_mix = self._parse_weight_spec(config.hard_context_mix)
+        self.hard_context_positive_families = self._parse_list_spec(
+            config.hard_context_positive_families
+        )
+        self.hard_context_negative_families = self._parse_list_spec(
+            config.hard_context_negative_families
+        )
 
     @staticmethod
     def _parse_weight_spec(spec: str) -> dict[str, float]:
@@ -351,6 +375,10 @@ class SourceTrackingRendererV2:
             except ValueError:
                 continue
         return weights
+
+    @staticmethod
+    def _parse_list_spec(spec: str) -> set[str]:
+        return {item.strip() for item in str(spec or "").split(",") if item.strip()}
 
     def render(
         self, stage: str, split: SplitName, seed: int
@@ -388,6 +416,12 @@ class SourceTrackingRendererV2:
         )
         target = self._label_at_frame(events, len(audio), frame_idx)
         context = self._label_context_for_frame(events, len(audio), frame_idx, frame_count)
+        hard_context = self._hard_context_masks_for_frame(
+            events,
+            len(audio),
+            frame_idx,
+            frame_count,
+        )
         return {
             "frames": self.extractor.extract_context(
                 audio,
@@ -398,6 +432,7 @@ class SourceTrackingRendererV2:
             ),
             "frame_idx": np.asarray(frame_idx, dtype=np.int64),
             **context,
+            **hard_context,
             **target,
         }
 
@@ -420,6 +455,12 @@ class SourceTrackingRendererV2:
         )
         target = self._label_at_frame(events, len(audio), frame_idx)
         context = self._label_context_for_frame(events, len(audio), frame_idx, frame_count)
+        hard_context = self._hard_context_masks_for_frame(
+            events,
+            len(audio),
+            frame_idx,
+            frame_count,
+        )
         return {
             "audio_context": self._audio_context_for_frame(
                 audio,
@@ -430,6 +471,7 @@ class SourceTrackingRendererV2:
             ),
             "frame_idx": np.asarray(frame_idx, dtype=np.int64),
             **context,
+            **hard_context,
             **target,
         }
 
@@ -624,6 +666,7 @@ class SourceTrackingRendererV2:
                 source_id=source_id,
                 family=note.family,
                 family_index=self.families.index(note.family),
+                instrument_str=note.instrument_str,
                 start_s=start / self.config.sample_rate,
                 end_s=end / self.config.sample_rate,
             )
@@ -665,6 +708,11 @@ class SourceTrackingRendererV2:
             start, end = self._event_frame_span(event, n_frames)
             if end <= start:
                 continue
+            onset_censored = self._censor_event_onset(
+                event,
+                events,
+                n_frames,
+            )
             active[start:end, event.source_id] = 1.0
             family[start:end, event.source_id] = event.family_index
             source_id[start:end, event.source_id] = event.source_id
@@ -678,18 +726,23 @@ class SourceTrackingRendererV2:
             offset_end = min(
                 n_frames, offset_center + self.config.offset_label_radius_frames + 1
             )
-            onset[onset_nearby_start:onset_nearby_end, event.source_id] = 1.0
-            offset[offset_start:offset_end, event.source_id] = 1.0
             onset_nearby_frames = np.arange(
                 onset_nearby_start,
                 onset_nearby_end,
                 dtype=np.float32,
             )
-            onset_delta[onset_nearby_start:onset_nearby_end, event.source_id] = (
-                onset_nearby_frames - start
-            )
-            onset_timing_mask[onset_nearby_start:onset_nearby_end, event.source_id] = 1.0
-            onset_nearby_mask[onset_nearby_start:onset_nearby_end, event.source_id] = 1.0
+            if not onset_censored:
+                onset[onset_nearby_start:onset_nearby_end, event.source_id] = 1.0
+                onset_delta[onset_nearby_start:onset_nearby_end, event.source_id] = (
+                    onset_nearby_frames - start
+                )
+                onset_timing_mask[
+                    onset_nearby_start:onset_nearby_end, event.source_id
+                ] = 1.0
+                onset_nearby_mask[
+                    onset_nearby_start:onset_nearby_end, event.source_id
+                ] = 1.0
+            offset[offset_start:offset_end, event.source_id] = 1.0
             offset_frames = np.arange(offset_start, offset_end, dtype=np.float32)
             offset_delta[offset_start:offset_end, event.source_id] = (
                 offset_frames - offset_center
@@ -737,16 +790,33 @@ class SourceTrackingRendererV2:
         use_hard_negatives: bool = True,
     ) -> int:
         n_frames = int(np.ceil(n_samples / self.config.hop))
-        spans = [
-            self._event_frame_span(event, n_frames)
+        span_rows = [
+            (
+                event,
+                *self._event_frame_span(event, n_frames),
+            )
             for event in events
             if event.source_id < self.config.max_sources
         ]
-        spans = [(start, end) for start, end in spans if end > start]
-        if not spans:
+        span_rows = [
+            (event, start, end) for event, start, end in span_rows if end > start
+        ]
+        if not span_rows:
             return n_frames - 1
         rng = np.random.default_rng(seed + 9_973)
-        start, end = spans[int(rng.integers(len(spans)))]
+        if (
+            context_frame_count is not None
+            and context_frame_count > 0
+            and use_hard_negatives
+        ):
+            hard_frame = self._sample_hard_context_frame(
+                span_rows,
+                n_frames,
+                rng,
+            )
+            if hard_frame is not None:
+                return hard_frame
+        event, start, end = span_rows[int(rng.integers(len(span_rows)))]
         probe = float(rng.random())
         onset_context_prob = min(
             1.0,
@@ -757,6 +827,13 @@ class SourceTrackingRendererV2:
             and context_frame_count > 0
             and probe < onset_context_prob
         ):
+            onset_rows = [
+                row
+                for row in span_rows
+                if not self._censor_event_onset(row[0], events, n_frames)
+            ]
+            if onset_rows:
+                _, start, end = onset_rows[int(rng.integers(len(onset_rows)))]
             hi = min(n_frames, start + int(context_frame_count))
             return int(rng.integers(start, max(start + 1, hi)))
         negative_radius = self.config.boundary_negative_radius_frames
@@ -796,6 +873,136 @@ class SourceTrackingRendererV2:
             return int(end - 1)
         return int(rng.integers(lo, hi))
 
+    def _sample_hard_context_frame(
+        self,
+        span_rows: list[tuple[SourceEventLabelV2, int, int]],
+        n_frames: int,
+        rng: np.random.Generator,
+    ) -> int | None:
+        sample_prob = min(1.0, max(0.0, float(self.config.hard_context_sample_prob)))
+        if sample_prob <= 0.0 or float(rng.random()) >= sample_prob:
+            return None
+        mode = self._sample_hard_context_mode(rng)
+        if mode == "ordinary":
+            return None
+        candidates = self._hard_context_candidates(span_rows, n_frames)
+        selected = candidates.get(mode, [])
+        if not selected:
+            return None
+        return int(selected[int(rng.integers(len(selected)))])
+
+    def _sample_hard_context_mode(self, rng: np.random.Generator) -> str:
+        weights = {
+            "reattack": self.hard_context_mix.get("reattack", 0.0),
+            "post_onset": self.hard_context_mix.get("post_onset", 0.0),
+            "pre_onset": self.hard_context_mix.get("pre_onset", 0.0),
+            "ordinary": self.hard_context_mix.get("ordinary", 0.0),
+        }
+        total = sum(max(0.0, value) for value in weights.values())
+        if total <= 0.0:
+            return "ordinary"
+        probe = float(rng.random()) * total
+        acc = 0.0
+        for mode, weight in weights.items():
+            acc += max(0.0, weight)
+            if probe <= acc:
+                return mode
+        return "ordinary"
+
+    def _hard_context_candidates(
+        self,
+        span_rows: list[tuple[SourceEventLabelV2, int, int]],
+        n_frames: int,
+    ) -> dict[str, list[int]]:
+        positive_families = self.hard_context_positive_families
+        negative_families = self.hard_context_negative_families
+        candidates: dict[str, list[int]] = {
+            "reattack": [],
+            "post_onset": [],
+            "pre_onset": [],
+        }
+        for event, start, _end in span_rows:
+            if self._censor_event_onset(event, [row[0] for row in span_rows], n_frames):
+                continue
+            if not positive_families or event.family in positive_families:
+                previous = self._previous_same_instrument_event(event, span_rows, start)
+                if previous is not None:
+                    prev_start, prev_end = previous
+                    spacing_ms = (start - prev_start) * self._hop_ms()
+                    remaining_ms = (prev_end - start) * self._hop_ms()
+                    if (
+                        self.config.hard_context_reattack_min_ms
+                        <= spacing_ms
+                        <= self.config.hard_context_reattack_max_ms
+                        and remaining_ms >= self.config.hard_context_min_remaining_ms
+                    ):
+                        candidates["reattack"].append(start)
+            if negative_families and event.family not in negative_families:
+                continue
+            post_lo, post_hi = self._ms_window_after_onset(
+                start,
+                self.config.hard_context_post_onset_min_ms,
+                self.config.hard_context_post_onset_max_ms,
+                n_frames,
+            )
+            candidates["post_onset"].extend(range(post_lo, post_hi))
+            pre_lo, pre_hi = self._ms_window_before_onset(
+                start,
+                self.config.hard_context_pre_onset_min_ms,
+                self.config.hard_context_pre_onset_max_ms,
+            )
+            candidates["pre_onset"].extend(range(pre_lo, pre_hi))
+        return candidates
+
+    def _previous_same_instrument_event(
+        self,
+        event: SourceEventLabelV2,
+        span_rows: list[tuple[SourceEventLabelV2, int, int]],
+        start: int,
+    ) -> tuple[int, int] | None:
+        previous = [
+            (other_start, other_end)
+            for other, other_start, other_end in span_rows
+            if other is not event
+            and other.source_id == event.source_id
+            and other.instrument_str == event.instrument_str
+            and other_start < start
+        ]
+        if not previous:
+            return None
+        return max(previous, key=lambda row: row[0])
+
+    def _ms_window_after_onset(
+        self,
+        start: int,
+        min_ms: float,
+        max_ms: float,
+        n_frames: int,
+    ) -> tuple[int, int]:
+        shoulder_gap = self.config.onset_shoulder_radius_frames + 1
+        lo = start + max(shoulder_gap, int(np.ceil(min_ms / self._hop_ms())))
+        hi = start + int(np.floor(max_ms / self._hop_ms())) + 1
+        return max(0, min(n_frames, lo)), max(0, min(n_frames, hi))
+
+    def _ms_window_before_onset(
+        self,
+        start: int,
+        min_ms: float,
+        max_ms: float,
+    ) -> tuple[int, int]:
+        shoulder_gap = self.config.onset_shoulder_radius_frames + 1
+        lo = start - int(np.floor(max_ms / self._hop_ms()))
+        hi = start - max(shoulder_gap, int(np.ceil(min_ms / self._hop_ms()))) + 1
+        return max(0, lo), max(0, hi)
+
+    @staticmethod
+    def _hop_ms() -> float:
+        return (
+            SourceTrackingAudioConfigV2.hop
+            / SourceTrackingAudioConfigV2.sample_rate
+            * 1000.0
+        )
+
     def _label_at_frame(
         self,
         events: list[SourceEventLabelV2],
@@ -819,11 +1026,14 @@ class SourceTrackingRendererV2:
             if start <= frame_idx < end:
                 activity[event.source_id] = 1.0
                 family[event.source_id] = event.family_index
+            onset_censored = self._censor_event_onset(event, events, n_frames)
             onset_frame_delta = frame_idx - start
-            if abs(onset_frame_delta) <= self.config.onset_shoulder_radius_frames:
+            if (
+                not onset_censored
+                and abs(onset_frame_delta) <= self.config.onset_shoulder_radius_frames
+            ):
                 onset_delta[event.source_id] = float(onset_frame_delta)
                 onset_nearby_mask[event.source_id] = 1.0
-            if abs(onset_frame_delta) <= self.config.onset_shoulder_radius_frames:
                 onset[event.source_id] = 1.0
                 onset_timing_mask[event.source_id] = 1.0
             offset_center = end - 1
@@ -884,6 +1094,142 @@ class SourceTrackingRendererV2:
             "event_state": event_state,
         }
 
+    def _hard_context_masks_for_frame(
+        self,
+        events: list[SourceEventLabelV2],
+        n_samples: int,
+        frame_idx: int,
+        frame_count: int,
+    ) -> dict[str, np.ndarray]:
+        n_frames = int(np.ceil(n_samples / self.config.hop))
+        start = max(0, frame_idx - frame_count + 1)
+        stop = frame_idx + 1
+        pad = frame_count - (stop - start)
+        shape = (frame_count, self.config.max_sources)
+        positive = np.zeros(shape, dtype=np.float32)
+        post_negative = np.zeros(shape, dtype=np.float32)
+        pre_negative = np.zeros(shape, dtype=np.float32)
+        far_negative = np.zeros(shape, dtype=np.float32)
+        labels = self._labels_from_events(events, n_samples)
+        onset_nearby = np.zeros(shape, dtype=np.float32)
+        onset_nearby[pad:] = labels.onset_nearby_mask[start:stop]
+        span_rows = [
+            (event, *self._event_frame_span(event, n_frames))
+            for event in events
+            if event.source_id < self.config.max_sources
+        ]
+        span_rows = [
+            (event, event_start, event_end)
+            for event, event_start, event_end in span_rows
+            if event_end > event_start
+        ]
+        all_events = [row[0] for row in span_rows]
+        for event, event_start, event_end in span_rows:
+            if self._censor_event_onset(event, all_events, n_frames):
+                continue
+            previous = self._previous_same_instrument_event(
+                event,
+                span_rows,
+                event_start,
+            )
+            if previous is not None:
+                prev_start, prev_end = previous
+                spacing_ms = (event_start - prev_start) * self._hop_ms()
+                remaining_ms = (prev_end - event_start) * self._hop_ms()
+                if (
+                    (
+                        not self.hard_context_positive_families
+                        or event.family in self.hard_context_positive_families
+                    )
+                    and self.config.hard_context_reattack_min_ms
+                    <= spacing_ms
+                    <= self.config.hard_context_reattack_max_ms
+                    and remaining_ms >= self.config.hard_context_min_remaining_ms
+                ):
+                    self._set_context_frame(positive, start, pad, event_start, event.source_id)
+            if (
+                self.hard_context_negative_families
+                and event.family not in self.hard_context_negative_families
+            ):
+                continue
+            post_lo, post_hi = self._ms_window_after_onset(
+                event_start,
+                self.config.hard_context_post_onset_min_ms,
+                self.config.hard_context_post_onset_max_ms,
+                n_frames,
+            )
+            self._set_context_range(
+                post_negative,
+                start,
+                pad,
+                post_lo,
+                post_hi,
+                event.source_id,
+            )
+            pre_lo, pre_hi = self._ms_window_before_onset(
+                event_start,
+                self.config.hard_context_pre_onset_min_ms,
+                self.config.hard_context_pre_onset_max_ms,
+            )
+            self._set_context_range(
+                pre_negative,
+                start,
+                pad,
+                pre_lo,
+                pre_hi,
+                event.source_id,
+            )
+            sustain_lo = min(
+                n_frames,
+                event_start + self.config.onset_shoulder_radius_frames + 1,
+            )
+            sustain_hi = max(sustain_lo, min(n_frames, event_end))
+            self._set_context_range(
+                far_negative,
+                start,
+                pad,
+                sustain_lo,
+                sustain_hi,
+                event.source_id,
+            )
+        far_negative = np.clip(
+            far_negative - post_negative - pre_negative - onset_nearby,
+            0.0,
+            1.0,
+        )
+        return {
+            "hard_context_positive_mask": positive,
+            "hard_context_post_onset_negative_mask": post_negative,
+            "hard_context_pre_onset_negative_mask": pre_negative,
+            "hard_context_far_negative_mask": far_negative,
+        }
+
+    @staticmethod
+    def _set_context_frame(
+        mask: np.ndarray,
+        context_start: int,
+        context_pad: int,
+        global_frame: int,
+        source_id: int,
+    ) -> None:
+        local = context_pad + global_frame - context_start
+        if 0 <= local < mask.shape[0]:
+            mask[local, source_id] = 1.0
+
+    @staticmethod
+    def _set_context_range(
+        mask: np.ndarray,
+        context_start: int,
+        context_pad: int,
+        global_start: int,
+        global_stop: int,
+        source_id: int,
+    ) -> None:
+        local_start = max(0, context_pad + global_start - context_start)
+        local_stop = min(mask.shape[0], context_pad + global_stop - context_start)
+        if local_stop > local_start:
+            mask[local_start:local_stop, source_id] = 1.0
+
     @staticmethod
     def _event_state_context(
         active: np.ndarray,
@@ -933,6 +1279,29 @@ class SourceTrackingRendererV2:
             int(np.ceil(event.end_s * self.config.sample_rate / self.config.hop)),
         )
         return start, end
+
+    def _censor_event_onset(
+        self,
+        event: SourceEventLabelV2,
+        events: list[SourceEventLabelV2],
+        n_frames: int,
+    ) -> bool:
+        if event.family not in self.censor_same_instrument_overlap_onset_families:
+            return False
+        if not event.instrument_str:
+            return False
+        start, _ = self._event_frame_span(event, n_frames)
+        for other in events:
+            if other is event:
+                continue
+            if other.source_id != event.source_id:
+                continue
+            if other.instrument_str != event.instrument_str:
+                continue
+            other_start, other_end = self._event_frame_span(other, n_frames)
+            if other_start < start < other_end:
+                return True
+        return False
 
     def _audio_context_for_frame(
         self,
