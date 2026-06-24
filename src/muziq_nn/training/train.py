@@ -2697,21 +2697,27 @@ class SourceTrackingTrainerV2:
             True if config is None else config.event_state_conditioning
         )
         if event_state is None or not event_state_conditioning:
-            return self.model(batch["frames"])
+            return self._trim_outputs_to_batch_context(self.model(batch["frames"]), batch)
         if config is not None and config.primary_audio_only_event_decoder:
-            return self.model(batch["frames"])
+            return self._trim_outputs_to_batch_context(self.model(batch["frames"]), batch)
         if teacher_forcing_rate >= 0.999:
-            return self.model(
-                batch["frames"],
-                event_state=self._corrupt_event_state(event_state),
+            return self._trim_outputs_to_batch_context(
+                self.model(
+                    batch["frames"],
+                    event_state=self._corrupt_event_state(event_state),
+                ),
+                batch,
             )
-        first = self.model(batch["frames"])
+        first = self._trim_outputs_to_batch_context(self.model(batch["frames"]), batch)
         sampled_state = self._scheduled_event_state(
             event_state,
             first,
             teacher_forcing_rate,
         )
-        outputs = self.model(batch["frames"], event_state=sampled_state)
+        outputs = self._trim_outputs_to_batch_context(
+            self.model(batch["frames"], event_state=sampled_state),
+            batch,
+        )
         if (
             torch.is_grad_enabled()
             and self._uses_first_pass_auxiliary_outputs()
@@ -2726,10 +2732,38 @@ class SourceTrackingTrainerV2:
                             batch["frames"],
                             event_state=event_state,
                         )
+                        outputs["_first_pass_teacher_outputs"] = (
+                            self._trim_outputs_to_batch_context(
+                                outputs["_first_pass_teacher_outputs"],
+                                batch,
+                            )
+                        )
                 finally:
                     if was_training:
                         self.model.train()
         return outputs
+
+    def _trim_outputs_to_batch_context(
+        self,
+        outputs: dict[str, torch.Tensor],
+        batch: dict[str, torch.Tensor],
+    ) -> dict[str, torch.Tensor]:
+        target = batch.get("context_onset")
+        if target is None:
+            return outputs
+        target_frames = target.shape[1]
+        trimmed: dict[str, torch.Tensor] = {}
+        for key, value in outputs.items():
+            if (
+                isinstance(value, torch.Tensor)
+                and value.ndim >= 3
+                and value.shape[0] == target.shape[0]
+                and value.shape[1] != target_frames
+            ):
+                trimmed[key] = value[:, -target_frames:, ...]
+            else:
+                trimmed[key] = value
+        return trimmed
 
     def _uses_first_pass_auxiliary_outputs(self) -> bool:
         return (
