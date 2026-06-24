@@ -8,8 +8,6 @@ DATA_ROOT="runs/nsynth_metadata_800_100_100_notes480_20260623"
 STATUS="${RUN_DIR}/train_status.json"
 RUN_ROOT="${RUN_DIR}/train_runs_notes480"
 GCS_PREFIX="gs://rezo-flyte/scratch/serializable/muziq-nn/20260624/boundary-sequence-phase12-clean-noisy-notes480/checkpoints/"
-WARM_START_URI="gs://rezo-flyte/scratch/serializable/muziq-nn/20260623/boundary-sequence-blockloss-mined-positive-notes48/checkpoints/20260623/20260623-041952/checkpoints/checkpoint_000009_phase-epoch_done_stage-single_note_all_epoch-003_batch-000235.pt"
-WARM_START_CHECKPOINT="${RUN_DIR}/warm_start/checkpoint_000009_phase-epoch_done_stage-single_note_all_epoch-003_batch-000235.pt"
 CENSORED_FAMILIES="vocal,flute,brass,string"
 PHASE1_FAMILY_BOOSTS="guitar=2.0,flute=2.0,string=1.6,vocal=1.6,synth_lead=1.4"
 PHASE2_FAMILY_BOOSTS="organ=2.2,reed=2.2,synth_lead=2.2,guitar=2.0,bass=1.8,flute=1.6,string=1.4,vocal=1.4"
@@ -19,7 +17,7 @@ HARD_NEGATIVE_FAMILIES="guitar,reed,organ,string,flute"
 FULL_PHASE_JITTER_SAMPLES=79
 FULL_FEATURE_NOISE_STD=0.01
 
-mkdir -p "${RUN_DIR}/logs" "${RUN_ROOT}" "${RUN_DIR}/warm_start"
+mkdir -p "${RUN_DIR}/logs" "${RUN_ROOT}"
 
 if pgrep -af "python -m muziq_nn.training.train .*${RUN_ROOT}" >/dev/null; then
   echo "Refusing to start duplicate phase 1/1a/2/2a training." >&2
@@ -42,19 +40,6 @@ if [[ ! -f "${DATA_ROOT}/manifests/nsynth/metadata_split_summary.json" ]]; then
     > "${RUN_DIR}/logs/prepare_notes480.log" 2>&1
 fi
 
-if [[ ! -s "${WARM_START_CHECKPOINT}" ]]; then
-  python - <<PY
-from pathlib import Path
-from google.cloud import storage
-
-uri = "${WARM_START_URI}"
-target = Path("${WARM_START_CHECKPOINT}")
-target.parent.mkdir(parents=True, exist_ok=True)
-bucket_name, blob_name = uri[len("gs://"):].split("/", 1)
-storage.Client().bucket(bucket_name).blob(blob_name).download_to_filename(target)
-PY
-fi
-
 python - <<PY
 import json
 from datetime import UTC, datetime
@@ -67,8 +52,10 @@ Path("${STATUS}").write_text(json.dumps({
     "run_dir": "${RUN_DIR}",
     "run_root": "${RUN_ROOT}",
     "data_root": "${DATA_ROOT}",
-    "warm_start_checkpoint": "${WARM_START_CHECKPOINT}",
-    "warm_start_checkpoint_uri": "${WARM_START_URI}",
+    "frontend_name": "leaf",
+    "fine_hop_samples": 40,
+    "context_hop_samples": 160,
+    "onset_shoulder_ms": 25,
     "gcs_prefix": "${GCS_PREFIX}",
     "phases": [
         {"name": "phase1", "stage": "single_note_all", "phase_jitter_samples": 0, "feature_noise_std": 0.0},
@@ -92,7 +79,8 @@ COMMON_ARGS=(
   --gpu-frame-extraction
   --training-slice-frames 256
   --training-slice-peak-warmup-frames 512
-  --input-novelty-features salience
+  --frontend-name leaf
+  --input-novelty-features leaf
   --no-resume-optimizer-state
   --checkpoint-upload-uri "${GCS_PREFIX}"
   --checkpoint-interval-batches 500
@@ -115,7 +103,6 @@ COMMON_ARGS=(
   --primary-audio-only-event-decoder
   --event-teacher-forcing-start 1.0
   --event-teacher-forcing-end 0.0
-  --onset-shoulder-radius-frames 5
   --offset-label-radius-frames 16
   --boundary-negative-radius-frames 24
   --positive-quality-boosts "fast_decay=2.0,bright=1.8,nonlinear_env=1.8,long_release=1.6,multiphonic=1.5"
@@ -216,12 +203,16 @@ PY
   if [[ -n "${teacher_checkpoint}" ]]; then
     teacher_args=(--phase1-onset-teacher-checkpoint "${teacher_checkpoint}")
   fi
+  local warm_args=()
+  if [[ -n "${warm_start}" ]]; then
+    warm_args=(--warm-start-checkpoint "${warm_start}")
+  fi
 
   set +e
   python -m muziq_nn.training.train \
     "${COMMON_ARGS[@]}" \
     "$@" \
-    --warm-start-checkpoint "${warm_start}" \
+    "${warm_args[@]}" \
     "${teacher_args[@]}" \
     --phase-jitter-samples "${phase_jitter_samples}" \
     --feature-noise-std "${feature_noise_std}" \
@@ -284,7 +275,7 @@ PY
   printf '%s\n' "${latest_checkpoint}"
 }
 
-PHASE1_CHECKPOINT="$(run_phase phase1 "${WARM_START_CHECKPOINT}" "" 0 0.0 "${PHASE1_ARGS[@]}")"
+PHASE1_CHECKPOINT="$(run_phase phase1 "" "" 0 0.0 "${PHASE1_ARGS[@]}")"
 PHASE1A_CHECKPOINT="$(run_phase phase1a "${PHASE1_CHECKPOINT}" "" "${FULL_PHASE_JITTER_SAMPLES}" "${FULL_FEATURE_NOISE_STD}" "${PHASE1_ARGS[@]}")"
 PHASE2_CHECKPOINT="$(run_phase phase2 "${PHASE1A_CHECKPOINT}" "${PHASE1A_CHECKPOINT}" 0 0.0 "${PHASE2_ARGS[@]}")"
 PHASE2A_CHECKPOINT="$(run_phase phase2a "${PHASE2_CHECKPOINT}" "${PHASE1A_CHECKPOINT}" "${FULL_PHASE_JITTER_SAMPLES}" "${FULL_FEATURE_NOISE_STD}" "${PHASE2_ARGS[@]}")"

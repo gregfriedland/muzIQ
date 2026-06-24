@@ -6,6 +6,7 @@ import argparse
 import importlib
 import json
 import math
+import os
 import queue
 import shutil
 import subprocess
@@ -27,7 +28,6 @@ from torch.nn import functional as F
 from muziq_nn.datasets.midi import MidiIndexV2
 from muziq_nn.datasets.nsynth import NsynthIndexV2
 from muziq_nn.datasets.render import (
-    AudioFrameExtractorV2,
     MidiScheduleStoreV2,
     NsynthNoteStoreV2,
     SourceTrackingAudioConfigV2,
@@ -40,6 +40,7 @@ from muziq_nn.models.attention import (
     SourceTrackingLossV2,
     SourceTrackingModelConfigV2,
 )
+from muziq_nn.models.frontend import LeafFrontendConfigV2
 
 
 @dataclass(frozen=True)
@@ -174,8 +175,9 @@ class TrainingConfigV2:
     resume_optimizer_state: bool = True
     training_slice_frames: int = 256
     training_slice_peak_warmup_frames: int = 512
-    input_novelty_features: str = "none"
-    gpu_frame_extraction: bool = False
+    frontend_name: str = "leaf"
+    input_novelty_features: str = "leaf"
+    gpu_frame_extraction: bool = True
     pin_memory: bool = False
     prefetch_batches: int = 0
     mixed_precision: bool = False
@@ -337,9 +339,6 @@ class TrainingBatchBuilderV2:
         self.frame_count = frame_count
         self.pin_memory = pin_memory and device.type == "cuda"
         self.input_novelty_features = input_novelty_features
-        extractor = AudioFrameExtractorV2()
-        self.frame_window = torch.from_numpy(extractor._window).to(device)
-        self.frame_fold = torch.from_numpy(extractor._fold.T).to(device)
 
     def build(self, examples) -> dict[str, torch.Tensor]:
         return self.build_slices([self.slice_from_example(example) for example in examples])
@@ -468,6 +467,8 @@ class TrainingBatchBuilderV2:
     def _build_frame_tensor(self, slices) -> torch.Tensor:
         if slices and "audio_context" in slices[0]:
             return self._build_frame_tensor_from_audio(slices)
+        if os.environ.get("MUZIQ_ALLOW_LEGACY_FFT_FRONTEND") != "1":
+            raise RuntimeError("Fixed FFT frame tensors are disabled; use LEAF audio_context.")
         frames = [item["frames"] for item in slices]
         padded = np.zeros(
             (len(frames), self.frame_count, SourceTrackingAudioConfigV2.bands),
@@ -480,19 +481,12 @@ class TrainingBatchBuilderV2:
 
     def _build_frame_tensor_from_audio(self, slices) -> torch.Tensor:
         audio = np.stack([item["audio_context"] for item in slices]).astype(np.float32)
-        audio_tensor = self._to_device(audio)
-        windows = audio_tensor.unfold(
-            dimension=1,
-            size=SourceTrackingAudioConfigV2.win,
-            step=SourceTrackingAudioConfigV2.hop,
-        )
-        mag = torch.fft.rfft(windows * self.frame_window, dim=-1).abs()
-        raw_bands = torch.matmul(mag.float(), self.frame_fold)
-        frames = self._normalize_bands(raw_bands)[:, -self.frame_count :, :]
-        return self._augment_frame_features(frames)
+        return self._to_device(audio)
 
     @classmethod
     def feature_dim(cls, input_novelty_features: str = "none") -> int:
+        if input_novelty_features == "leaf":
+            return LeafFrontendConfigV2().feature_dim
         bands = SourceTrackingAudioConfigV2.bands
         if input_novelty_features == "none":
             return bands
@@ -1456,6 +1450,12 @@ class SourceTrackingTrainerV2:
 
     def __init__(self, config: TrainingConfigV2):
         self.config = config
+        if config.frontend_name != "leaf" or config.input_novelty_features != "leaf":
+            raise RuntimeError("FFT/fixed-frame training is disabled; use the LEAF frontend.")
+        if not config.gpu_frame_extraction:
+            raise RuntimeError("LEAF training requires raw audio-context extraction.")
+        if config.frame_cache_examples_per_stage > 0:
+            raise RuntimeError("Cached FFT frame pools are disabled for LEAF training.")
         self.device = self._resolve_device(config.device)
         self.renderer = self._build_renderer(include_midi=False)
         self.midi_renderer: SourceTrackingRendererV2 | None = None
@@ -1465,6 +1465,8 @@ class SourceTrackingTrainerV2:
         self.warm_start_load_report: dict[str, object] | None = None
         self.model_config = SourceTrackingModelConfigV2(
             n_bands=TrainingBatchBuilderV2.feature_dim(config.input_novelty_features),
+            frontend_name=config.frontend_name,
+            leaf=LeafFrontendConfigV2(),
             model_dim=config.model_dim,
             heads=config.model_heads,
             layers=config.model_layers,
@@ -1591,6 +1593,8 @@ class SourceTrackingTrainerV2:
                     self.config.training_slice_peak_warmup_frames
                 ),
                 "input_novelty_features": self.config.input_novelty_features,
+                "frontend_name": self.config.frontend_name,
+                "frontend_metadata": self.model.frontend_metadata(),
                 "gpu_frame_extraction": self.config.gpu_frame_extraction,
                 "pin_memory": self.config.pin_memory,
                 "prefetch_batches": self.config.prefetch_batches,
@@ -2852,6 +2856,9 @@ class SourceTrackingTrainerV2:
         offset = outputs.get("offset_logits_sequence")
         if onset is None or offset is None:
             return true_state
+        if onset.shape[1] != true_state.shape[1]:
+            onset = onset[:, -true_state.shape[1] :, :]
+            offset = offset[:, -true_state.shape[1] :, :]
         predicted = SourceTrackingEventStateBuilderV2.from_logits(
             onset.detach(),
             offset.detach(),
@@ -2863,9 +2870,13 @@ class SourceTrackingTrainerV2:
         if self.config.event_state_use_predicted_age and true_state.shape[-1] > 3:
             onset_age = outputs.get("onset_age_logits_sequence")
             if onset_age is not None:
+                if onset_age.shape[1] != true_state.shape[1]:
+                    onset_age = onset_age[:, -true_state.shape[1] :, :]
                 predicted[..., 3] = torch.sigmoid(onset_age.detach())
             offset_age = outputs.get("offset_age_logits_sequence")
             if offset_age is not None and true_state.shape[-1] > 4:
+                if offset_age.shape[1] != true_state.shape[1]:
+                    offset_age = offset_age[:, -true_state.shape[1] :, :]
                 predicted[..., 4] = torch.sigmoid(offset_age.detach())
         keep_true = (
             torch.rand(
@@ -3576,10 +3587,12 @@ class SourceTrackingTrainerV2:
                 "state_dict": self.model.state_dict(),
                 "optimizer_state_dict": optimizer_state,
                 "checkpoint_metadata": asdict(metadata),
+                "frontend_metadata": self.model.frontend_metadata(),
             },
             checkpoint_path,
         )
         metadata_payload = asdict(metadata)
+        metadata_payload["frontend_metadata"] = self.model.frontend_metadata()
         metadata_path.write_text(json.dumps(metadata_payload, indent=2), encoding="utf-8")
         checkpoint_relative_path = f"checkpoints/{checkpoint_path.name}"
         metadata_relative_path = f"checkpoints/{metadata_path.name}"
@@ -3642,9 +3655,11 @@ class SourceTrackingTrainerV2:
             {
                 "state_dict": self.model.state_dict(),
                 "optimizer_state_dict": optimizer_state,
+                "frontend_metadata": self.model.frontend_metadata(),
                 "checkpoint_metadata": {
                     "phase": "training_done",
                     "stage": "complete",
+                    "frontend_metadata": self.model.frontend_metadata(),
                     "examples_seen": sum(row["examples"] for row in history),
                     "loss": history[-1]["loss"] if history else None,
                     "optimizer_state_included": optimizer_state is not None,
@@ -4343,12 +4358,22 @@ class TrainingCliV2:
             default=TrainingConfigV2.training_slice_peak_warmup_frames,
         )
         parser.add_argument(
-            "--input-novelty-features",
-            choices=("none", "flux", "salience"),
-            default=TrainingConfigV2.input_novelty_features,
-            help="Append derived onset-novelty features to each frame.",
+            "--frontend-name",
+            choices=("leaf",),
+            default=TrainingConfigV2.frontend_name,
+            help="Only the LEAF frontend is supported for new training runs.",
         )
-        parser.add_argument("--gpu-frame-extraction", action="store_true")
+        parser.add_argument(
+            "--input-novelty-features",
+            choices=("leaf",),
+            default=TrainingConfigV2.input_novelty_features,
+            help="Legacy FFT feature augmentation is disabled; use LEAF.",
+        )
+        parser.add_argument(
+            "--gpu-frame-extraction",
+            action="store_true",
+            default=TrainingConfigV2.gpu_frame_extraction,
+        )
         parser.add_argument("--pin-memory", action="store_true")
         parser.add_argument(
             "--prefetch-batches",

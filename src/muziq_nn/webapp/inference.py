@@ -14,7 +14,6 @@ import torch.nn.functional as F
 from scipy import signal as sps
 
 from muziq_nn.datasets.render import (
-    AudioFrameExtractorV2,
     FamilyVocabularyV2,
     SourceTrackingAudioConfigV2,
 )
@@ -23,6 +22,7 @@ from muziq_nn.models.attention import (
     SourceTrackingEventStateBuilderV2,
     SourceTrackingModelConfigV2,
 )
+from muziq_nn.models.frontend import LeafFrontendConfigV2
 
 
 @dataclass(frozen=True)
@@ -82,8 +82,9 @@ class SourceTrackingCheckpointLoaderV2:
         self.device = self._select_device(device)
         self.payload = self._load_payload()
         self.state_dict = self._state_dict_from_payload(self.payload)
+        self.frontend_metadata = self._frontend_metadata_from_payload(self.payload)
         self.has_count_head = any(name.startswith("head.count.") for name in self.state_dict)
-        self.config = self._infer_config(self.state_dict)
+        self.config = self._infer_config(self.state_dict, self.frontend_metadata)
         self.model = self._load_model()
 
     def _load_payload(self) -> Any:
@@ -129,9 +130,22 @@ class SourceTrackingCheckpointLoaderV2:
             return payload
         raise ValueError("checkpoint payload does not contain a PyTorch state dict")
 
+    @staticmethod
+    def _frontend_metadata_from_payload(payload: Any) -> dict[str, object]:
+        if not isinstance(payload, dict):
+            raise ValueError("checkpoint payload does not contain frontend metadata")
+        metadata = payload.get("frontend_metadata")
+        if metadata is None and isinstance(payload.get("checkpoint_metadata"), dict):
+            metadata = payload["checkpoint_metadata"].get("frontend_metadata")
+        if not isinstance(metadata, dict) or metadata.get("frontend_name") != "leaf":
+            raise ValueError("checkpoint is missing required LEAF frontend metadata")
+        return metadata
+
     @classmethod
     def _infer_config(
-        cls, state_dict: dict[str, torch.Tensor]
+        cls,
+        state_dict: dict[str, torch.Tensor],
+        frontend_metadata: dict[str, object],
     ) -> SourceTrackingModelConfigV2:
         input_weight = state_dict["input.weight"]
         family_weight = state_dict["head.family.weight"]
@@ -139,7 +153,21 @@ class SourceTrackingCheckpointLoaderV2:
         identity_weight = state_dict["head.identity.weight"]
         layer_count = cls._infer_layer_count(state_dict)
         event_decoder_layers = cls._infer_event_decoder_layer_count(state_dict)
+        leaf = LeafFrontendConfigV2(
+            sample_rate=int(frontend_metadata["sample_rate"]),
+            fine_hop_samples=int(frontend_metadata["fine_hop_samples"]),
+            context_hop_samples=int(frontend_metadata["context_hop_samples"]),
+            kernel_size=int(frontend_metadata["kernel_size"]),
+            filters=int(frontend_metadata["filters"]),
+            min_hz=float(frontend_metadata["min_hz"]),
+            max_hz=float(frontend_metadata["max_hz"]),
+            onset_shoulder_ms=float(frontend_metadata.get("onset_shoulder_ms", 25.0)),
+            normalization=str(frontend_metadata.get("normalization", "pcen")),
+            pooling=str(frontend_metadata.get("pooling", "mean_max")),
+        )
         return SourceTrackingModelConfigV2(
+            frontend_name="leaf",
+            leaf=leaf,
             n_bands=int(input_weight.shape[1]),
             n_families=int(family_weight.shape[0]),
             max_sources=int(slot_queries.shape[0]),
@@ -204,22 +232,9 @@ class SourceTrackingCheckpointLoaderV2:
         return outputs[f"{prefix}_logits"]
 
     def prepare_frames(self, frames: torch.Tensor) -> torch.Tensor:
-        if frames.shape[-1] == self.config.n_bands:
+        if frames.ndim == 2:
             return frames
-        if frames.shape[-1] != SourceTrackingAudioConfigV2.bands:
-            raise ValueError(
-                "frame feature width does not match checkpoint: "
-                f"got {frames.shape[-1]}, expected {self.config.n_bands}"
-            )
-        if self.config.n_bands == SourceTrackingAudioConfigV2.bands * 2:
-            return self._augment_frame_features(frames, "flux")
-        salience_width = SourceTrackingAudioConfigV2.bands * 6 + 5
-        if self.config.n_bands == salience_width:
-            return self._augment_frame_features(frames, "salience")
-        raise ValueError(
-            "unsupported checkpoint input feature width: "
-            f"{self.config.n_bands}"
-        )
+        raise ValueError("LEAF checkpoints require raw audio tensors [batch, samples]")
 
     @staticmethod
     def _augment_frame_features(frames: torch.Tensor, mode: str) -> torch.Tensor:
@@ -285,7 +300,6 @@ class RealtimeSourceTrackerV2:
         self.loaded = SourceTrackingCheckpointLoaderV2(checkpoint_path, device=device)
         self.context_frames = context_frames
         self.activity_threshold = activity_threshold
-        self.extractor = AudioFrameExtractorV2()
         self.families = FamilyVocabularyV2()
         self.audio = np.zeros(0, dtype=np.float32)
         self.started_at = time.monotonic()
@@ -311,15 +325,18 @@ class RealtimeSourceTrackerV2:
     def predict(self) -> SourceTrackingInferenceResultV2:
         if len(self.audio) == 0:
             return self._empty_result(0)
-        frames = self.extractor.extract_context(
-            self.audio,
-            end_frame=int(np.ceil(len(self.audio) / SourceTrackingAudioConfigV2.hop)) - 1,
-            frame_count=self.context_frames,
-            peak_warmup_frames=self.context_frames,
-        )
-        if len(frames) == 0:
+        audio = self._audio_context()
+        if len(audio) == 0:
             return self._empty_result(0)
-        return self._predict_frames(frames)
+        return self._predict_frames(audio)
+
+    def _audio_context(self) -> np.ndarray:
+        leaf = self.loaded.config.leaf
+        samples = leaf.kernel_size + (self.context_frames - 1) * leaf.context_hop_samples
+        context = np.zeros(samples, dtype=np.float32)
+        clipped = self.audio[-samples:]
+        context[-len(clipped) :] = clipped
+        return context
 
     def reset(self) -> None:
         self.audio = np.zeros(0, dtype=np.float32)
@@ -367,7 +384,7 @@ class RealtimeSourceTrackerV2:
             )
         return SourceTrackingInferenceResultV2(
             timestamp_s=time.monotonic() - self.started_at,
-            frame_count=int(frames.shape[0]),
+            frame_count=self.context_frames,
             sample_count=int(len(self.audio)),
             source_count=predicted_count
             if predicted_count is not None

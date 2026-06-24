@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from muziq_nn.datasets.render import AudioFrameExtractorV2, SourceTrackingAudioConfigV2
 
 
 class TestAudioFrameExtractorV2:
+    @pytest.fixture(autouse=True)
+    def _allow_legacy_fft(self, monkeypatch):
+        monkeypatch.setenv("MUZIQ_ALLOW_LEGACY_FFT_FRONTEND", "1")
+
     def test_vectorized_extract_matches_legacy_loop(self):
         rng = np.random.default_rng(7)
         audio = rng.normal(

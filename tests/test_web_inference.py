@@ -3,6 +3,7 @@ import os
 from pathlib import Path
 
 import numpy as np
+import pytest
 import torch
 
 from muziq_nn.models.attention import (
@@ -23,7 +24,13 @@ class TestRealtimeSourceTrackerV2:
     def _write_checkpoint(checkpoint_path: Path) -> SourceTrackingModelConfigV2:
         config = SourceTrackingModelConfigV2(model_dim=32, heads=4, layers=1)
         model = DualPathTransformerSourceTrackerV2(config)
-        torch.save({"state_dict": model.state_dict()}, checkpoint_path)
+        torch.save(
+            {
+                "state_dict": model.state_dict(),
+                "frontend_metadata": model.frontend_metadata(),
+            },
+            checkpoint_path,
+        )
         return config
 
     def test_loads_checkpoint_and_predicts_sources(self, tmp_path: Path):
@@ -56,7 +63,13 @@ class TestRealtimeSourceTrackerV2:
             for name, value in model.state_dict().items()
             if not name.startswith("head.count.")
         }
-        torch.save({"state_dict": state_dict}, checkpoint_path)
+        torch.save(
+            {
+                "state_dict": state_dict,
+                "frontend_metadata": model.frontend_metadata(),
+            },
+            checkpoint_path,
+        )
 
         tracker = RealtimeSourceTrackerV2(
             checkpoint_path,
@@ -71,20 +84,25 @@ class TestRealtimeSourceTrackerV2:
         assert len(prediction.sources) == config.max_sources
         assert isinstance(prediction.source_count, int)
 
-    def test_loads_salience_feature_checkpoint_and_predicts_sources(
+    def test_loads_leaf_checkpoint_and_predicts_sources(
         self,
         tmp_path: Path,
     ):
         checkpoint_path = tmp_path / "checkpoint.pt"
         config = SourceTrackingModelConfigV2(
-            n_bands=245,
             model_dim=32,
             heads=4,
             layers=1,
             event_decoder_layers=2,
         )
         model = DualPathTransformerSourceTrackerV2(config)
-        torch.save({"state_dict": model.state_dict()}, checkpoint_path)
+        torch.save(
+            {
+                "state_dict": model.state_dict(),
+                "frontend_metadata": model.frontend_metadata(),
+            },
+            checkpoint_path,
+        )
 
         tracker = RealtimeSourceTrackerV2(
             checkpoint_path,
@@ -95,26 +113,38 @@ class TestRealtimeSourceTrackerV2:
 
         prediction = tracker.append_audio(audio, 16_000)
 
-        assert tracker.loaded.config.n_bands == 245
+        assert tracker.loaded.config.frontend_name == "leaf"
         assert tracker.loaded.config.event_decoder_layers == 2
         assert len(prediction.sources) == config.max_sources
 
-    def test_prepare_frames_appends_salience_features(self, tmp_path: Path):
+    def test_prepare_frames_requires_raw_audio(self, tmp_path: Path):
         checkpoint_path = tmp_path / "checkpoint.pt"
-        config = SourceTrackingModelConfigV2(
-            n_bands=245,
-            model_dim=32,
-            heads=4,
-            layers=1,
-        )
+        config = SourceTrackingModelConfigV2(model_dim=32, heads=4, layers=1)
         model = DualPathTransformerSourceTrackerV2(config)
-        torch.save({"state_dict": model.state_dict()}, checkpoint_path)
+        torch.save(
+            {
+                "state_dict": model.state_dict(),
+                "frontend_metadata": model.frontend_metadata(),
+            },
+            checkpoint_path,
+        )
         loader = SourceTrackingCheckpointLoaderV2(checkpoint_path, device="cpu")
 
-        frames = torch.zeros(2, 4, 40)
-        prepared = loader.prepare_frames(frames)
+        audio = torch.zeros(2, 16_000)
+        prepared = loader.prepare_frames(audio)
 
-        assert prepared.shape == (2, 4, 245)
+        assert prepared.shape == audio.shape
+        with pytest.raises(ValueError, match="raw audio tensors"):
+            loader.prepare_frames(torch.zeros(2, 4, 40))
+
+    def test_rejects_checkpoint_without_frontend_metadata(self, tmp_path: Path):
+        checkpoint_path = tmp_path / "checkpoint.pt"
+        config = SourceTrackingModelConfigV2(model_dim=32, heads=4, layers=1)
+        model = DualPathTransformerSourceTrackerV2(config)
+        torch.save({"state_dict": model.state_dict()}, checkpoint_path)
+
+        with pytest.raises(ValueError, match="LEAF frontend metadata"):
+            SourceTrackingCheckpointLoaderV2(checkpoint_path, device="cpu")
 
     def test_status_route_reports_explicit_checkpoint(self, tmp_path: Path):
         checkpoint_path = tmp_path / "checkpoint.pt"

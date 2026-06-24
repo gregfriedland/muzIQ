@@ -7,6 +7,8 @@ import pytest
 import torch
 from conftest import TinyCorpusBuilderV2
 
+from muziq_nn.datasets.render import SourceTrackingAudioConfigV2
+from muziq_nn.models.frontend import LeafFrontendConfigV2
 from muziq_nn.training.train import (
     CurriculumPlanV2,
     CurriculumStageV2,
@@ -106,11 +108,22 @@ class TestTrainSmokeV2:
 
     def test_stage_filter_rejects_removed_cached_frame_stages(self, tmp_path):
         TinyCorpusBuilderV2(tmp_path / "data").build()
+        with pytest.raises(RuntimeError, match="Cached FFT frame pools are disabled"):
+            SourceTrackingTrainerV2(
+                TrainingConfigV2(
+                    data_root=str(tmp_path / "data"),
+                    stage_filter="single_note_frames_cached,single_instrument_melody_frames_cached",
+                    frame_cache_examples_per_stage=5,
+                    device="cpu",
+                )
+            )
+
+    def test_stage_filter_rejects_removed_cached_frame_names(self, tmp_path):
+        TinyCorpusBuilderV2(tmp_path / "data").build()
         trainer = SourceTrackingTrainerV2(
             TrainingConfigV2(
                 data_root=str(tmp_path / "data"),
                 stage_filter="single_note_frames_cached,single_instrument_melody_frames_cached",
-                frame_cache_examples_per_stage=5,
                 device="cpu",
             )
         )
@@ -254,7 +267,7 @@ class TestTrainSmokeV2:
                 "--event-state-dropout-prob",
                 "0.2",
                 "--input-novelty-features",
-                "salience",
+                "leaf",
                 "--phase-jitter-samples",
                 "79",
                 "--feature-noise-std",
@@ -336,7 +349,7 @@ class TestTrainSmokeV2:
         assert config.primary_audio_only_event_decoder is True
         assert config.event_state_noise_std == 0.1
         assert config.event_state_dropout_prob == 0.2
-        assert config.input_novelty_features == "salience"
+        assert config.input_novelty_features == "leaf"
         assert config.phase_jitter_samples == 79
         assert config.feature_noise_std == 0.01
         assert config.anneal_noise_phase_jitter_samples == 23
@@ -381,7 +394,9 @@ class TestTrainSmokeV2:
 
         augmented = builder._augment_frame_features(frames)
 
-        assert TrainingBatchBuilderV2.feature_dim("salience") == 245
+        assert TrainingBatchBuilderV2.feature_dim("salience") == (
+            SourceTrackingAudioConfigV2.bands * 6 + 5
+        )
         assert augmented.shape == (1, 3, 17)
         assert torch.equal(augmented[..., :2], frames)
         assert torch.allclose(
@@ -405,30 +420,20 @@ class TestTrainSmokeV2:
             ),
         )
 
-    def test_partial_warm_start_expands_input_weight_for_flux_features(self, tmp_path):
+    def test_leaf_feature_dim_matches_frontend_descriptor(self):
+        assert TrainingBatchBuilderV2.feature_dim("leaf") == LeafFrontendConfigV2().feature_dim
+
+    def test_trainer_rejects_legacy_public_frontends(self, tmp_path):
         TinyCorpusBuilderV2(tmp_path / "data").build()
-        base = SourceTrackingTrainerV2(
-            TrainingConfigV2(data_root=str(tmp_path / "data"), device="cpu")
-        )
-        checkpoint = tmp_path / "checkpoint.pt"
-        torch.save({"state_dict": base.model.state_dict()}, checkpoint)
 
-        expanded = SourceTrackingTrainerV2(
-            TrainingConfigV2(
-                data_root=str(tmp_path / "data"),
-                device="cpu",
-                warm_start_checkpoint=str(checkpoint),
-                partial_warm_start=True,
-                input_novelty_features="flux",
+        with pytest.raises(RuntimeError, match="LEAF frontend"):
+            SourceTrackingTrainerV2(
+                TrainingConfigV2(
+                    data_root=str(tmp_path / "data"),
+                    device="cpu",
+                    input_novelty_features="flux",
+                )
             )
-        )
-
-        assert expanded.model.input.weight.shape[1] == 80
-        assert expanded.warm_start_load_report["adapted_tensors"] == ["input.weight"]
-        assert torch.equal(
-            expanded.model.input.weight[:, :40],
-            base.model.input.weight,
-        )
 
     def test_freeze_for_first_pass_event_age_trains_only_age_heads(self, tmp_path):
         TinyCorpusBuilderV2(tmp_path / "data").build()

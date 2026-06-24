@@ -2,16 +2,21 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import os
+from dataclasses import dataclass, field
 
 import torch
 from torch import nn
 from torch.nn import functional as F
 
+from muziq_nn.models.frontend import LeafAudioFrontendV2, LeafFrontendConfigV2
+
 
 @dataclass(frozen=True)
 class SourceTrackingModelConfigV2:
-    n_bands: int = 40
+    frontend_name: str = "leaf"
+    leaf: LeafFrontendConfigV2 = field(default_factory=LeafFrontendConfigV2)
+    n_bands: int = LeafFrontendConfigV2().feature_dim
     n_families: int = 11
     max_sources: int = 5
     model_dim: int = 128
@@ -227,12 +232,21 @@ class SourceTrackingEventStateBuilderV2:
 
 
 class DualPathTransformerSourceTrackerV2(nn.Module):
-    """Small dual-path transformer for cached 40-band frame sequences."""
+    """Small dual-path transformer for LEAF audio-context sequences."""
 
     def __init__(self, config: SourceTrackingModelConfigV2 | None = None):
         super().__init__()
         self.config = config or SourceTrackingModelConfigV2()
         c = self.config
+        if c.frontend_name != "leaf":
+            if os.environ.get("MUZIQ_ALLOW_LEGACY_FFT_FRONTEND") != "1":
+                raise RuntimeError(
+                    "FFT/fixed-frame frontend is disabled. New models must use "
+                    "frontend_name='leaf'."
+                )
+            self.frontend = None
+        else:
+            self.frontend = LeafAudioFrontendV2(c.leaf)
         self.input = nn.Linear(c.n_bands, c.model_dim)
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=c.model_dim,
@@ -247,11 +261,20 @@ class DualPathTransformerSourceTrackerV2(nn.Module):
         self.head = SourceTrackingHeadV2(c)
         self.event_decoder = SourceTrackingEventDecoderV2(c)
 
+    def frontend_metadata(self) -> dict[str, object]:
+        if self.frontend is None:
+            return {"frontend_name": "legacy_fft"}
+        return self.frontend.metadata()
+
     def forward(
         self,
         frames: torch.Tensor,
         event_state: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
+        if self.frontend is not None:
+            frames = self.frontend(frames)
+        if event_state is not None and frames.shape[1] != event_state.shape[1]:
+            frames = frames[:, -event_state.shape[1] :, :]
         encoded = self.encoder(self.input(frames))
         outputs = self.head(encoded)
         outputs.update(self.event_decoder(encoded, event_state))

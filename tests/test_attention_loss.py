@@ -9,10 +9,12 @@ from muziq_nn.models.attention import (
 )
 
 
-def test_model_can_ignore_event_state_conditioning():
+def test_model_can_ignore_event_state_conditioning(monkeypatch):
+    monkeypatch.setenv("MUZIQ_ALLOW_LEGACY_FFT_FRONTEND", "1")
     torch.manual_seed(1)
     model = DualPathTransformerSourceTrackerV2(
         SourceTrackingModelConfigV2(
+            frontend_name="legacy_fft",
             n_bands=4,
             max_sources=2,
             model_dim=16,

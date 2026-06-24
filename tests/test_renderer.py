@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 import torch
 from conftest import TinyCorpusBuilderV2
 
@@ -19,6 +20,16 @@ from muziq_nn.training.train import TrainingBatchBuilderV2, TrainingRenderWorker
 
 
 class TestRendererV2:
+    @pytest.fixture(autouse=True)
+    def _allow_legacy_fft_for_reference_tests(self, monkeypatch):
+        monkeypatch.setenv("MUZIQ_ALLOW_LEGACY_FFT_FRONTEND", "1")
+
+    def test_fft_extractor_requires_explicit_legacy_override(self, monkeypatch):
+        monkeypatch.delenv("MUZIQ_ALLOW_LEGACY_FFT_FRONTEND", raising=False)
+
+        with pytest.raises(RuntimeError, match="FFT frontend is disabled"):
+            AudioFrameExtractorV2()
+
     def test_band_normalization_preserves_spectral_shape(self):
         extractor = AudioFrameExtractorV2()
         raw_bands = np.ones((2, SourceTrackingAudioConfigV2.bands), dtype=np.float32)
@@ -277,7 +288,7 @@ class TestRendererV2:
 
             assert sliced["context_onset_nearby_mask"].sum() > 0
 
-    def test_audio_training_slice_matches_cpu_frame_slice_after_batching(
+    def test_audio_training_slice_batches_raw_audio_and_matching_labels(
         self, tmp_path
     ):
         TinyCorpusBuilderV2(tmp_path).build()
@@ -287,7 +298,7 @@ class TestRendererV2:
         )
         builder = TrainingBatchBuilderV2(torch.device("cpu"), frame_count=256)
 
-        frame_slice = renderer.render_training_slice(
+        label_slice = renderer.render_training_slice(
             "single_instrument_melody",
             "train",
             seed=6,
@@ -302,19 +313,16 @@ class TestRendererV2:
             peak_warmup_frames=512,
         )
 
-        frame_batch = builder.build_slices([frame_slice])
+        label_batch = builder.build_slices([label_slice])
         audio_batch = builder.build_slices([audio_slice])
 
-        torch.testing.assert_close(
-            audio_batch["frames"],
-            frame_batch["frames"],
-            rtol=5e-4,
-            atol=5e-4,
-        )
-        torch.testing.assert_close(audio_batch["activity"], frame_batch["activity"])
-        torch.testing.assert_close(audio_batch["family"], frame_batch["family"])
-        torch.testing.assert_close(audio_batch["onset"], frame_batch["onset"])
-        torch.testing.assert_close(audio_batch["offset"], frame_batch["offset"])
+        assert audio_batch["frames"].ndim == 2
+        assert audio_batch["frames"].shape[0] == 1
+        assert audio_batch["frames"].shape[1] > 256
+        torch.testing.assert_close(audio_batch["activity"], label_batch["activity"])
+        torch.testing.assert_close(audio_batch["family"], label_batch["family"])
+        torch.testing.assert_close(audio_batch["onset"], label_batch["onset"])
+        torch.testing.assert_close(audio_batch["offset"], label_batch["offset"])
 
     def test_audio_training_slice_honors_phase_offset_after_batching(
         self, tmp_path
@@ -327,13 +335,12 @@ class TestRendererV2:
         builder = TrainingBatchBuilderV2(torch.device("cpu"), frame_count=256)
         phase_offset_samples = SourceTrackingAudioConfigV2.hop // 2
 
-        frame_slice = renderer.render_training_slice(
+        baseline_audio_slice = renderer.render_training_audio_slice(
             "single_instrument_melody",
             "train",
             seed=6,
             frame_count=256,
             peak_warmup_frames=512,
-            phase_offset_samples=phase_offset_samples,
         )
         audio_slice = renderer.render_training_audio_slice(
             "single_instrument_melody",
@@ -344,15 +351,11 @@ class TestRendererV2:
             phase_offset_samples=phase_offset_samples,
         )
 
-        frame_batch = builder.build_slices([frame_slice])
+        baseline_batch = builder.build_slices([baseline_audio_slice])
         audio_batch = builder.build_slices([audio_slice])
 
-        torch.testing.assert_close(
-            audio_batch["frames"],
-            frame_batch["frames"],
-            rtol=5e-4,
-            atol=5e-4,
-        )
+        assert audio_batch["frames"].shape == baseline_batch["frames"].shape
+        assert not torch.equal(audio_batch["frames"], baseline_batch["frames"])
 
     def test_audio_training_worker_honors_phase_offset_after_batching(
         self, tmp_path
@@ -365,7 +368,7 @@ class TestRendererV2:
         builder = TrainingBatchBuilderV2(torch.device("cpu"), frame_count=256)
         phase_offset_samples = SourceTrackingAudioConfigV2.hop // 2
 
-        frame_slice = renderer.render_training_slice(
+        label_slice = renderer.render_training_slice(
             "single_instrument_melody",
             "train",
             seed=6,
@@ -386,15 +389,12 @@ class TestRendererV2:
             )
         )
 
-        frame_batch = builder.build_slices([frame_slice])
+        label_batch = builder.build_slices([label_slice])
         audio_batch = builder.build_slices([audio_slice])
 
-        torch.testing.assert_close(
-            audio_batch["frames"],
-            frame_batch["frames"],
-            rtol=5e-4,
-            atol=5e-4,
-        )
+        assert audio_batch["frames"].ndim == 2
+        torch.testing.assert_close(audio_batch["activity"], label_batch["activity"])
+        torch.testing.assert_close(audio_batch["family"], label_batch["family"])
 
     def test_training_slice_samples_boundary_frames(self, tmp_path):
         TinyCorpusBuilderV2(tmp_path).build()

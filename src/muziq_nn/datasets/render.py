@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from collections import OrderedDict, defaultdict
 
 import numpy as np
@@ -25,14 +26,16 @@ class SourceTrackingAudioConfigV2:
 
     sample_rate = 16_000
     duration_s = 30.0
-    hop = 80
-    win = 512
-    bands = 40
+    fine_hop = 40
+    hop = 160
+    win = 384
+    bands = 128
     max_sources = 5
     log_min_hz = 40.0
     log_max_hz = 8_000.0
     log_feature_scale = 1_000.0
-    onset_shoulder_radius_frames = 5
+    onset_shoulder_ms = 25.0
+    onset_shoulder_radius_frames = 3
     offset_label_radius_frames = 16
     boundary_negative_radius_frames = 24
     onset_hard_negative_sample_prob = 0.0
@@ -84,9 +87,14 @@ class FamilyVocabularyV2:
 
 
 class AudioFrameExtractorV2:
-    """Convert rendered audio into 40 log-spaced magnitude frames."""
+    """Legacy FFT frontend kept only for explicit compatibility tests."""
 
     def __init__(self, config: type[SourceTrackingAudioConfigV2] = SourceTrackingAudioConfigV2):
+        if os.environ.get("MUZIQ_ALLOW_LEGACY_FFT_FRONTEND") != "1":
+            raise RuntimeError(
+                "FFT frontend is disabled. Use LEAF audio-context extraction; set "
+                "MUZIQ_ALLOW_LEGACY_FFT_FRONTEND=1 only for legacy compatibility tests."
+            )
         self.config = config
         self._window = np.hanning(config.win).astype(np.float32)
         self._fold = self._build_log_fold()
@@ -330,7 +338,7 @@ class SourceTrackingRendererV2:
         self.note_store = note_store
         self.midi_store = midi_store
         self.config = config
-        self.extractor = AudioFrameExtractorV2(config)
+        self.extractor: AudioFrameExtractorV2 | None = None
         self.families = FamilyVocabularyV2()
         self.positive_family_boosts = self._parse_weight_spec(
             config.positive_family_boosts
@@ -384,7 +392,7 @@ class SourceTrackingRendererV2:
         self, stage: str, split: SplitName, seed: int
     ) -> RenderedSourceTrackingExampleV2:
         audio, events = self._render_audio_events(stage, split, seed)
-        frames = self.extractor.extract(audio)
+        frames = self._legacy_extractor().extract(audio)
         labels = self._labels_from_events(events, len(audio))
         return RenderedSourceTrackingExampleV2(
             stage=stage,
@@ -423,7 +431,7 @@ class SourceTrackingRendererV2:
             frame_count,
         )
         return {
-            "frames": self.extractor.extract_context(
+            "frames": self._legacy_extractor().extract_context(
                 audio,
                 end_frame=frame_idx,
                 frame_count=frame_count,
@@ -435,6 +443,11 @@ class SourceTrackingRendererV2:
             **hard_context,
             **target,
         }
+
+    def _legacy_extractor(self) -> AudioFrameExtractorV2:
+        if self.extractor is None:
+            self.extractor = AudioFrameExtractorV2(self.config)
+        return self.extractor
 
     def render_training_audio_slice(
         self,
